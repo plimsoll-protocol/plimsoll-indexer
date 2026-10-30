@@ -56,3 +56,64 @@ func DecodeSupplyState(v xdr.ScVal) (*SupplyState, error) {
 		Poster:        poster,
 	}, nil
 }
+
+// ReportState is one of the coverage ledger's current reserve reports, as
+// get_report returns it.
+type ReportState struct {
+	Amount   *big.Int
+	AsOf     time.Time
+	PostedAt time.Time
+	Tier     uint32
+	Reporter string
+	DocHash  string
+	DocURI   string
+}
+
+// DecodeReportState reads what get_report returns. A tier with nothing posted
+// decodes to (nil, nil).
+func DecodeReportState(v xdr.ScVal) (*ReportState, error) {
+	if v.Type == xdr.ScValTypeScvVoid {
+		return nil, nil
+	}
+	f, err := Fields(v)
+	if err != nil {
+		return nil, err
+	}
+	amount, err := AsI128(f["amount"])
+	if err != nil {
+		return nil, err
+	}
+	asOf, err := AsU64(f["as_of"])
+	if err != nil {
+		return nil, err
+	}
+	postedAt, err := AsU64(f["posted_at"])
+	if err != nil {
+		return nil, err
+	}
+	tier, err := AsU32(f["tier"])
+	if err != nil {
+		return nil, err
+	}
+	reporter, err := AsAddress(f["reporter"])
+	if err != nil {
+		return nil, err
+	}
+	docHash, err := AsHex(f["doc_hash"])
+	if err != nil {
+		return nil, err
+	}
+	docURI, err := AsString(f["doc_uri"])
+	if err != nil {
+		return nil, err
+	}
+	return &ReportState{
+		Amount:   amount,
+		AsOf:     time.Unix(int64(asOf), 0).UTC(),
+		PostedAt: time.Unix(int64(postedAt), 0).UTC(),
+		Tier:     tier,
+		Reporter: reporter,
+		DocHash:  docHash,
+		DocURI:   docURI,
+	}, nil
+}

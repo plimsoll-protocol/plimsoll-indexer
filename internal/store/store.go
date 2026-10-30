@@ -142,16 +142,16 @@ func applyEvent(ctx context.Context, tx pgx.Tx, ev any) error {
 	case soroban.SupplyPosted:
 		_, err = tx.Exec(ctx, `
 			INSERT INTO supply_snapshots
-			  (event_id, sac, amount, at_ledger, breakdown_hash, poster, posted_ledger, posted_at, tx_hash)
-			VALUES ($1, $2, $3::numeric, $4, $5, $6, $7, $8, $9)
+			  (event_id, sac, amount, at_ledger, breakdown_hash, poster, posted_ledger, posted_at, tx_hash, source)
+			VALUES ($1, $2, $3::numeric, $4, $5, $6, $7, $8, $9, 'event')
 			ON CONFLICT (event_id) DO NOTHING`,
 			e.ID, e.SAC, e.Amount.String(), int64(e.AtLedger), e.BreakdownHash, e.Poster,
 			int64(e.Ledger), e.ClosedAt, e.TxHash)
 	case soroban.ReservePosted:
 		_, err = tx.Exec(ctx, `
 			INSERT INTO reserve_reports
-			  (event_id, sac, tier, amount, as_of, reporter, doc_hash, doc_uri, posted_ledger, posted_at, tx_hash)
-			VALUES ($1, $2, $3, $4::numeric, $5, $6, $7, $8, $9, $10, $11)
+			  (event_id, sac, tier, amount, as_of, reporter, doc_hash, doc_uri, posted_ledger, posted_at, tx_hash, source)
+			VALUES ($1, $2, $3, $4::numeric, $5, $6, $7, $8, $9, $10, $11, 'event')
 			ON CONFLICT (event_id) DO NOTHING`,
 			e.ID, e.SAC, int16(e.Tier), e.Amount.String(), e.AsOf, e.Reporter, e.DocHash, e.DocURI,
 			int64(e.Ledger), e.ClosedAt, e.TxHash)
@@ -214,7 +214,7 @@ func (s *Store) GetAsset(ctx context.Context, sac string) (coverage.Asset, error
 
 func (s *Store) SupplyHistory(ctx context.Context, sac string, limit int) ([]coverage.Supply, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT amount::text, at_ledger, posted_at, breakdown_hash, poster, tx_hash
+		SELECT amount::text, at_ledger, posted_at, breakdown_hash, poster, tx_hash, source
 		FROM supply_snapshots WHERE sac = $1
 		ORDER BY at_ledger DESC LIMIT $2`, sac, limit)
 	if err != nil {
@@ -226,7 +226,7 @@ func (s *Store) SupplyHistory(ctx context.Context, sac string, limit int) ([]cov
 		var sp coverage.Supply
 		var amount string
 		var ledger int64
-		if err := rows.Scan(&amount, &ledger, &sp.PostedAt, &sp.BreakdownHash, &sp.Poster, &sp.TxHash); err != nil {
+		if err := rows.Scan(&amount, &ledger, &sp.PostedAt, &sp.BreakdownHash, &sp.Poster, &sp.TxHash, &sp.Source); err != nil {
 			return nil, err
 		}
 		sp.Amount = mustBig(amount)
@@ -247,7 +247,7 @@ func (s *Store) LatestSupply(ctx context.Context, sac string) (*coverage.Supply,
 
 func (s *Store) ReportHistory(ctx context.Context, sac string, limit int) ([]coverage.Report, error) {
 	return s.queryReports(ctx, `
-		SELECT tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash
+		SELECT tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source
 		FROM reserve_reports WHERE sac = $1
 		ORDER BY posted_ledger DESC, as_of DESC LIMIT $2`, sac, limit)
 }
@@ -255,7 +255,7 @@ func (s *Store) ReportHistory(ctx context.Context, sac string, limit int) ([]cov
 // LatestReports returns the newest report (by as_of) for each tier.
 func (s *Store) LatestReports(ctx context.Context, sac string) (map[uint32]coverage.Report, error) {
 	list, err := s.queryReports(ctx, `
-		SELECT DISTINCT ON (tier) tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash
+		SELECT DISTINCT ON (tier) tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source
 		FROM reserve_reports WHERE sac = $1
 		ORDER BY tier, as_of DESC`, sac)
 	if err != nil {
@@ -279,7 +279,7 @@ func (s *Store) queryReports(ctx context.Context, sql string, args ...any) ([]co
 		var r coverage.Report
 		var tier int16
 		var amount string
-		if err := rows.Scan(&tier, &amount, &r.AsOf, &r.PostedAt, &r.Reporter, &r.DocHash, &r.DocURI, &r.TxHash); err != nil {
+		if err := rows.Scan(&tier, &amount, &r.AsOf, &r.PostedAt, &r.Reporter, &r.DocHash, &r.DocURI, &r.TxHash, &r.Source); err != nil {
 			return nil, err
 		}
 		r.Tier = uint32(tier)
@@ -346,4 +346,55 @@ func mustBig(s string) *big.Int {
 		return new(big.Int)
 	}
 	return n
+}
+
+// ---- reconciliation -------------------------------------------------------
+
+// SaveChainSupply records a snapshot read back from contract state, and reports
+// whether it was new. Events are the normal source of these rows and carry the
+// transaction that produced them; this fills what an ingestion gap lost, so the
+// row is marked 'chain' with an empty tx_hash and is only written when it is
+// ahead of everything stored for the asset.
+func (s *Store) SaveChainSupply(ctx context.Context, sac string, sp coverage.Supply) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		INSERT INTO supply_snapshots
+		  (event_id, sac, amount, at_ledger, breakdown_hash, poster, posted_ledger, posted_at, tx_hash, source)
+		SELECT $1, $2, $3::numeric, $4, $5, $6, $4, $7, '', 'chain'
+		WHERE NOT EXISTS (
+		    SELECT 1 FROM supply_snapshots WHERE sac = $2 AND at_ledger >= $4
+		)
+		ON CONFLICT (event_id) DO NOTHING`,
+		chainSupplyID(sac, sp.Ledger), sac, sp.Amount.String(), int64(sp.Ledger),
+		sp.BreakdownHash, sp.Poster, sp.PostedAt)
+	if err != nil {
+		return false, fmt.Errorf("save chain supply: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// SaveChainReport records a report read back from contract state, and reports
+// whether it was new. See SaveChainSupply.
+func (s *Store) SaveChainReport(ctx context.Context, sac string, r coverage.Report) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		INSERT INTO reserve_reports
+		  (event_id, sac, tier, amount, as_of, reporter, doc_hash, doc_uri, posted_ledger, posted_at, tx_hash, source)
+		SELECT $1, $2, $3, $4::numeric, $5, $6, $7, $8, 0, $9, '', 'chain'
+		WHERE NOT EXISTS (
+		    SELECT 1 FROM reserve_reports WHERE sac = $2 AND tier = $3 AND as_of >= $5
+		)
+		ON CONFLICT (event_id) DO NOTHING`,
+		chainReportID(sac, r.Tier, r.AsOf), sac, int16(r.Tier), r.Amount.String(), r.AsOf,
+		r.Reporter, r.DocHash, r.DocURI, r.PostedAt)
+	if err != nil {
+		return false, fmt.Errorf("save chain report: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+func chainSupplyID(sac string, ledger uint32) string {
+	return fmt.Sprintf("chain:%s:supply:%d", sac, ledger)
+}
+
+func chainReportID(sac string, tier uint32, asOf time.Time) string {
+	return fmt.Sprintf("chain:%s:report:%d:%d", sac, tier, asOf.Unix())
 }

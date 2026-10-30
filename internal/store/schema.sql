@@ -37,6 +37,11 @@ CREATE TABLE IF NOT EXISTS supply_snapshots (
 );
 CREATE INDEX IF NOT EXISTS supply_snapshots_sac_ledger
     ON supply_snapshots (sac, at_ledger DESC);
+-- 'event' for a row decoded from a contract event, which carries the
+-- transaction that produced it; 'chain' for one read back from contract state
+-- by the reconciler, where the originating transaction is not recoverable and
+-- tx_hash is empty.
+ALTER TABLE supply_snapshots ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'event';
 
 CREATE TABLE IF NOT EXISTS reserve_reports (
     event_id        TEXT PRIMARY KEY,
@@ -53,6 +58,7 @@ CREATE TABLE IF NOT EXISTS reserve_reports (
 );
 CREATE INDEX IF NOT EXISTS reserve_reports_sac_tier_asof
     ON reserve_reports (sac, tier, as_of DESC);
+ALTER TABLE reserve_reports ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'event';
 
 CREATE TABLE IF NOT EXISTS reporters (
     address         TEXT PRIMARY KEY,

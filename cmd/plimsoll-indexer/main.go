@@ -95,14 +95,15 @@ func run(cfg config.Config, log *slog.Logger) error {
 		if err != nil {
 			return errors.New("SUPPLY_POSTER_SECRET is not a valid secret seed")
 		}
+		invoker := &soroban.Invoker{
+			RPC:        rpc,
+			Signer:     signer,
+			Passphrase: cfg.NetworkPassphrase,
+		}
 		poster := &worker.Poster{
-			Horizon: hz,
-			RPC:     rpc,
-			Invoker: &soroban.Invoker{
-				RPC:        rpc,
-				Signer:     signer,
-				Passphrase: cfg.NetworkPassphrase,
-			},
+			Horizon:     hz,
+			RPC:         rpc,
+			Invoker:     invoker,
 			Store:       db,
 			LedgerID:    cfg.CoverageLedgerID,
 			RepostAfter: cfg.RepostAfter,
@@ -111,6 +112,20 @@ func run(cfg config.Config, log *slog.Logger) error {
 		}
 		log.Info("supply posting enabled", "poster", signer.Address())
 		go every(ctx, cfg.PostInterval, log.With("job", "poster"), poster.Run)
+
+		// Reads contract state back, so it needs an account to simulate from
+		// and runs only where one is configured. It shares the poster's ticker
+		// because both are a handful of cheap calls per asset.
+		reconciler := &worker.Reconciler{
+			Invoker:  invoker,
+			Store:    db,
+			LedgerID: cfg.CoverageLedgerID,
+			Log:      log.With("job", "reconcile"),
+		}
+		if err := reconciler.Run(ctx); err != nil {
+			log.Error("initial reconcile failed", "err", err)
+		}
+		go every(ctx, cfg.PostInterval, log.With("job", "reconcile"), reconciler.Run)
 	} else {
 		log.Info("supply posting disabled (SUPPLY_POSTER_SECRET not set)")
 	}
