@@ -32,11 +32,30 @@ type Result struct {
 // Address is the account that signs and sources this invoker's calls.
 func (inv *Invoker) Address() string { return inv.Signer.Address() }
 
-// Read simulates fn on contractID and returns its result without submitting a
-// transaction, so contract state can be queried without paying a fee. The
-// simulation is built on the signer's account only because simulation needs a
-// source; nothing is signed or sent.
+// Read simulates fn on contractID with the signer as the source account.
 func (inv *Invoker) Read(ctx context.Context, contractID, fn string, args []xdr.ScVal) (xdr.ScVal, error) {
+	return simulateRead(ctx, inv.RPC, inv.Signer.Address(), contractID, fn, args)
+}
+
+// placeholderSource sources read-only simulations. Simulation does not load,
+// charge or sequence the source account, so no real account is needed; this is
+// the all-zero account id, which cannot exist and so cannot be mistaken for
+// anyone's.
+const placeholderSource = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+
+// Reader calls contract functions read-only, by simulation. It holds no key,
+// so an instance with nothing to sign with can still read contract state.
+type Reader struct {
+	RPC *rpcclient.Client
+}
+
+// Read simulates fn on contractID and returns its result. Nothing is signed,
+// submitted or paid for.
+func (r *Reader) Read(ctx context.Context, contractID, fn string, args []xdr.ScVal) (xdr.ScVal, error) {
+	return simulateRead(ctx, r.RPC, placeholderSource, contractID, fn, args)
+}
+
+func simulateRead(ctx context.Context, rpc *rpcclient.Client, source, contractID, fn string, args []xdr.ScVal) (xdr.ScVal, error) {
 	var out xdr.ScVal
 	contractAddr, err := ScAddress(contractID)
 	if err != nil {
@@ -51,11 +70,11 @@ func (inv *Invoker) Read(ctx context.Context, contractID, fn string, args []xdr.
 				Args:            xdr.ScVec(args),
 			},
 		},
-		SourceAccount: inv.Signer.Address(),
+		SourceAccount: source,
 	}
 	// Simulation never consumes the sequence number, so a placeholder is fine
 	// and saves a round trip to load the account.
-	tx, err := build(inv.Signer.Address(), 0, txnbuild.MinBaseFee, op)
+	tx, err := build(source, 0, txnbuild.MinBaseFee, op)
 	if err != nil {
 		return out, err
 	}
@@ -63,7 +82,7 @@ func (inv *Invoker) Read(ctx context.Context, contractID, fn string, args []xdr.
 	if err != nil {
 		return out, err
 	}
-	sim, err := inv.RPC.SimulateTransaction(ctx, protocol.SimulateTransactionRequest{Transaction: b64})
+	sim, err := rpc.SimulateTransaction(ctx, protocol.SimulateTransactionRequest{Transaction: b64})
 	if err != nil {
 		return out, fmt.Errorf("simulate: %w", err)
 	}

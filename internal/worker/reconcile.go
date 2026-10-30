@@ -12,6 +12,12 @@ import (
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
 )
 
+// contractReader reads contract state. Reconciliation never writes, so this is
+// deliberately narrower than contracts: it can be satisfied without a key.
+type contractReader interface {
+	Read(ctx context.Context, contractID, fn string, args []xdr.ScVal) (xdr.ScVal, error)
+}
+
 // reconcileStore is the storage surface reconciliation needs.
 type reconcileStore interface {
 	ListAssets(ctx context.Context) ([]coverage.Asset, error)
@@ -31,8 +37,11 @@ type reconcileStore interface {
 // the latest figure, so reading it back repairs the answer the API gives.
 // These rows are marked 'chain' and carry no transaction hash, which is the
 // honest record that they were recovered rather than observed.
+//
+// Reading is simulation, which needs no key and costs nothing, so this runs on
+// any instance whether or not it can sign.
 type Reconciler struct {
-	Invoker  contracts
+	Invoker  contractReader
 	Store    reconcileStore
 	LedgerID string
 	Log      *slog.Logger

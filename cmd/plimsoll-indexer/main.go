@@ -65,6 +65,20 @@ func run(cfg config.Config, log *slog.Logger) error {
 	}
 	go every(ctx, cfg.IngestInterval, log.With("job", "ingest"), ingester.Run)
 
+	// Repairs what an ingestion gap lost by reading contract state back.
+	// Reading is simulation, so this needs no key and runs even on an instance
+	// that cannot sign.
+	reconciler := &worker.Reconciler{
+		Invoker:  &soroban.Reader{RPC: rpc},
+		Store:    db,
+		LedgerID: cfg.CoverageLedgerID,
+		Log:      log.With("job", "reconcile"),
+	}
+	if err := reconciler.Run(ctx); err != nil {
+		log.Error("initial reconcile failed", "err", err)
+	}
+	go every(ctx, cfg.ReconcileInterval, log.With("job", "reconcile"), reconciler.Run)
+
 	tomlSync := &worker.TomlSync{
 		Horizon: hz,
 		Fetcher: stellartoml.NewFetcher(),
@@ -113,19 +127,6 @@ func run(cfg config.Config, log *slog.Logger) error {
 		log.Info("supply posting enabled", "poster", signer.Address())
 		go every(ctx, cfg.PostInterval, log.With("job", "poster"), poster.Run)
 
-		// Reads contract state back, so it needs an account to simulate from
-		// and runs only where one is configured. It shares the poster's ticker
-		// because both are a handful of cheap calls per asset.
-		reconciler := &worker.Reconciler{
-			Invoker:  invoker,
-			Store:    db,
-			LedgerID: cfg.CoverageLedgerID,
-			Log:      log.With("job", "reconcile"),
-		}
-		if err := reconciler.Run(ctx); err != nil {
-			log.Error("initial reconcile failed", "err", err)
-		}
-		go every(ctx, cfg.PostInterval, log.With("job", "reconcile"), reconciler.Run)
 	} else {
 		log.Info("supply posting disabled (SUPPLY_POSTER_SECRET not set)")
 	}

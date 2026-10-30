@@ -28,10 +28,14 @@ type Config struct {
 	PosterSecret       string
 	IngestInterval     time.Duration
 	PostInterval       time.Duration
-	RepostAfter        time.Duration
-	TomlInterval       time.Duration
-	CORSOrigins        []string
-	LogLevel           string
+	// ReconcileInterval is how often contract state is read back to repair
+	// what event ingestion missed. Each pass is a handful of simulations per
+	// asset, so it can be infrequent.
+	ReconcileInterval time.Duration
+	RepostAfter       time.Duration
+	TomlInterval      time.Duration
+	CORSOrigins       []string
+	LogLevel          string
 	// KeepAwakeURL is requested every KeepAwakeInterval so a host that sleeps
 	// idle services (Render's free tier) keeps this one, and its poster, up.
 	KeepAwakeURL      string
@@ -77,6 +81,7 @@ func Load() (Config, error) {
 	}{
 		{"INGEST_INTERVAL", "10s", &c.IngestInterval},
 		{"POST_INTERVAL", "15m", &c.PostInterval},
+		{"RECONCILE_INTERVAL", "15m", &c.ReconcileInterval},
 		{"REPOST_AFTER", "6h", &c.RepostAfter},
 		{"TOML_INTERVAL", "6h", &c.TomlInterval},
 		{"KEEP_AWAKE_INTERVAL", "10m", &c.KeepAwakeInterval},
