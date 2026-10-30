@@ -1,8 +1,12 @@
 package worker
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"math/big"
 	"sort"
 	"strings"
@@ -12,6 +16,7 @@ import (
 	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
 )
 
 // A getEvents page in the shape testnet RPC serves today: no
@@ -121,5 +126,139 @@ func TestDecodePageDropsUntrackedEvents(t *testing.T) {
 	}
 	if len(decoded) != 0 {
 		t.Fatalf("want untracked event dropped, got %d", len(decoded))
+	}
+}
+
+// ---- Run ------------------------------------------------------------------
+
+type fakeRPC struct {
+	// pages keyed by the cursor asked for; "" is a start-ledger request.
+	pages   map[string]protocol.GetEventsResponse
+	errs    map[string]error
+	latest  uint32
+	asked   []string
+	oldest  uint32
+	askedSL []uint32
+}
+
+func (f *fakeRPC) GetEvents(_ context.Context, req protocol.GetEventsRequest) (protocol.GetEventsResponse, error) {
+	key := ""
+	if req.Pagination != nil && req.Pagination.Cursor != nil {
+		key = req.Pagination.Cursor.String()
+	}
+	if key == "" {
+		f.askedSL = append(f.askedSL, req.StartLedger)
+	}
+	f.asked = append(f.asked, key)
+	if err := f.errs[key]; err != nil {
+		return protocol.GetEventsResponse{}, err
+	}
+	resp := f.pages[key]
+	if resp.LatestLedger == 0 {
+		resp.LatestLedger = f.latest
+	}
+	if resp.OldestLedger == 0 {
+		resp.OldestLedger = f.oldest
+	}
+	return resp, nil
+}
+
+func (f *fakeRPC) GetLatestLedger(context.Context) (protocol.GetLatestLedgerResponse, error) {
+	return protocol.GetLatestLedgerResponse{Sequence: f.latest}, nil
+}
+
+type fakeStore struct {
+	progress store.Progress
+	applied  [][]any
+	cursors  []string
+	ledgers  []uint32
+}
+
+func (f *fakeStore) Progress(context.Context, string) (store.Progress, error) {
+	return f.progress, nil
+}
+
+func (f *fakeStore) ApplyEvents(_ context.Context, _, cursor string, ledger uint32, events []any) error {
+	f.applied = append(f.applied, events)
+	f.cursors = append(f.cursors, cursor)
+	f.ledgers = append(f.ledgers, ledger)
+	return nil
+}
+
+func newIngester(rpc *fakeRPC, db *fakeStore) *Ingester {
+	return &Ingester{
+		RPC:         rpc,
+		Store:       db,
+		ContractIDs: []string{"CC2QQ7R4FLPHZP7KA5AO4IASXXICTG6N4GQXCXITTEBNYQEYTYXKMN4D"},
+		StartLedger: 5034380,
+		Log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+}
+
+// The exact refusal testnet RPC returns for a cursor that has aged out.
+var retentionErr = errors.New("[-32600] startLedger must be within the ledger range: 5347200 - 5468159")
+
+func TestRunRestartsWhenCursorFellOutOfRetention(t *testing.T) {
+	page := supplyPostedPage(t)
+	stale := "0022785183757369344-0000000000"
+	rpc := &fakeRPC{
+		latest: 5468159,
+		oldest: 5347200,
+		errs:   map[string]error{stale: retentionErr},
+		pages: map[string]protocol.GetEventsResponse{
+			"": {Events: page, Cursor: "0023421401557905408-0000000000"},
+		},
+	}
+	db := &fakeStore{progress: store.Progress{Cursor: stale, ScannedLedger: 5305089, EventLedger: 5305089}}
+
+	if err := newIngester(rpc, db).Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(db.applied) != 1 || len(db.applied[0]) != 1 {
+		t.Fatalf("want the page after recovery stored, got %v", db.applied)
+	}
+	// The configured start is long out of retention, so the restart has to ask
+	// for the oldest ledger RPC still serves rather than the configured one.
+	// (The first entry is the probe startLedger makes to learn the window.)
+	if got := rpc.askedSL[len(rpc.askedSL)-1]; got != 5347200 {
+		t.Errorf("restarted from ledger %d, want 5347200", got)
+	}
+}
+
+func TestRunGivesUpWhenRestartIsAlsoRefused(t *testing.T) {
+	stale := "0022785183757369344-0000000000"
+	rpc := &fakeRPC{
+		latest: 5468159,
+		oldest: 5347200,
+		errs:   map[string]error{stale: retentionErr, "": retentionErr},
+	}
+	db := &fakeStore{progress: store.Progress{Cursor: stale}}
+
+	err := newIngester(rpc, db).Run(context.Background())
+	if err == nil {
+		t.Fatal("want an error once the restart is refused too")
+	}
+	// The stale cursor is tried once and never retried, so a refusal that
+	// outlasts the recovery cannot spin.
+	stales := 0
+	for _, c := range rpc.asked {
+		if c == stale {
+			stales++
+		}
+	}
+	if stales != 1 {
+		t.Errorf("stale cursor asked for %d times, want 1", stales)
+	}
+}
+
+func TestRunReportsUnrelatedRPCErrors(t *testing.T) {
+	rpc := &fakeRPC{latest: 100, oldest: 1, errs: map[string]error{"": errors.New("connection reset")}}
+	db := &fakeStore{}
+	err := newIngester(rpc, db).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "connection reset") {
+		t.Fatalf("want the RPC error reported, got %v", err)
+	}
+	if len(db.applied) != 0 {
+		t.Error("nothing should be stored when the page failed")
 	}
 }
