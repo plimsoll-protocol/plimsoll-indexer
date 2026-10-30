@@ -1,12 +1,18 @@
 name: Keep alive and check freshness
 
-# Render's free tier sleeps after ~15 idle minutes, which also stops the
-# supply poster. This pings the service often enough to keep it awake, and
-# fails loudly if the service stops ingesting or if on-chain supply snapshots
-# go stale.
+# Render's free tier sleeps after ~15 idle minutes, which also stops the supply
+# poster. The service keeps itself awake by requesting its own /healthz
+# (KEEP_AWAKE_URL), so this workflow is the outside check on that: it wakes the
+# service, and fails loudly if ingestion has stalled or supply snapshots have
+# gone stale.
+#
+# The schedule asked for every 10 minutes and GitHub delivered roughly every
+# four hours, which is what a frequent cron on a small repo gets. Half-hourly is
+# what the monitor actually needs, and asking for what is wanted makes the gaps
+# between runs mean something.
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "7,37 * * * *"
   workflow_dispatch:
 
 permissions:
