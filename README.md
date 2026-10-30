@@ -112,6 +112,13 @@ On Render the indexer requests its own `/healthz` every 10 minutes
 not put it to sleep and supply posting keeps running. One always-on service
 uses about 744 of the free tier's 750 monthly instance hours.
 
+[.github/workflows/keepalive.yml](.github/workflows/keepalive.yml) watches the
+deployment from outside: it wakes the service, fails if nothing has been
+ingested recently, and fails if any asset's supply snapshot has gone stale.
+The ingestion check exists because a scan position alone is not evidence of
+progress — ingestion once stopped for nine days while `/healthz` kept
+answering `ok` with a current ledger.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Security: [SECURITY.md](SECURITY.md).

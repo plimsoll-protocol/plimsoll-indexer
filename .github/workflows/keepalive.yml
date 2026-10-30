@@ -2,7 +2,8 @@ name: Keep alive and check freshness
 
 # Render's free tier sleeps after ~15 idle minutes, which also stops the
 # supply poster. This pings the service often enough to keep it awake, and
-# fails loudly if on-chain supply snapshots go stale.
+# fails loudly if the service stops ingesting or if on-chain supply snapshots
+# go stale.
 on:
   schedule:
     - cron: "*/10 * * * *"
@@ -19,6 +20,8 @@ env:
   INDEXER_URL: https://plimsoll-indexer.onrender.com
   # Poster reposts every 6h (REPOST_AFTER); allow 2h of slack.
   MAX_SUPPLY_AGE_SECONDS: "28800"
+  # Each repost raises an event, so the same bound applies to ingestion.
+  MAX_EVENT_AGE_SECONDS: "28800"
 
 jobs:
   ping:
@@ -28,20 +31,42 @@ jobs:
       - name: Wake and health-check the indexer
         run: |
           curl -fsS --max-time 90 --retry 3 --retry-delay 10 --retry-all-errors \
-            "$INDEXER_URL/healthz"
+            "$INDEXER_URL/healthz" > health.json
+          cat health.json
+
+      # Ingestion once stopped for nine days while /healthz still answered
+      # "ok" with a current ledger, because that ledger is how far the scan
+      # reached and advances whether or not anything is stored. The scan
+      # position is no use as a monitor; the last event written is.
+      - name: Fail if nothing has been ingested recently
+        run: |
+          age=$(jq -r '.last_event_age_seconds // empty' health.json)
+          if [ -z "$age" ]; then
+            echo "::error::/healthz reported no last_event_age_seconds. Is the service running a build from before the ingest fix?"
+            exit 1
+          fi
+          echo "last ingested event is ${age}s old"
+          if [ "$age" -gt "$MAX_EVENT_AGE_SECONDS" ]; then
+            echo "::error::nothing has been ingested for ${age}s (limit $MAX_EVENT_AGE_SECONDS). Ingestion is stalled even though the service answers."
+            exit 1
+          fi
 
       - name: Fail if any supply snapshot is stale
         run: |
           now=$(date +%s)
           curl -fsS --max-time 60 "$INDEXER_URL/v1/assets" > assets.json
-          jq -r '.assets[] | "\(.code) \(.supply.posted_at // "none")"' assets.json | while read -r code posted; do
+          stale=0
+          while read -r code posted; do
             if [ "$posted" = "none" ]; then
-              echo "::error::$code has no supply snapshot"; exit 1
+              echo "::error::$code has no supply snapshot"
+              stale=1
+              continue
             fi
             age=$(( now - $(date -d "$posted" +%s) ))
             echo "$code supply age ${age}s"
             if [ "$age" -gt "$MAX_SUPPLY_AGE_SECONDS" ]; then
               echo "::error::$code supply snapshot is ${age}s old (limit $MAX_SUPPLY_AGE_SECONDS). Is SUPPLY_POSTER_SECRET set and the poster funded?"
-              exit 1
+              stale=1
             fi
-          done
+          done <<< "$(jq -r '.assets[] | "\(.code) \(.supply.posted_at // "none")"' assets.json)"
+          exit "$stale"
