@@ -47,7 +47,7 @@ bucket can be recomputed from Horizon's `/assets` endpoint.
 
 | Method and path | Returns |
 | --- | --- |
-| `GET /healthz` | `{status, ingested_to_ledger}` |
+| `GET /healthz` | `{status, ingested_to_ledger, last_event_ledger, last_event_at, last_event_age_seconds}` |
 | `GET /v1/network` | Contract ids, RPC and Horizon URLs |
 | `GET /v1/assets?min_tier=1` | Every asset with latest supply, latest report per tier, coverage and stellar.toml data |
 | `GET /v1/assets/{sac}?min_tier=1` | One asset, same shape |

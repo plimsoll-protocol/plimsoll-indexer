@@ -29,10 +29,11 @@ type Ingester struct {
 
 // Run pulls every available page once. Call it on a ticker.
 func (in *Ingester) Run(ctx context.Context) error {
-	cursor, _, err := in.Store.Cursor(ctx, cursorName)
+	progress, err := in.Store.Progress(ctx, cursorName)
 	if err != nil {
-		return fmt.Errorf("read cursor: %w", err)
+		return fmt.Errorf("read progress: %w", err)
 	}
+	cursor := progress.Cursor
 	for {
 		req := protocol.GetEventsRequest{
 			Filters: []protocol.EventFilter{{

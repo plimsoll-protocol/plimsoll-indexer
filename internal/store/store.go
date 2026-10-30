@@ -53,17 +53,34 @@ func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
 // ---- ingest cursor --------------------------------------------------------
 
-// Cursor returns the stored RPC cursor and last ledger for name.
-func (s *Store) Cursor(ctx context.Context, name string) (string, uint32, error) {
-	var cur string
-	var ledger int64
+// Progress is how far ingestion has reached.
+type Progress struct {
+	// Cursor and ScannedLedger advance on every page, empty pages included.
+	Cursor        string
+	ScannedLedger uint32
+	// EventLedger and EventAt describe the last event actually written. A scan
+	// that keeps advancing while these stand still means pages are arriving but
+	// nothing in them is being stored.
+	EventLedger uint32
+	EventAt     time.Time
+}
+
+// Progress returns how far ingestion for name has reached.
+func (s *Store) Progress(ctx context.Context, name string) (Progress, error) {
+	var p Progress
+	var scanned, event int64
+	var at *time.Time
 	err := s.pool.QueryRow(ctx,
-		`SELECT cursor, ledger FROM ingest_cursor WHERE name = $1`, name,
-	).Scan(&cur, &ledger)
+		`SELECT cursor, ledger, event_ledger, event_at FROM ingest_cursor WHERE name = $1`, name,
+	).Scan(&p.Cursor, &scanned, &event, &at)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", 0, nil
+		return Progress{}, nil
 	}
-	return cur, uint32(ledger), err
+	p.ScannedLedger, p.EventLedger = uint32(scanned), uint32(event)
+	if at != nil {
+		p.EventAt = *at
+	}
+	return p, err
 }
 
 // ApplyEvents writes decoded events and advances the cursor in one transaction.
@@ -79,12 +96,34 @@ func (s *Store) ApplyEvents(ctx context.Context, name, cursor string, ledger uin
 			return err
 		}
 	}
+	// GREATEST keeps the recorded event position monotonic, so a page that
+	// carries nothing cannot walk it backwards.
+	var eventLedger int64
+	var eventAt *time.Time
+	for _, ev := range events {
+		m, ok := ev.(soroban.WithMeta)
+		if !ok {
+			continue
+		}
+		if meta := m.EventMeta(); int64(meta.Ledger) > eventLedger {
+			eventLedger = int64(meta.Ledger)
+			at := meta.ClosedAt
+			eventAt = &at
+		}
+	}
 	_, err = tx.Exec(ctx, `
-		INSERT INTO ingest_cursor (name, cursor, ledger, updated_at)
-		VALUES ($1, $2, $3, now())
+		INSERT INTO ingest_cursor (name, cursor, ledger, event_ledger, event_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, now())
 		ON CONFLICT (name) DO UPDATE
-		SET cursor = EXCLUDED.cursor, ledger = EXCLUDED.ledger, updated_at = now()`,
-		name, cursor, int64(ledger))
+		SET cursor = EXCLUDED.cursor,
+		    ledger = EXCLUDED.ledger,
+		    event_ledger = GREATEST(ingest_cursor.event_ledger, EXCLUDED.event_ledger),
+		    event_at = CASE
+		        WHEN EXCLUDED.event_ledger >= ingest_cursor.event_ledger THEN EXCLUDED.event_at
+		        ELSE ingest_cursor.event_at
+		    END,
+		    updated_at = now()`,
+		name, cursor, int64(ledger), eventLedger, eventAt)
 	if err != nil {
 		return fmt.Errorf("save cursor: %w", err)
 	}

@@ -69,7 +69,14 @@ func (f *fake) Breakdown(_ context.Context, h string) ([]byte, error) {
 	}
 	return nil, store.ErrNotFound
 }
-func (f *fake) Cursor(context.Context, string) (string, uint32, error) { return "c", 42, nil }
+func (f *fake) Progress(context.Context, string) (store.Progress, error) {
+	return store.Progress{
+		Cursor:        "c",
+		ScannedLedger: 42,
+		EventLedger:   40,
+		EventAt:       now.Add(-90 * time.Second),
+	}, nil
+}
 
 func server() *httptest.Server {
 	f := &fake{
@@ -150,6 +157,14 @@ func TestListAndMisc(t *testing.T) {
 	h := get(t, srv, "/healthz", 200)
 	if h["ingested_to_ledger"].(float64) != 42 {
 		t.Fatal("health missing ledger")
+	}
+	// A scan far ahead of the last stored event is the shape of silently
+	// broken ingestion, so health has to report both.
+	if h["last_event_ledger"].(float64) != 40 {
+		t.Errorf("last_event_ledger = %v", h["last_event_ledger"])
+	}
+	if h["last_event_age_seconds"].(float64) != 90 {
+		t.Errorf("last_event_age_seconds = %v", h["last_event_age_seconds"])
 	}
 	get(t, srv, "/v1/assets/"+sac+"/supply?limit=0", 400)
 	get(t, srv, "/v1/assets/"+sac+"/reports", 200)

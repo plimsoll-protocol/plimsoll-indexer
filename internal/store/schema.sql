@@ -6,6 +6,11 @@ CREATE TABLE IF NOT EXISTS ingest_cursor (
     ledger      BIGINT NOT NULL DEFAULT 0,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- `ledger` is how far the scan has reached, which advances whether or not a
+-- page held anything. These record the last event actually written, so a scan
+-- that silently stores nothing is visible from /healthz.
+ALTER TABLE ingest_cursor ADD COLUMN IF NOT EXISTS event_ledger BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE ingest_cursor ADD COLUMN IF NOT EXISTS event_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS assets (
     sac             TEXT PRIMARY KEY,
