@@ -29,6 +29,60 @@ type Result struct {
 	Ledger uint32
 }
 
+// Address is the account that signs and sources this invoker's calls.
+func (inv *Invoker) Address() string { return inv.Signer.Address() }
+
+// Read simulates fn on contractID and returns its result without submitting a
+// transaction, so contract state can be queried without paying a fee. The
+// simulation is built on the signer's account only because simulation needs a
+// source; nothing is signed or sent.
+func (inv *Invoker) Read(ctx context.Context, contractID, fn string, args []xdr.ScVal) (xdr.ScVal, error) {
+	var out xdr.ScVal
+	contractAddr, err := ScAddress(contractID)
+	if err != nil {
+		return out, fmt.Errorf("contract id: %w", err)
+	}
+	op := &txnbuild.InvokeHostFunction{
+		HostFunction: xdr.HostFunction{
+			Type: xdr.HostFunctionTypeHostFunctionTypeInvokeContract,
+			InvokeContract: &xdr.InvokeContractArgs{
+				ContractAddress: contractAddr,
+				FunctionName:    xdr.ScSymbol(fn),
+				Args:            xdr.ScVec(args),
+			},
+		},
+		SourceAccount: inv.Signer.Address(),
+	}
+	// Simulation never consumes the sequence number, so a placeholder is fine
+	// and saves a round trip to load the account.
+	tx, err := build(inv.Signer.Address(), 0, txnbuild.MinBaseFee, op)
+	if err != nil {
+		return out, err
+	}
+	b64, err := tx.Base64()
+	if err != nil {
+		return out, err
+	}
+	sim, err := inv.RPC.SimulateTransaction(ctx, protocol.SimulateTransactionRequest{Transaction: b64})
+	if err != nil {
+		return out, fmt.Errorf("simulate: %w", err)
+	}
+	if sim.Error != "" {
+		return out, fmt.Errorf("simulate %s: %s", fn, sim.Error)
+	}
+	if len(sim.Results) != 1 {
+		return out, fmt.Errorf("simulate %s: want 1 result, got %d", fn, len(sim.Results))
+	}
+	ret := sim.Results[0].ReturnValueXDR
+	if ret == nil {
+		return out, fmt.Errorf("simulate %s: no return value", fn)
+	}
+	if err := xdr.SafeUnmarshalBase64(*ret, &out); err != nil {
+		return out, fmt.Errorf("decode %s result: %w", fn, err)
+	}
+	return out, nil
+}
+
 // Invoke calls fn on contractID with args and waits for the result.
 func (inv *Invoker) Invoke(ctx context.Context, contractID, fn string, args []xdr.ScVal) (Result, error) {
 	contractAddr, err := ScAddress(contractID)
