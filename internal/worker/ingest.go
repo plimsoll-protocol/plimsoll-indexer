@@ -59,18 +59,9 @@ func (in *Ingester) Run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("getEvents: %w", err)
 		}
-		decoded := make([]any, 0, len(resp.Events))
-		for _, e := range resp.Events {
-			if !e.InSuccessfulContractCall {
-				continue
-			}
-			ev, err := soroban.Decode(e)
-			if err != nil {
-				return err
-			}
-			if ev != nil {
-				decoded = append(decoded, ev)
-			}
+		decoded, err := decodePage(resp.Events)
+		if err != nil {
+			return err
 		}
 		if err := in.Store.ApplyEvents(ctx, cursorName, resp.Cursor, resp.LatestLedger, decoded); err != nil {
 			return fmt.Errorf("apply events: %w", err)
@@ -83,6 +74,28 @@ func (in *Ingester) Run(ctx context.Context) error {
 			return nil
 		}
 	}
+}
+
+// decodePage turns one page of RPC events into the typed events this indexer
+// stores, dropping the ones it does not track.
+//
+// Every event a page carries is kept. RPC used to mark events raised by calls
+// that later failed with inSuccessfulContractCall=false, and stopped sending
+// the field once it only ever returned events from successful calls. Filtering
+// on it silently dropped every event once the field went missing, which wedged
+// ingestion, so the filter is gone rather than defaulted either way.
+func decodePage(events []protocol.EventInfo) ([]any, error) {
+	decoded := make([]any, 0, len(events))
+	for _, e := range events {
+		ev, err := soroban.Decode(e)
+		if err != nil {
+			return nil, err
+		}
+		if ev != nil {
+			decoded = append(decoded, ev)
+		}
+	}
+	return decoded, nil
 }
 
 // startLedger clamps the configured start to RPC's retention window.
