@@ -2,23 +2,37 @@ package soroban
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
-	"github.com/stellar/go-stellar-sdk/clients/rpcclient"
 	"github.com/stellar/go-stellar-sdk/keypair"
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 	"github.com/stellar/go-stellar-sdk/txnbuild"
 	"github.com/stellar/go-stellar-sdk/xdr"
 )
 
+// Simulator is the one RPC call a read-only simulation needs.
+type Simulator interface {
+	SimulateTransaction(ctx context.Context, req protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error)
+}
+
+// RPC is the part of the Soroban RPC client an invocation needs.
+// *rpcclient.Client satisfies it. It is an interface so a fake can stand in,
+// which is the only way to exercise archived-entry restoration: a live network
+// archives an entry on its own schedule, not on a test's.
+type RPC interface {
+	Simulator
+	LoadAccount(ctx context.Context, address string) (txnbuild.Account, error)
+	SendTransaction(ctx context.Context, req protocol.SendTransactionRequest) (protocol.SendTransactionResponse, error)
+	PollTransaction(ctx context.Context, txHash string) (protocol.GetTransactionResponse, error)
+}
+
 // Invoker submits contract calls signed by a single account. The account is
 // both the transaction source and the address whose auth the contract
 // requires, so simulation returns source-account credentials and no separate
 // auth-entry signing is needed.
 type Invoker struct {
-	RPC        *rpcclient.Client
+	RPC        RPC
 	Signer     *keypair.Full
 	Passphrase string
 }
@@ -46,7 +60,7 @@ const placeholderSource = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 // Reader calls contract functions read-only, by simulation. It holds no key,
 // so an instance with nothing to sign with can still read contract state.
 type Reader struct {
-	RPC *rpcclient.Client
+	RPC Simulator
 }
 
 // Read simulates fn on contractID and returns its result. Nothing is signed,
@@ -55,7 +69,7 @@ func (r *Reader) Read(ctx context.Context, contractID, fn string, args []xdr.ScV
 	return simulateRead(ctx, r.RPC, placeholderSource, contractID, fn, args)
 }
 
-func simulateRead(ctx context.Context, rpc *rpcclient.Client, source, contractID, fn string, args []xdr.ScVal) (xdr.ScVal, error) {
+func simulateRead(ctx context.Context, rpc Simulator, source, contractID, fn string, args []xdr.ScVal) (xdr.ScVal, error) {
 	var out xdr.ScVal
 	contractAddr, err := ScAddress(contractID)
 	if err != nil {
@@ -103,10 +117,40 @@ func simulateRead(ctx context.Context, rpc *rpcclient.Client, source, contractID
 }
 
 // Invoke calls fn on contractID with args and waits for the result.
+//
+// Soroban archives a persistent ledger entry once its TTL runs out, and
+// simulation then returns a restore preamble instead of a result. That is not
+// an edge case but a certainty for a contract nobody has written to lately, so
+// the restore the preamble asks for is submitted first and the call retried
+// once. Failing instead, as this used to, meant the poster would simply stop
+// posting the day the demo's entries aged out.
 func (inv *Invoker) Invoke(ctx context.Context, contractID, fn string, args []xdr.ScVal) (Result, error) {
+	res, preamble, err := inv.attempt(ctx, contractID, fn, args)
+	if err != nil || preamble == nil {
+		return res, err
+	}
+	if err := inv.restore(ctx, preamble); err != nil {
+		return Result{}, fmt.Errorf("restore archived entries for %s: %w", fn, err)
+	}
+	res, preamble, err = inv.attempt(ctx, contractID, fn, args)
+	if err != nil {
+		return Result{}, err
+	}
+	if preamble != nil {
+		// One restore is all this will do: a second preamble means something
+		// other than a stale TTL is wrong, and retrying would spend fees in a
+		// loop without fixing it.
+		return Result{}, fmt.Errorf("invoke %s: entries still archived after a restore", fn)
+	}
+	return res, nil
+}
+
+// attempt simulates fn, then signs and sends it. A non-nil preamble means
+// nothing was sent because archived entries have to be restored first.
+func (inv *Invoker) attempt(ctx context.Context, contractID, fn string, args []xdr.ScVal) (Result, *protocol.RestorePreamble, error) {
 	contractAddr, err := ScAddress(contractID)
 	if err != nil {
-		return Result{}, fmt.Errorf("contract id: %w", err)
+		return Result{}, nil, fmt.Errorf("contract id: %w", err)
 	}
 	hostFn := xdr.HostFunction{
 		Type: xdr.HostFunctionTypeHostFunctionTypeInvokeContract,
@@ -117,49 +161,45 @@ func (inv *Invoker) Invoke(ctx context.Context, contractID, fn string, args []xd
 		},
 	}
 
-	acct, err := inv.RPC.LoadAccount(ctx, inv.Signer.Address())
+	seq, err := inv.sequence(ctx)
 	if err != nil {
-		return Result{}, fmt.Errorf("load account: %w", err)
-	}
-	seq, err := acct.GetSequenceNumber()
-	if err != nil {
-		return Result{}, fmt.Errorf("sequence: %w", err)
+		return Result{}, nil, err
 	}
 
 	// 1. Simulate to learn the footprint, resource fee and auth entries.
 	simOp := &txnbuild.InvokeHostFunction{HostFunction: hostFn, SourceAccount: inv.Signer.Address()}
 	simTx, err := build(inv.Signer.Address(), seq, txnbuild.MinBaseFee, simOp)
 	if err != nil {
-		return Result{}, err
+		return Result{}, nil, err
 	}
 	simB64, err := simTx.Base64()
 	if err != nil {
-		return Result{}, err
+		return Result{}, nil, err
 	}
 	sim, err := inv.RPC.SimulateTransaction(ctx, protocol.SimulateTransactionRequest{Transaction: simB64})
 	if err != nil {
-		return Result{}, fmt.Errorf("simulate: %w", err)
+		return Result{}, nil, fmt.Errorf("simulate: %w", err)
 	}
 	if sim.Error != "" {
-		return Result{}, fmt.Errorf("simulate %s: %s", fn, sim.Error)
+		return Result{}, nil, fmt.Errorf("simulate %s: %s", fn, sim.Error)
 	}
 	if sim.RestorePreamble != nil {
-		return Result{}, errors.New("simulate: ledger entries need restoring first")
+		return Result{}, sim.RestorePreamble, nil
 	}
 	if len(sim.Results) != 1 {
-		return Result{}, fmt.Errorf("simulate: want 1 result, got %d", len(sim.Results))
+		return Result{}, nil, fmt.Errorf("simulate: want 1 result, got %d", len(sim.Results))
 	}
 
 	var data xdr.SorobanTransactionData
 	if err := xdr.SafeUnmarshalBase64(sim.TransactionDataXDR, &data); err != nil {
-		return Result{}, fmt.Errorf("decode transaction data: %w", err)
+		return Result{}, nil, fmt.Errorf("decode transaction data: %w", err)
 	}
 	var auth []xdr.SorobanAuthorizationEntry
 	if sim.Results[0].AuthXDR != nil {
 		for _, a := range *sim.Results[0].AuthXDR {
 			var entry xdr.SorobanAuthorizationEntry
 			if err := xdr.SafeUnmarshalBase64(a, &entry); err != nil {
-				return Result{}, fmt.Errorf("decode auth entry: %w", err)
+				return Result{}, nil, fmt.Errorf("decode auth entry: %w", err)
 			}
 			auth = append(auth, entry)
 		}
@@ -174,9 +214,55 @@ func (inv *Invoker) Invoke(ctx context.Context, contractID, fn string, args []xd
 	}
 	tx, err := build(inv.Signer.Address(), seq, txnbuild.MinBaseFee+sim.MinResourceFee, op)
 	if err != nil {
-		return Result{}, err
+		return Result{}, nil, err
 	}
-	tx, err = tx.Sign(inv.Passphrase, inv.Signer)
+	res, err := inv.signSendPoll(ctx, tx, fn)
+	return res, nil, err
+}
+
+// restore submits the RestoreFootprint the preamble describes, bringing the
+// archived entries the call needs back into the live state.
+func (inv *Invoker) restore(ctx context.Context, preamble *protocol.RestorePreamble) error {
+	var data xdr.SorobanTransactionData
+	if err := xdr.SafeUnmarshalBase64(preamble.TransactionDataXDR, &data); err != nil {
+		return fmt.Errorf("decode restore transaction data: %w", err)
+	}
+	seq, err := inv.sequence(ctx)
+	if err != nil {
+		return err
+	}
+	// The preamble already carries the footprint and resources for the restore,
+	// so this needs no simulation of its own.
+	op := &txnbuild.RestoreFootprint{
+		SourceAccount: inv.Signer.Address(),
+		Ext:           xdr.TransactionExt{V: 1, SorobanData: &data},
+	}
+	tx, err := build(inv.Signer.Address(), seq, txnbuild.MinBaseFee+preamble.MinResourceFee, op)
+	if err != nil {
+		return err
+	}
+	_, err = inv.signSendPoll(ctx, tx, "restore_footprint")
+	return err
+}
+
+// sequence reads the signer's current sequence number.
+//
+// It is read again before the restore and before the retry, rather than
+// reused, because the restore consumes one.
+func (inv *Invoker) sequence(ctx context.Context) (int64, error) {
+	acct, err := inv.RPC.LoadAccount(ctx, inv.Signer.Address())
+	if err != nil {
+		return 0, fmt.Errorf("load account: %w", err)
+	}
+	seq, err := acct.GetSequenceNumber()
+	if err != nil {
+		return 0, fmt.Errorf("sequence: %w", err)
+	}
+	return seq, nil
+}
+
+func (inv *Invoker) signSendPoll(ctx context.Context, tx *txnbuild.Transaction, what string) (Result, error) {
+	tx, err := tx.Sign(inv.Passphrase, inv.Signer)
 	if err != nil {
 		return Result{}, fmt.Errorf("sign: %w", err)
 	}
@@ -189,7 +275,7 @@ func (inv *Invoker) Invoke(ctx context.Context, contractID, fn string, args []xd
 		return Result{}, fmt.Errorf("send: %w", err)
 	}
 	if sent.Status == "ERROR" || sent.Status == "TRY_AGAIN_LATER" {
-		return Result{}, fmt.Errorf("send %s: status %s %s", fn, sent.Status, sent.ErrorResultXDR)
+		return Result{}, fmt.Errorf("send %s: status %s %s", what, sent.Status, sent.ErrorResultXDR)
 	}
 
 	pollCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
