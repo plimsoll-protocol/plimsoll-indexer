@@ -48,15 +48,72 @@ type latestLedger interface {
 // ingestion stalled the poster could not see its own posts land, so it
 // reposted every tick for nine days and paid a fee each time.
 type Poster struct {
-	Horizon     supplySource
-	RPC         latestLedger
-	Invoker     contracts
-	Store       breakdownStore
-	LedgerID    string
-	RepostAfter time.Duration
-	Log         *slog.Logger
-	Now         func() time.Time
+	Horizon supplySource
+	// HorizonCheck is a second, independent Horizon the supply is compared
+	// against before it is signed. Nil disables the comparison.
+	HorizonCheck supplySource
+	RPC          latestLedger
+	Invoker      contracts
+	Store        breakdownStore
+	LedgerID     string
+	RepostAfter  time.Duration
+	Log          *slog.Logger
+	Now          func() time.Time
 }
+
+// errSupplyDisagreement stops a post when two Horizons report different totals
+// for the same ledger. The figure this indexer signs is the one thing it
+// asserts on its own authority, so a second source disagreeing about it is
+// reason to publish nothing rather than pick a side.
+var errSupplyDisagreement = errors.New("horizons disagree about supply at the same ledger")
+
+// crossCheck compares a breakdown against the second Horizon.
+//
+// Two honest Horizons at the same ledger must report the same total, so that is
+// the comparison worth making: disagreement there is disagreement about a fact.
+// At different ledgers they may legitimately differ because supply moved in
+// between, which is not evidence of anything, so a skew is retried once and
+// then reported rather than treated as a lie. Refusing to post on skew alone
+// would stall a fast-moving asset indefinitely, which would be a worse failure
+// than the one being guarded against.
+func (p *Poster) crossCheck(ctx context.Context, b horizon.Breakdown, code, issuer string) error {
+	if p.HorizonCheck == nil {
+		return nil
+	}
+	for attempt := 1; ; attempt++ {
+		other, err := p.HorizonCheck.Supply(ctx, code, issuer)
+		if err != nil {
+			// The check Horizon being unreachable says nothing about the figure.
+			// Failing the post over it would hand any third party the power to
+			// stop this indexer.
+			p.Log.Warn("supply cross-check unavailable", "code", code, "err", err)
+			return nil
+		}
+		agree := b.Total == other.Total
+		if agree {
+			p.Log.Debug("supply cross-checked", "code", code, "total", b.Total,
+				"ledger", b.Ledger, "check_ledger", other.Ledger)
+			return nil
+		}
+		if b.Ledger == other.Ledger {
+			p.Log.Error("horizons disagree about supply", "code", code, "issuer", issuer,
+				"total", b.Total, "check_total", other.Total,
+				"ledger", b.Ledger, "check_ledger", other.Ledger)
+			return errSupplyDisagreement
+		}
+		if attempt == crossCheckAttempts {
+			p.Log.Warn("supply not cross-checked: horizons are at different ledgers",
+				"code", code, "total", b.Total, "check_total", other.Total,
+				"ledger", b.Ledger, "check_ledger", other.Ledger)
+			return nil
+		}
+	}
+}
+
+// crossCheckAttempts is how many times the second Horizon is asked before a
+// ledger skew is accepted as unverifiable. Ledgers close about every five
+// seconds, so a second look is often enough for the two to line up.
+const crossCheckAttempts = 2
 
 func (p *Poster) Run(ctx context.Context) error {
 	assets, err := p.Store.ListAssets(ctx)
@@ -102,6 +159,13 @@ func (p *Poster) postOne(ctx context.Context, sac, code, issuer string) error {
 		if b.Ledger <= last.Ledger {
 			return nil // Horizon has not moved past the posted snapshot yet.
 		}
+	}
+
+	// Checked here rather than on every fetch: this is the point where the
+	// figure stops being an observation and becomes something this indexer
+	// signs.
+	if err := p.crossCheck(ctx, b, code, issuer); err != nil {
+		return err
 	}
 
 	// The contract rejects a ledger newer than the one it is executing in.

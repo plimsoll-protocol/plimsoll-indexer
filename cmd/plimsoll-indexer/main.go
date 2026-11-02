@@ -124,6 +124,14 @@ func run(cfg config.Config, log *slog.Logger) error {
 			Log:         log.With("job", "poster"),
 			Now:         time.Now,
 		}
+		// Left nil when no second Horizon is configured: comparing hz against
+		// itself would always agree and prove nothing.
+		if cfg.HorizonCheckURL != "" {
+			poster.HorizonCheck = horizon.NewClient(cfg.HorizonCheckURL)
+			log.Info("supply cross-check enabled", "check_horizon", cfg.HorizonCheckURL)
+		} else {
+			log.Info("supply cross-check disabled (HORIZON_CHECK_URL not set)")
+		}
 		log.Info("supply posting enabled", "poster", signer.Address())
 		go every(ctx, cfg.PostInterval, log.With("job", "poster"), poster.Run)
 

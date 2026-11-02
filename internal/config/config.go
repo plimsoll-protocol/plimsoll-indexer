@@ -17,10 +17,15 @@ const (
 )
 
 type Config struct {
-	DatabaseURL        string
-	Port               string
-	RPCURL             string
-	HorizonURL         string
+	DatabaseURL string
+	Port        string
+	RPCURL      string
+	HorizonURL  string
+	// HorizonCheckURL is a second, independent Horizon the poster compares the
+	// supply against before signing it on chain. One Horizon is one point of
+	// trust for the only figure this indexer asserts itself. Empty disables the
+	// comparison.
+	HorizonCheckURL    string
 	NetworkPassphrase  string
 	CoverageLedgerID   string
 	ReporterRegistryID string
@@ -49,6 +54,7 @@ func Load() (Config, error) {
 		Port:               envOr("PORT", "8080"),
 		RPCURL:             envOr("STELLAR_RPC_URL", TestnetRPC),
 		HorizonURL:         strings.TrimRight(envOr("HORIZON_URL", TestnetHorizon), "/"),
+		HorizonCheckURL:    strings.TrimRight(os.Getenv("HORIZON_CHECK_URL"), "/"),
 		NetworkPassphrase:  envOr("STELLAR_NETWORK_PASSPHRASE", TestnetPassphrase),
 		CoverageLedgerID:   os.Getenv("COVERAGE_LEDGER_ID"),
 		ReporterRegistryID: os.Getenv("REPORTER_REGISTRY_ID"),
