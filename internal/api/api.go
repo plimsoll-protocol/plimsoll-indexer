@@ -3,6 +3,7 @@ package api
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -14,6 +15,9 @@ import (
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
 )
+
+//go:embed openapi.yaml
+var openAPISpec []byte
 
 // Reader is what the API needs from storage.
 type Reader interface {
@@ -49,6 +53,7 @@ type Server struct {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
+	mux.HandleFunc("GET /openapi.yaml", s.openAPI)
 	mux.HandleFunc("GET /v1/network", s.network)
 	mux.HandleFunc("GET /v1/assets", s.listAssets)
 	mux.HandleFunc("GET /v1/assets/{sac}", s.getAsset)
@@ -165,6 +170,12 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		body["last_event_age_seconds"] = int64(s.Now().Sub(p.EventAt).Seconds())
 	}
 	writeJSON(w, http.StatusOK, body)
+}
+
+func (s *Server) openAPI(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/yaml")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(openAPISpec)
 }
 
 func (s *Server) network(w http.ResponseWriter, _ *http.Request) {

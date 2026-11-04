@@ -1,0 +1,484 @@
+openapi: 3.1.0
+info:
+  title: Plimsoll Indexer API
+  description: OpenAPI 3.1.0 specification for Plimsoll read API over HTTP.
+  version: 1.0.0
+  license:
+    name: Apache 2.0
+    identifier: Apache-2.0
+servers:
+  - url: https://plimsoll-indexer.onrender.com
+    description: Hosted testnet API
+  - url: http://localhost:8080
+    description: Local development API
+security: []
+paths:
+  /healthz:
+    get:
+      summary: Health check and indexer sync status
+      operationId: healthCheck
+      responses:
+        '200':
+          description: Indexer is healthy and synced
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+                  ingested_to_ledger:
+                    type: integer
+                    example: 42
+                required:
+                  - status
+                  - ingested_to_ledger
+        '503':
+          description: Storage/database is unavailable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "db_unavailable"
+                required:
+                  - status
+  /openapi.yaml:
+    get:
+      summary: Get OpenAPI 3.1 specification
+      operationId: getOpenAPISpec
+      responses:
+        '200':
+          description: OpenAPI specification file
+          content:
+            application/yaml:
+              schema:
+                type: string
+  /v1/network:
+    get:
+      summary: Discover network parameters and contract IDs
+      operationId: getNetworkInfo
+      responses:
+        '200':
+          description: Network discovery parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NetworkInfo'
+  /v1/assets:
+    get:
+      summary: List all tracked assets with coverage and reports
+      operationId: listAssets
+      parameters:
+        - name: min_tier
+          in: query
+          required: false
+          description: Minimum tier level (1=transcribed, 2=issuer_signed, 3=auditor_signed)
+          schema:
+            type: integer
+            enum: [1, 2, 3]
+            default: 1
+      responses:
+        '200':
+          description: List of tracked assets
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  assets:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Asset'
+                required:
+                  - assets
+        '400':
+          description: Invalid request parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/assets/{sac}:
+    get:
+      summary: Get details, latest supply, reports, and coverage for a specific asset
+      operationId: getAsset
+      parameters:
+        - name: sac
+          in: path
+          required: true
+          description: Stellar Asset Contract (SAC) address
+          schema:
+            type: string
+            example: "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
+        - name: min_tier
+          in: query
+          required: false
+          description: Minimum tier level (1=transcribed, 2=issuer_signed, 3=auditor_signed)
+          schema:
+            type: integer
+            enum: [1, 2, 3]
+            default: 1
+      responses:
+        '200':
+          description: Asset details and current status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Asset'
+        '400':
+          description: Invalid request parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Asset not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/assets/{sac}/supply:
+    get:
+      summary: Get historical supply snapshots for an asset
+      operationId: getSupplyHistory
+      parameters:
+        - name: sac
+          in: path
+          required: true
+          description: Stellar Asset Contract (SAC) address
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of snapshots to return (1-1000)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        '200':
+          description: Supply history snapshots
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  supply:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Supply'
+                required:
+                  - supply
+        '400':
+          description: Invalid limit parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/assets/{sac}/reports:
+    get:
+      summary: Get historical reserve reports for an asset
+      operationId: getReportHistory
+      parameters:
+        - name: sac
+          in: path
+          required: true
+          description: Stellar Asset Contract (SAC) address
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of reports to return (1-1000)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        '200':
+          description: Reserve report history
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reports:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Report'
+                required:
+                  - reports
+        '400':
+          description: Invalid limit parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/reporters:
+    get:
+      summary: List registered reporters and their roles
+      operationId: listReporters
+      responses:
+        '200':
+          description: List of registered reporters
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reporters:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Reporter'
+                required:
+                  - reporters
+  /v1/breakdowns/{hash}:
+    get:
+      summary: Get raw supply breakdown by hash
+      operationId: getBreakdown
+      parameters:
+        - name: hash
+          in: path
+          required: true
+          description: SHA-256 breakdown hash
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Raw JSON breakdown served verbatim
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: Breakdown hash not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+components:
+  schemas:
+    NetworkInfo:
+      type: object
+      properties:
+        network_passphrase:
+          type: string
+          example: "Public Global Stellar Network ; September 2015"
+        rpc_url:
+          type: string
+          example: "https://mainnet.sorobanrpc.com"
+        horizon_url:
+          type: string
+          example: "https://horizon.stellar.org"
+        coverage_ledger_id:
+          type: string
+          example: "CC456..."
+        reporter_registry_id:
+          type: string
+          example: "CC789..."
+      required:
+        - network_passphrase
+        - rpc_url
+        - horizon_url
+        - coverage_ledger_id
+        - reporter_registry_id
+    Supply:
+      type: object
+      properties:
+        amount:
+          type: string
+          example: "10000000000"
+        ledger:
+          type: integer
+          example: 100
+        posted_at:
+          type: string
+          format: date-time
+          example: "2026-10-05T11:00:00Z"
+        breakdown_hash:
+          type: string
+          example: "abc"
+        poster:
+          type: string
+          example: "GPOST..."
+        tx_hash:
+          type: string
+          example: "tx123..."
+      required:
+        - amount
+        - ledger
+        - posted_at
+        - breakdown_hash
+        - poster
+        - tx_hash
+    Report:
+      type: object
+      properties:
+        tier:
+          type: string
+          enum: [transcribed, issuer_signed, auditor_signed]
+          example: "issuer_signed"
+        amount:
+          type: string
+          example: "10200000000"
+        as_of:
+          type: string
+          format: date-time
+          example: "2026-10-05T10:00:00Z"
+        posted_at:
+          type: string
+          format: date-time
+          example: "2026-10-05T10:05:00Z"
+        reporter:
+          type: string
+          example: "GISS..."
+        doc_hash:
+          type: string
+          example: "dochash123..."
+        doc_uri:
+          type: string
+          example: "https://x"
+        tx_hash:
+          type: string
+          example: "tx456..."
+      required:
+        - tier
+        - amount
+        - as_of
+        - posted_at
+        - reporter
+        - doc_hash
+        - doc_uri
+        - tx_hash
+    Coverage:
+      type: object
+      properties:
+        bps:
+          type: [integer, "null"]
+          example: 10200
+        ratio:
+          type: [string, "null"]
+          example: "102.00%"
+        tier:
+          type: string
+          example: "issuer_signed"
+        supply:
+          type: string
+          example: "10000000000"
+        reserves:
+          type: string
+          example: "10200000000"
+        supply_ledger:
+          type: integer
+          example: 100
+        supply_posted_at:
+          type: string
+          format: date-time
+          example: "2026-10-05T11:00:00Z"
+        report_as_of:
+          type: string
+          format: date-time
+          example: "2026-10-05T10:00:00Z"
+        report_age_seconds:
+          type: integer
+          example: 7200
+        supply_age_seconds:
+          type: integer
+          example: 3600
+        reporter:
+          type: string
+          example: "GISS..."
+        doc_uri:
+          type: string
+          example: "https://x"
+      required:
+        - tier
+        - supply
+        - reserves
+        - supply_ledger
+        - supply_posted_at
+        - report_as_of
+        - report_age_seconds
+        - supply_age_seconds
+        - reporter
+        - doc_uri
+    Asset:
+      type: object
+      properties:
+        sac:
+          type: string
+          example: "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
+        code:
+          type: string
+          example: "PUSD"
+        issuer:
+          type: string
+          example: "GISS..."
+        listed_ledger:
+          type: integer
+          example: 50
+        listed_at:
+          type: string
+          format: date-time
+          example: "2026-10-01T00:00:00Z"
+        toml:
+          type: [object, "null"]
+        toml_checked_at:
+          type: [string, "null"]
+          format: date-time
+        toml_error:
+          type: [string, "null"]
+        supply:
+          oneOf:
+            - $ref: '#/components/schemas/Supply'
+            - type: "null"
+        reports:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/Report'
+        coverage:
+          oneOf:
+            - $ref: '#/components/schemas/Coverage'
+            - type: "null"
+      required:
+        - sac
+        - code
+        - issuer
+        - listed_ledger
+        - listed_at
+        - reports
+    Reporter:
+      type: object
+      properties:
+        role:
+          type: string
+          example: "auditor"
+        address:
+          type: string
+          example: "GAUD..."
+        name:
+          type: string
+          example: "Acme"
+        updated_at:
+          type: string
+          format: date-time
+          example: "2026-10-01T00:00:00Z"
+      required:
+        - role
+        - address
+        - name
+        - updated_at
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "asset not listed"
+      required:
+        - error

@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -197,5 +198,25 @@ func TestCORSHeader(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent || resp.Header.Get("Access-Control-Allow-Origin") != "*" {
 		t.Fatalf("status %d, header %q", resp.StatusCode, resp.Header.Get("Access-Control-Allow-Origin"))
+	}
+}
+
+func TestOpenAPISpec(t *testing.T) {
+	srv := server()
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/openapi.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d want 200", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "openapi: 3.1.0") {
+		t.Fatalf("expected openapi 3.1.0 spec, got: %s", string(body))
 	}
 }
