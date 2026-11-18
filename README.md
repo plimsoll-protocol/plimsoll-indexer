@@ -13,12 +13,13 @@
 # Plimsoll indexer
 
 The off-chain half of [Plimsoll](https://github.com/plimsoll-protocol/plimsoll-contracts).
-One Go binary with three jobs and an HTTP API:
+One Go binary with four jobs and an HTTP API:
 
 | Job | What it does |
 | --- | --- |
-| **Supply poster** | For every listed asset, sums Horizon's per-bucket holdings (trustlines in every auth state, claimable balances, liquidity pools, contract balances) and calls `post_supply` on the coverage ledger with the total and the SHA-256 of the breakdown. Posts when supply changes, or every `REPOST_AFTER` so freshness checks keep passing. |
+| **Supply poster** | For every listed asset, sums Horizon's per-bucket holdings (trustlines in every auth state, claimable balances, liquidity pools, contract balances) and calls `post_supply` on the coverage ledger with the total and the SHA-256 of the breakdown. Posts when supply changes, or every `REPOST_AFTER` so freshness checks keep passing. Whether a post is due is read from the coverage ledger itself, so a stalled event ingest cannot make it repost on every tick. |
 | **Event ingester** | Reads `asset_listed`, `supply_posted`, `reserve_posted`, `reporter_set` and `reporter_revoked` from Soroban RPC into Postgres, keeping history past RPC's ~7-day retention. |
+| **State reconciler** | Reads each listed asset's `get_supply` and `get_report` back from the coverage ledger and stores anything newer than ingestion has. RPC serves only about seven days of events, so a longer ingestion gap cannot be repaired from events; the contracts always hold the latest figure. Recovered rows are marked `"source": "chain"` and carry no `tx_hash`. Reading is simulation, so it needs no key and runs even on an instance that cannot sign. |
 | **stellar.toml sync** | Resolves each issuer's `home_domain`, reads its SEP-1 `stellar.toml`, and stores the matching `[[CURRENCIES]]` entry, including `attestation_of_reserve`. |
 
 **Live API:** https://plimsoll-indexer.onrender.com/v1/assets  
@@ -43,15 +44,25 @@ hashed is served byte-for-byte at `/v1/breakdowns/{hash}`; `sha256` of that
 body equals the `breakdown_hash` in the on-chain `supply_posted` event, and each
 bucket can be recomputed from Horizon's `/assets` endpoint.
 
+### Verifying supply snapshots
+
+Verify an asset's latest supply snapshot against live Horizon balances without needing a local database:
+
+```bash
+go run ./cmd/plimsoll-indexer verify --sac <SAC_ADDRESS> [--indexer http://localhost:8080] [--horizon <HORIZON_URL>] [--rpc <RPC_URL>] [--ledger-id <CONTRACT_ID>]
+```
+
+The command fetches the asset's snapshot breakdown from the indexer, verifies the snapshot on-chain via Soroban RPC simulation (`get_supply`), checks its SHA-256 hash integrity, recomputes balances directly from Horizon, prints a formatted diff table, and exits `0` on match or `1` on mismatch. Network discovery is fetched automatically from `/v1/network`.
+
 ## API
 
 | Method and path | Returns |
 | --- | --- |
-| `GET /healthz` | `{status, ingested_to_ledger}` |
+| `GET /healthz` | `{status, ingested_to_ledger, last_event_ledger, last_event_at, last_event_age_seconds}` |
 | `GET /v1/network` | Contract ids, RPC and Horizon URLs |
 | `GET /v1/assets?min_tier=1` | Every asset with latest supply, latest report per tier, coverage and stellar.toml data |
 | `GET /v1/assets/{sac}?min_tier=1` | One asset, same shape |
-| `GET /v1/assets/{sac}/supply?limit=100` | Supply snapshot history |
+| `GET /v1/assets/{sac}/supply?limit=100` | Supply snapshot history. Each row carries `source`: `event` for a figure decoded from a contract event, with the `tx_hash` that produced it, or `chain` for one recovered from contract state after an ingestion gap, where `tx_hash` is empty. |
 | `GET /v1/assets/{sac}/reports?limit=100` | Reserve report history |
 | `GET /v1/reporters` | Active registered reporters |
 | `GET /v1/breakdowns/{hash}` | Exact bytes of a supply breakdown |
@@ -110,6 +121,13 @@ On Render the indexer requests its own `/healthz` every 10 minutes
 (`KEEP_AWAKE_URL`, derived from `RENDER_EXTERNAL_URL`), so the free tier does
 not put it to sleep and supply posting keeps running. One always-on service
 uses about 744 of the free tier's 750 monthly instance hours.
+
+[.github/workflows/keepalive.yml](.github/workflows/keepalive.yml) watches the
+deployment from outside: it wakes the service, fails if nothing has been
+ingested recently, and fails if any asset's supply snapshot has gone stale.
+The ingestion check exists because a scan position alone is not evidence of
+progress — ingestion once stopped for nine days while `/healthz` kept
+answering `ok` with a current ledger.
 
 ## Contributing
 

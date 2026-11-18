@@ -26,6 +26,10 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "verify" {
+		os.Exit(runVerifyCommand(os.Args[2:]))
+	}
+
 	cfg, err := config.Load()
 	log := newLogger(cfg.LogLevel)
 	if err != nil {
@@ -65,6 +69,20 @@ func run(cfg config.Config, log *slog.Logger) error {
 	}
 	go every(ctx, cfg.IngestInterval, log.With("job", "ingest"), ingester.Run)
 
+	// Repairs what an ingestion gap lost by reading contract state back.
+	// Reading is simulation, so this needs no key and runs even on an instance
+	// that cannot sign.
+	reconciler := &worker.Reconciler{
+		Invoker:  &soroban.Reader{RPC: rpc},
+		Store:    db,
+		LedgerID: cfg.CoverageLedgerID,
+		Log:      log.With("job", "reconcile"),
+	}
+	if err := reconciler.Run(ctx); err != nil {
+		log.Error("initial reconcile failed", "err", err)
+	}
+	go every(ctx, cfg.ReconcileInterval, log.With("job", "reconcile"), reconciler.Run)
+
 	tomlSync := &worker.TomlSync{
 		Horizon: hz,
 		Fetcher: stellartoml.NewFetcher(),
@@ -95,22 +113,32 @@ func run(cfg config.Config, log *slog.Logger) error {
 		if err != nil {
 			return errors.New("SUPPLY_POSTER_SECRET is not a valid secret seed")
 		}
+		invoker := &soroban.Invoker{
+			RPC:        rpc,
+			Signer:     signer,
+			Passphrase: cfg.NetworkPassphrase,
+		}
 		poster := &worker.Poster{
-			Horizon: hz,
-			RPC:     rpc,
-			Invoker: &soroban.Invoker{
-				RPC:        rpc,
-				Signer:     signer,
-				Passphrase: cfg.NetworkPassphrase,
-			},
+			Horizon:     hz,
+			RPC:         rpc,
+			Invoker:     invoker,
 			Store:       db,
 			LedgerID:    cfg.CoverageLedgerID,
 			RepostAfter: cfg.RepostAfter,
 			Log:         log.With("job", "poster"),
 			Now:         time.Now,
 		}
+		// Left nil when no second Horizon is configured: comparing hz against
+		// itself would always agree and prove nothing.
+		if cfg.HorizonCheckURL != "" {
+			poster.HorizonCheck = horizon.NewClient(cfg.HorizonCheckURL)
+			log.Info("supply cross-check enabled", "check_horizon", cfg.HorizonCheckURL)
+		} else {
+			log.Info("supply cross-check disabled (HORIZON_CHECK_URL not set)")
+		}
 		log.Info("supply posting enabled", "poster", signer.Address())
 		go every(ctx, cfg.PostInterval, log.With("job", "poster"), poster.Run)
+
 	} else {
 		log.Info("supply posting disabled (SUPPLY_POSTER_SECRET not set)")
 	}
