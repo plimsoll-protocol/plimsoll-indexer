@@ -5,8 +5,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 
-	"github.com/stellar/go-stellar-sdk/clients/rpcclient"
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
@@ -18,10 +18,22 @@ const (
 	pageLimit  = 200
 )
 
+// eventSource is the RPC surface ingestion needs.
+type eventSource interface {
+	GetEvents(ctx context.Context, req protocol.GetEventsRequest) (protocol.GetEventsResponse, error)
+	GetLatestLedger(ctx context.Context) (protocol.GetLatestLedgerResponse, error)
+}
+
+// eventStore is the storage surface ingestion needs.
+type eventStore interface {
+	Progress(ctx context.Context, name string) (store.Progress, error)
+	ApplyEvents(ctx context.Context, name, cursor string, ledger uint32, events []any) error
+}
+
 // Ingester copies Plimsoll contract events from RPC into Postgres.
 type Ingester struct {
-	RPC         *rpcclient.Client
-	Store       *store.Store
+	RPC         eventSource
+	Store       eventStore
 	ContractIDs []string
 	StartLedger uint32
 	Log         *slog.Logger
@@ -29,10 +41,12 @@ type Ingester struct {
 
 // Run pulls every available page once. Call it on a ticker.
 func (in *Ingester) Run(ctx context.Context) error {
-	cursor, _, err := in.Store.Cursor(ctx, cursorName)
+	progress, err := in.Store.Progress(ctx, cursorName)
 	if err != nil {
-		return fmt.Errorf("read cursor: %w", err)
+		return fmt.Errorf("read progress: %w", err)
 	}
+	cursor := progress.Cursor
+	recovered := false
 	for {
 		req := protocol.GetEventsRequest{
 			Filters: []protocol.EventFilter{{
@@ -57,20 +71,25 @@ func (in *Ingester) Run(ctx context.Context) error {
 
 		resp, err := in.RPC.GetEvents(ctx, req)
 		if err != nil {
-			return fmt.Errorf("getEvents: %w", err)
-		}
-		decoded := make([]any, 0, len(resp.Events))
-		for _, e := range resp.Events {
-			if !e.InSuccessfulContractCall {
+			// A cursor older than RPC's retention window is refused, and
+			// retrying the same cursor can only be refused again, so ingestion
+			// would stay wedged until someone cleared the cursor by hand.
+			// Restart from the oldest ledger RPC still serves. Events in the
+			// gap are gone from RPC for good; the warning is the record that
+			// they were skipped. Recover once per run so a persistent refusal
+			// cannot spin.
+			if cursor != "" && !recovered && outsideRetention(err) {
+				in.Log.Warn("ingest cursor is older than RPC retention; restarting from the oldest ledger RPC serves and skipping the gap",
+					"cursor", cursor, "scanned_to_ledger", progress.ScannedLedger,
+					"last_event_ledger", progress.EventLedger, "error", err)
+				cursor, recovered = "", true
 				continue
 			}
-			ev, err := soroban.Decode(e)
-			if err != nil {
-				return err
-			}
-			if ev != nil {
-				decoded = append(decoded, ev)
-			}
+			return fmt.Errorf("getEvents: %w", err)
+		}
+		decoded, err := decodePage(resp.Events)
+		if err != nil {
+			return err
 		}
 		if err := in.Store.ApplyEvents(ctx, cursorName, resp.Cursor, resp.LatestLedger, decoded); err != nil {
 			return fmt.Errorf("apply events: %w", err)
@@ -83,6 +102,36 @@ func (in *Ingester) Run(ctx context.Context) error {
 			return nil
 		}
 	}
+}
+
+// outsideRetention reports whether RPC refused the request because the ledger
+// it asked for has aged out. RPC answers -32600 ("invalid request") for this
+// alongside genuinely malformed requests, so the message is the only thing
+// that distinguishes it.
+func outsideRetention(err error) bool {
+	return strings.Contains(err.Error(), "must be within the ledger range")
+}
+
+// decodePage turns one page of RPC events into the typed events this indexer
+// stores, dropping the ones it does not track.
+//
+// Every event a page carries is kept. RPC used to mark events raised by calls
+// that later failed with inSuccessfulContractCall=false, and stopped sending
+// the field once it only ever returned events from successful calls. Filtering
+// on it silently dropped every event once the field went missing, which wedged
+// ingestion, so the filter is gone rather than defaulted either way.
+func decodePage(events []protocol.EventInfo) ([]any, error) {
+	decoded := make([]any, 0, len(events))
+	for _, e := range events {
+		ev, err := soroban.Decode(e)
+		if err != nil {
+			return nil, err
+		}
+		if ev != nil {
+			decoded = append(decoded, ev)
+		}
+	}
+	return decoded, nil
 }
 
 // startLedger clamps the configured start to RPC's retention window.

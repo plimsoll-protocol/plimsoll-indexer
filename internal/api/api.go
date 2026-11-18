@@ -26,7 +26,7 @@ type Reader interface {
 	ReportHistory(ctx context.Context, sac string, limit int) ([]coverage.Report, error)
 	Reporters(ctx context.Context) ([]coverage.Reporter, error)
 	Breakdown(ctx context.Context, hash string) ([]byte, error)
-	Cursor(ctx context.Context, name string) (string, uint32, error)
+	Progress(ctx context.Context, name string) (store.Progress, error)
 }
 
 // NetworkInfo is served at /v1/network so clients can discover contract ids.
@@ -147,8 +147,24 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "db_unavailable"})
 		return
 	}
-	_, ledger, _ := s.Store.Cursor(r.Context(), "plimsoll-events")
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "ingested_to_ledger": ledger})
+	p, err := s.Store.Progress(r.Context(), "plimsoll-events")
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "progress_unavailable"})
+		return
+	}
+	body := map[string]any{
+		"status":             "ok",
+		"ingested_to_ledger": p.ScannedLedger,
+		"last_event_ledger":  p.EventLedger,
+	}
+	// A scan that keeps advancing while no event lands is how ingestion failed
+	// silently before, so say when an event was last written and let callers
+	// alert on it.
+	if !p.EventAt.IsZero() {
+		body["last_event_at"] = p.EventAt.UTC()
+		body["last_event_age_seconds"] = int64(s.Now().Sub(p.EventAt).Seconds())
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (s *Server) network(w http.ResponseWriter, _ *http.Request) {

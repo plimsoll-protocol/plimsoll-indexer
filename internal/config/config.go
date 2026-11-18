@@ -17,10 +17,15 @@ const (
 )
 
 type Config struct {
-	DatabaseURL        string
-	Port               string
-	RPCURL             string
-	HorizonURL         string
+	DatabaseURL string
+	Port        string
+	RPCURL      string
+	HorizonURL  string
+	// HorizonCheckURL is a second, independent Horizon the poster compares the
+	// supply against before signing it on chain. One Horizon is one point of
+	// trust for the only figure this indexer asserts itself. Empty disables the
+	// comparison.
+	HorizonCheckURL    string
 	NetworkPassphrase  string
 	CoverageLedgerID   string
 	ReporterRegistryID string
@@ -28,10 +33,14 @@ type Config struct {
 	PosterSecret       string
 	IngestInterval     time.Duration
 	PostInterval       time.Duration
-	RepostAfter        time.Duration
-	TomlInterval       time.Duration
-	CORSOrigins        []string
-	LogLevel           string
+	// ReconcileInterval is how often contract state is read back to repair
+	// what event ingestion missed. Each pass is a handful of simulations per
+	// asset, so it can be infrequent.
+	ReconcileInterval time.Duration
+	RepostAfter       time.Duration
+	TomlInterval      time.Duration
+	CORSOrigins       []string
+	LogLevel          string
 	// KeepAwakeURL is requested every KeepAwakeInterval so a host that sleeps
 	// idle services (Render's free tier) keeps this one, and its poster, up.
 	KeepAwakeURL      string
@@ -45,6 +54,7 @@ func Load() (Config, error) {
 		Port:               envOr("PORT", "8080"),
 		RPCURL:             envOr("STELLAR_RPC_URL", TestnetRPC),
 		HorizonURL:         strings.TrimRight(envOr("HORIZON_URL", TestnetHorizon), "/"),
+		HorizonCheckURL:    strings.TrimRight(os.Getenv("HORIZON_CHECK_URL"), "/"),
 		NetworkPassphrase:  envOr("STELLAR_NETWORK_PASSPHRASE", TestnetPassphrase),
 		CoverageLedgerID:   os.Getenv("COVERAGE_LEDGER_ID"),
 		ReporterRegistryID: os.Getenv("REPORTER_REGISTRY_ID"),
@@ -77,6 +87,7 @@ func Load() (Config, error) {
 	}{
 		{"INGEST_INTERVAL", "10s", &c.IngestInterval},
 		{"POST_INTERVAL", "15m", &c.PostInterval},
+		{"RECONCILE_INTERVAL", "15m", &c.ReconcileInterval},
 		{"REPOST_AFTER", "6h", &c.RepostAfter},
 		{"TOML_INTERVAL", "6h", &c.TomlInterval},
 		{"KEEP_AWAKE_INTERVAL", "10m", &c.KeepAwakeInterval},

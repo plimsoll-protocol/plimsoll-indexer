@@ -67,6 +67,10 @@ type Supply struct {
 	BreakdownHash string    `json:"breakdown_hash"`
 	Poster        string    `json:"poster"`
 	TxHash        string    `json:"tx_hash"`
+	// Source is "event" for a figure decoded from a contract event, which
+	// carries the transaction above, or "chain" for one read back from contract
+	// state after an ingestion gap, where tx_hash is empty.
+	Source string `json:"source"`
 }
 
 type Report struct {
@@ -78,6 +82,7 @@ type Report struct {
 	DocHash  string    `json:"doc_hash"`
 	DocURI   string    `json:"doc_uri"`
 	TxHash   string    `json:"tx_hash"`
+	Source   string    `json:"source"`
 }
 
 type Reporter struct {

@@ -1,0 +1,36 @@
+name: Auto-merge
+
+# Turns on GitHub auto-merge for trusted-author pull requests. Branch protection
+# on main then merges the PR by itself once every required status check is green
+# (the CI tests and the "scan changed files" malware check). This job only calls
+# the GitHub API to toggle auto-merge; it never checks out or runs PR code, which
+# is why pull_request_target is safe here (the logic always comes from main, so a
+# PR cannot alter it).
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  enable:
+    # Auto-enable only for maintainers / org members and Dependabot. Outside
+    # contributions still need a maintainer to merge them after review, so the
+    # heuristic malware scan is never the sole gate on untrusted code.
+    if: >-
+      github.event.pull_request.draft == false &&
+      ( github.actor == 'dependabot[bot]' ||
+        github.event.pull_request.author_association == 'OWNER' ||
+        github.event.pull_request.author_association == 'MEMBER' ||
+        github.event.pull_request.author_association == 'COLLABORATOR' )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enable auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: gh pr merge "$PR" --repo "$REPO" --auto --squash

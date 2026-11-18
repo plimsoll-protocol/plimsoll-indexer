@@ -27,6 +27,13 @@ type Meta struct {
 	Contract string
 }
 
+// EventMeta returns the metadata every Plimsoll event carries, so callers can
+// track ingest progress without switching on the concrete type.
+func (m Meta) EventMeta() Meta { return m }
+
+// WithMeta is satisfied by every event Decode returns.
+type WithMeta interface{ EventMeta() Meta }
+
 type AssetListed struct {
 	Meta
 	SAC, Code, Issuer string

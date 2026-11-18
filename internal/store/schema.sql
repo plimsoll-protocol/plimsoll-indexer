@@ -6,6 +6,11 @@ CREATE TABLE IF NOT EXISTS ingest_cursor (
     ledger      BIGINT NOT NULL DEFAULT 0,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- `ledger` is how far the scan has reached, which advances whether or not a
+-- page held anything. These record the last event actually written, so a scan
+-- that silently stores nothing is visible from /healthz.
+ALTER TABLE ingest_cursor ADD COLUMN IF NOT EXISTS event_ledger BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE ingest_cursor ADD COLUMN IF NOT EXISTS event_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS assets (
     sac             TEXT PRIMARY KEY,
@@ -32,6 +37,11 @@ CREATE TABLE IF NOT EXISTS supply_snapshots (
 );
 CREATE INDEX IF NOT EXISTS supply_snapshots_sac_ledger
     ON supply_snapshots (sac, at_ledger DESC);
+-- 'event' for a row decoded from a contract event, which carries the
+-- transaction that produced it; 'chain' for one read back from contract state
+-- by the reconciler, where the originating transaction is not recoverable and
+-- tx_hash is empty.
+ALTER TABLE supply_snapshots ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'event';
 
 CREATE TABLE IF NOT EXISTS reserve_reports (
     event_id        TEXT PRIMARY KEY,
@@ -48,6 +58,7 @@ CREATE TABLE IF NOT EXISTS reserve_reports (
 );
 CREATE INDEX IF NOT EXISTS reserve_reports_sac_tier_asof
     ON reserve_reports (sac, tier, as_of DESC);
+ALTER TABLE reserve_reports ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'event';
 
 CREATE TABLE IF NOT EXISTS reporters (
     address         TEXT PRIMARY KEY,
