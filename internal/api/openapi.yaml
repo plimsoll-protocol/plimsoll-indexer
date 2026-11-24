@@ -112,6 +112,7 @@ paths:
           description: Stellar Asset Contract (SAC) address
           schema:
             type: string
+            pattern: '^C[A-Z2-7]{55}$'
             example: "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
         - name: min_tier
           in: query
@@ -151,6 +152,7 @@ paths:
           description: Stellar Asset Contract (SAC) address
           schema:
             type: string
+            pattern: '^C[A-Z2-7]{55}$'
         - name: limit
           in: query
           required: false
@@ -175,7 +177,13 @@ paths:
                 required:
                   - supply
         '400':
-          description: Invalid limit parameter
+          description: Invalid limit parameter, or sac is not a contract strkey
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Asset not found
           content:
             application/json:
               schema:
@@ -191,6 +199,7 @@ paths:
           description: Stellar Asset Contract (SAC) address
           schema:
             type: string
+            pattern: '^C[A-Z2-7]{55}$'
         - name: limit
           in: query
           required: false
@@ -215,7 +224,13 @@ paths:
                 required:
                   - reports
         '400':
-          description: Invalid limit parameter
+          description: Invalid limit parameter, or sac is not a contract strkey
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Asset not found
           content:
             application/json:
               schema:
@@ -246,9 +261,10 @@ paths:
         - name: hash
           in: path
           required: true
-          description: SHA-256 breakdown hash
+          description: SHA-256 breakdown hash, 64 hex characters
           schema:
             type: string
+            pattern: '^[0-9a-fA-F]{64}$'
       responses:
         '200':
           description: Raw JSON breakdown served verbatim
@@ -256,6 +272,12 @@ paths:
             application/json:
               schema:
                 type: object
+        '400':
+          description: Hash is not 64 hex characters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: Breakdown hash not found
           content:

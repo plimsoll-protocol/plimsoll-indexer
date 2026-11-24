@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/stellar/go-stellar-sdk/strkey"
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
@@ -222,11 +225,15 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getAsset(w http.ResponseWriter, r *http.Request) {
+	sac, ok := parseSAC(w, r)
+	if !ok {
+		return
+	}
 	minTier, ok := parseTier(w, r)
 	if !ok {
 		return
 	}
-	a, err := s.Store.GetAsset(r.Context(), r.PathValue("sac"))
+	a, err := s.Store.GetAsset(r.Context(), sac)
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "asset not listed")
 		return
@@ -302,11 +309,18 @@ func withAttestation(raw []byte, att store.Attestation, found bool) (json.RawMes
 }
 
 func (s *Server) supplyHistory(w http.ResponseWriter, r *http.Request) {
+	sac, ok := parseSAC(w, r)
+	if !ok {
+		return
+	}
 	limit, ok := parseLimit(w, r)
 	if !ok {
 		return
 	}
-	list, err := s.Store.SupplyHistory(r.Context(), r.PathValue("sac"), limit)
+	if !s.requireAsset(w, r, sac) {
+		return
+	}
+	list, err := s.Store.SupplyHistory(r.Context(), sac, limit)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -319,11 +333,18 @@ func (s *Server) supplyHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) reportHistory(w http.ResponseWriter, r *http.Request) {
+	sac, ok := parseSAC(w, r)
+	if !ok {
+		return
+	}
 	limit, ok := parseLimit(w, r)
 	if !ok {
 		return
 	}
-	list, err := s.Store.ReportHistory(r.Context(), r.PathValue("sac"), limit)
+	if !s.requireAsset(w, r, sac) {
+		return
+	}
+	list, err := s.Store.ReportHistory(r.Context(), sac, limit)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -349,7 +370,12 @@ func (s *Server) reporters(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) breakdown(w http.ResponseWriter, r *http.Request) {
-	body, err := s.Store.Breakdown(r.Context(), r.PathValue("hash"))
+	hash := r.PathValue("hash")
+	if !isBreakdownHash(hash) {
+		writeError(w, http.StatusBadRequest, "hash must be 64 hex characters")
+		return
+	}
+	body, err := s.Store.Breakdown(r.Context(), hash)
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "unknown breakdown hash")
 		return
@@ -458,6 +484,42 @@ func validateWebhook(req webhookRequest) error {
 }
 
 // ---- helpers --------------------------------------------------------------
+
+// parseSAC reads the {sac} path value and rejects anything that is not a
+// contract strkey, so unlisted ids answer 404 instead of passing arbitrary
+// strings through to storage.
+func parseSAC(w http.ResponseWriter, r *http.Request) (string, bool) {
+	sac := r.PathValue("sac")
+	if !strkey.IsValidContractAddress(sac) {
+		writeError(w, http.StatusBadRequest, "sac must be a contract strkey")
+		return "", false
+	}
+	return sac, true
+}
+
+// requireAsset answers 404 unless the asset is listed, so its history
+// endpoints match /v1/assets/{sac} instead of returning an empty list.
+func (s *Server) requireAsset(w http.ResponseWriter, r *http.Request, sac string) bool {
+	_, err := s.Store.GetAsset(r.Context(), sac)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "asset not listed")
+		return false
+	}
+	if err != nil {
+		s.fail(w, err)
+		return false
+	}
+	return true
+}
+
+// isBreakdownHash reports whether hash is a SHA-256 digest in hex.
+func isBreakdownHash(hash string) bool {
+	if len(hash) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(hash)
+	return err == nil
+}
 
 func parseTier(w http.ResponseWriter, r *http.Request) (uint32, bool) {
 	v := r.URL.Query().Get("min_tier")

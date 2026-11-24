@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stellar/go-stellar-sdk/strkey"
+
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
 )
@@ -19,6 +21,21 @@ import (
 var now = time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
 
 const sac = "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
+
+// breakdownHash is what a SHA-256 breakdown hash looks like: 64 hex characters.
+var breakdownHash = strings.Repeat("a", 64)
+
+// unlistedSAC is a well-formed contract strkey that fake holds no asset for.
+func unlistedSAC(t *testing.T) string {
+	t.Helper()
+	raw := make([]byte, 32)
+	raw[0] = 0x01
+	s, err := strkey.Encode(strkey.VersionByteContract, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
 
 type fake struct {
 	assets      []coverage.Asset
@@ -192,7 +209,7 @@ func TestListAndMisc(t *testing.T) {
 	if len(list["assets"].([]any)) != 1 {
 		t.Fatal("expected one asset")
 	}
-	get(t, srv, "/v1/assets/CNOPE", 404)
+	get(t, srv, "/v1/assets/CNOPE", 400)
 	rep := get(t, srv, "/v1/reporters", 200)
 	if rep["reporters"].([]any)[0].(map[string]any)["role"] != "auditor" {
 		t.Fatal("role name missing")
@@ -216,7 +233,7 @@ func TestListAndMisc(t *testing.T) {
 func TestBreakdownServedVerbatim(t *testing.T) {
 	srv := server()
 	defer srv.Close()
-	resp, err := http.Get(srv.URL + "/v1/breakdowns/abc")
+	resp, err := http.Get(srv.URL + "/v1/breakdowns/" + breakdownHash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +242,59 @@ func TestBreakdownServedVerbatim(t *testing.T) {
 	if string(b) != `{"total":"1"}` {
 		t.Fatalf("body %q", b)
 	}
-	get(t, srv, "/v1/breakdowns/zzz", 404)
+	get(t, srv, "/v1/breakdowns/"+strings.Repeat("0", 64), 404)
+}
+
+// Every path id is checked before it reaches storage: malformed ids are a
+// client error, while well-formed but unlisted ids are a missing resource.
+func TestMalformedPathIDs(t *testing.T) {
+	srv := server()
+	defer srv.Close()
+	for _, path := range []string{
+		"/v1/assets/not-a-sac",
+		"/v1/assets/CNOPE",
+		"/v1/assets/not-a-sac/supply",
+		"/v1/assets/not-a-sac/reports",
+	} {
+		body := get(t, srv, path, 400)
+		if body["error"] == nil {
+			t.Errorf("%s: expected an error message, got %+v", path, body)
+		}
+	}
+	for _, hash := range []string{"abc", strings.Repeat("a", 63), strings.Repeat("z", 64)} {
+		body := get(t, srv, "/v1/breakdowns/"+hash, 400)
+		if body["error"] == nil {
+			t.Errorf("hash %q: expected an error message, got %+v", hash, body)
+		}
+	}
+}
+
+func TestUnlistedPathIDs(t *testing.T) {
+	srv := server()
+	defer srv.Close()
+	unknown := unlistedSAC(t)
+	for _, path := range []string{
+		"/v1/assets/" + unknown,
+		"/v1/assets/" + unknown + "/supply",
+		"/v1/assets/" + unknown + "/reports",
+	} {
+		body := get(t, srv, path, 404)
+		if body["error"] != "asset not listed" {
+			t.Errorf("%s: body %+v", path, body)
+		}
+	}
+}
+
+// A listed asset keeps answering 200 from both history endpoints.
+func TestListedAssetHistory(t *testing.T) {
+	srv := server()
+	defer srv.Close()
+	if got := get(t, srv, "/v1/assets/"+sac+"/supply", 200)["supply"].([]any); len(got) != 1 {
+		t.Fatalf("supply history %+v", got)
+	}
+	if got := get(t, srv, "/v1/assets/"+sac+"/reports", 200)["reports"].([]any); len(got) != 1 {
+		t.Fatalf("report history %+v", got)
+	}
 }
 
 // adminRequest sends a webhook-administration request and returns the status
