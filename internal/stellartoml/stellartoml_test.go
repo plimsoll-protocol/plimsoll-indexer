@@ -2,6 +2,8 @@ package stellartoml
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -93,5 +95,24 @@ func TestFetchOK(t *testing.T) {
 	info, err := f.Fetch(context.Background(), "example.money", "USDX", "GISSUER")
 	if err != nil || info.Currency == nil {
 		t.Fatalf("got %+v, %v", info, err)
+	}
+}
+
+func TestFetchSnapshotHashesExactResponseBytes(t *testing.T) {
+	body := []byte(sample)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	f := NewFetcher()
+	f.URLFor = func(string) string { return srv.URL }
+
+	info, gotHash, err := f.FetchSnapshot(context.Background(), "example.money", "USDX", "GISSUER")
+	if err != nil || info.Currency == nil {
+		t.Fatalf("FetchSnapshot: info=%+v err=%v", info, err)
+	}
+	sum := sha256.Sum256(body)
+	if gotHash != hex.EncodeToString(sum[:]) {
+		t.Fatalf("hash %q, want SHA-256 of exact response bytes %q", gotHash, hex.EncodeToString(sum[:]))
 	}
 }

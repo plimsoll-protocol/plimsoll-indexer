@@ -37,6 +37,8 @@ values are reported together at startup.
 | `HORIZON_CHECK_URL` | empty | Second, independently operated Horizon. Empty disables the cross-check. |
 | `START_LEDGER` | `0` | First ledger to ingest. `0` or a ledger in the future means "latest"; older than RPC retention is clamped. |
 | `SUPPLY_POSTER_SECRET` | empty | Empty runs read-only. Never log or share it. |
+| `WEBHOOK_ADMIN_TOKEN` | empty | Enables authenticated webhook management when set with `WEBHOOK_ENCRYPTION_KEY`. |
+| `WEBHOOK_ENCRYPTION_KEY` | empty | Base64-encoded 32-byte key (`openssl rand -base64 32`); keep stable to preserve webhook delivery. |
 | `PORT` | `8080` | |
 | `CORS_ORIGINS` | `*` | Comma separated. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. Logs are JSON on stdout. |
@@ -113,6 +115,8 @@ Logs are JSON (`log/slog`). Key messages:
 | warn | `recovered a supply snapshot / reserve report from contract state...` | The reconciler filled a gap. Rows are marked `"source": "chain"` with no `tx_hash`. |
 | info | `supply posting disabled (SUPPLY_POSTER_SECRET not set)` | Expected on read-only instances. |
 | info | `supply cross-check disabled (HORIZON_CHECK_URL not set)` | The poster signs on one Horizon's word. |
+| info | `issuer stellar.toml changed` | The issuer document hash changed; includes `old_hash` and `new_hash`. |
+| error | `issuer stellar.toml change webhook delivery failed` | A destination could not receive the TOML change event. |
 
 ## Common procedures
 

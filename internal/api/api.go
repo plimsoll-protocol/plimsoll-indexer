@@ -3,17 +3,21 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	_ "embed"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/webhook"
 )
 
 //go:embed openapi.yaml
@@ -43,11 +47,20 @@ type NetworkInfo struct {
 }
 
 type Server struct {
-	Store   Reader
-	Network NetworkInfo
-	CORS    []string
-	Log     *slog.Logger
-	Now     func() time.Time
+	Store             Reader
+	WebhookStore      WebhookManager
+	WebhookAdminToken string
+	WebhookCodec      *webhook.SecretCodec
+	Network           NetworkInfo
+	CORS              []string
+	Log               *slog.Logger
+	Now               func() time.Time
+}
+
+type WebhookManager interface {
+	CreateWebhook(context.Context, string, string, []byte) (store.Webhook, error)
+	ListWebhooks(context.Context) ([]store.Webhook, error)
+	DeleteWebhook(context.Context, int64) (bool, error)
 }
 
 func (s *Server) Handler() http.Handler {
@@ -61,6 +74,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/assets/{sac}/reports", s.reportHistory)
 	mux.HandleFunc("GET /v1/reporters", s.reporters)
 	mux.HandleFunc("GET /v1/breakdowns/{hash}", s.breakdown)
+	mux.HandleFunc("POST /v1/webhooks", s.createWebhook)
+	mux.HandleFunc("GET /v1/webhooks", s.listWebhooks)
+	mux.HandleFunc("DELETE /v1/webhooks/{id}", s.deleteWebhook)
 	return s.cors(mux)
 }
 
@@ -104,6 +120,17 @@ type assetJSON struct {
 type reporterJSON struct {
 	Role string `json:"role"`
 	coverage.Reporter
+}
+
+type webhookJSON struct {
+	ID        int64     `json:"id"`
+	URL       string    `json:"url"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type createdWebhookJSON struct {
+	webhookJSON
+	Secret string `json:"secret"`
 }
 
 func toSupply(sp *coverage.Supply) *supplyJSON {
@@ -314,6 +341,109 @@ func (s *Server) breakdown(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
+func (s *Server) createWebhook(w http.ResponseWriter, r *http.Request) {
+	if !s.webhookConfigured(w) || !s.authorizeWebhookAdmin(w, r) {
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 4097))
+	if err != nil || len(body) > 4096 {
+		writeError(w, http.StatusBadRequest, "request body must be valid JSON under 4KB")
+		return
+	}
+	var input struct {
+		URL string `json:"url"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		writeError(w, http.StatusBadRequest, "request body must contain a webhook URL")
+		return
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "request body must contain one JSON object")
+		return
+	}
+	if err := webhook.ValidateURL(input.URL); err != nil {
+		writeError(w, http.StatusBadRequest, "url must be a valid HTTPS URL")
+		return
+	}
+	secret, err := webhook.GenerateSecret()
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	ciphertext, err := s.WebhookCodec.Encrypt(secret)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	created, err := s.WebhookStore.CreateWebhook(r.Context(), input.URL, webhook.SecretHash(secret), ciphertext)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, createdWebhookJSON{
+		webhookJSON: webhookJSON{ID: created.ID, URL: created.URL, CreatedAt: created.CreatedAt},
+		Secret:      secret,
+	})
+}
+
+func (s *Server) listWebhooks(w http.ResponseWriter, r *http.Request) {
+	if !s.webhookConfigured(w) || !s.authorizeWebhookAdmin(w, r) {
+		return
+	}
+	webhooks, err := s.WebhookStore.ListWebhooks(r.Context())
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	out := make([]webhookJSON, 0, len(webhooks))
+	for _, item := range webhooks {
+		out = append(out, webhookJSON{ID: item.ID, URL: item.URL, CreatedAt: item.CreatedAt})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"webhooks": out})
+}
+
+func (s *Server) deleteWebhook(w http.ResponseWriter, r *http.Request) {
+	if !s.webhookConfigured(w) || !s.authorizeWebhookAdmin(w, r) {
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id < 1 {
+		writeError(w, http.StatusBadRequest, "webhook id must be a positive integer")
+		return
+	}
+	deleted, err := s.WebhookStore.DeleteWebhook(r.Context(), id)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	if !deleted {
+		writeError(w, http.StatusNotFound, "webhook not found")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) webhookConfigured(w http.ResponseWriter) bool {
+	if s.WebhookStore == nil || s.WebhookCodec == nil || s.WebhookAdminToken == "" {
+		writeError(w, http.StatusServiceUnavailable, "webhook management is not configured")
+		return false
+	}
+	return true
+}
+
+func (s *Server) authorizeWebhookAdmin(w http.ResponseWriter, r *http.Request) bool {
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if token == r.Header.Get("Authorization") || len(token) != len(s.WebhookAdminToken) ||
+		subtle.ConstantTimeCompare([]byte(token), []byte(s.WebhookAdminToken)) != 1 {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return false
+	}
+	return true
+}
+
 // ---- helpers --------------------------------------------------------------
 
 func parseTier(w http.ResponseWriter, r *http.Request) (uint32, bool) {
@@ -352,7 +482,8 @@ func (s *Server) cors(next http.Handler) http.Handler {
 				break
 			}
 		}
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return

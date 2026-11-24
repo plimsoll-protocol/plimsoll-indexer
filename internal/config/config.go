@@ -2,6 +2,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -51,14 +52,16 @@ type Config struct {
 	// supply against before signing it on chain. One Horizon is one point of
 	// trust for the only figure this indexer asserts itself. Empty disables the
 	// comparison.
-	HorizonCheckURL    string
-	NetworkPassphrase  string
-	CoverageLedgerID   string
-	ReporterRegistryID string
-	StartLedger        uint32
-	PosterSecret       string
-	IngestInterval     time.Duration
-	PostInterval       time.Duration
+	HorizonCheckURL      string
+	NetworkPassphrase    string
+	CoverageLedgerID     string
+	ReporterRegistryID   string
+	StartLedger          uint32
+	PosterSecret         string
+	WebhookAdminToken    string
+	WebhookEncryptionKey string
+	IngestInterval       time.Duration
+	PostInterval         time.Duration
 	// ReconcileInterval is how often contract state is read back to repair
 	// what event ingestion missed. Each pass is a handful of simulations per
 	// asset, so it can be infrequent.
@@ -97,18 +100,20 @@ func Load() (Config, error) {
 	}
 
 	c := Config{
-		Network:            network,
-		DatabaseURL:        os.Getenv("DATABASE_URL"),
-		Port:               envOr("PORT", "8080"),
-		RPCURL:             envOr("STELLAR_RPC_URL", preset.RPCURL),
-		HorizonURL:         strings.TrimRight(envOr("HORIZON_URL", preset.HorizonURL), "/"),
-		HorizonCheckURL:    strings.TrimRight(os.Getenv("HORIZON_CHECK_URL"), "/"),
-		NetworkPassphrase:  envOr("STELLAR_NETWORK_PASSPHRASE", preset.Passphrase),
-		CoverageLedgerID:   os.Getenv("COVERAGE_LEDGER_ID"),
-		ReporterRegistryID: os.Getenv("REPORTER_REGISTRY_ID"),
-		PosterSecret:       os.Getenv("SUPPLY_POSTER_SECRET"),
-		LogLevel:           envOr("LOG_LEVEL", "info"),
-		KeepAwakeURL:       keepAwakeURL(os.Getenv("KEEP_AWAKE_URL"), os.Getenv("RENDER_EXTERNAL_URL")),
+		Network:              network,
+		DatabaseURL:          os.Getenv("DATABASE_URL"),
+		Port:                 envOr("PORT", "8080"),
+		RPCURL:               envOr("STELLAR_RPC_URL", preset.RPCURL),
+		HorizonURL:           strings.TrimRight(envOr("HORIZON_URL", preset.HorizonURL), "/"),
+		HorizonCheckURL:      strings.TrimRight(os.Getenv("HORIZON_CHECK_URL"), "/"),
+		NetworkPassphrase:    envOr("STELLAR_NETWORK_PASSPHRASE", preset.Passphrase),
+		CoverageLedgerID:     os.Getenv("COVERAGE_LEDGER_ID"),
+		ReporterRegistryID:   os.Getenv("REPORTER_REGISTRY_ID"),
+		PosterSecret:         os.Getenv("SUPPLY_POSTER_SECRET"),
+		WebhookAdminToken:    os.Getenv("WEBHOOK_ADMIN_TOKEN"),
+		WebhookEncryptionKey: os.Getenv("WEBHOOK_ENCRYPTION_KEY"),
+		LogLevel:             envOr("LOG_LEVEL", "info"),
+		KeepAwakeURL:         keepAwakeURL(os.Getenv("KEEP_AWAKE_URL"), os.Getenv("RENDER_EXTERNAL_URL")),
 	}
 
 	if c.RPCURL == "" {
@@ -122,6 +127,15 @@ func Load() (Config, error) {
 	}
 	if c.ReporterRegistryID == "" {
 		errs = append(errs, errors.New("REPORTER_REGISTRY_ID is required"))
+	}
+	if (c.WebhookAdminToken == "") != (c.WebhookEncryptionKey == "") {
+		errs = append(errs, errors.New("WEBHOOK_ADMIN_TOKEN and WEBHOOK_ENCRYPTION_KEY must be configured together"))
+	}
+	if c.WebhookEncryptionKey != "" {
+		key, err := base64.StdEncoding.DecodeString(c.WebhookEncryptionKey)
+		if err != nil || len(key) != 32 {
+			errs = append(errs, errors.New("WEBHOOK_ENCRYPTION_KEY must be base64-encoded 32-byte key"))
+		}
 	}
 
 	start, err := strconv.ParseUint(envOr("START_LEDGER", "0"), 10, 32)

@@ -155,3 +155,62 @@ func testPool(t *testing.T, url string) *pgxpool.Pool {
 	t.Cleanup(p.Close)
 	return p
 }
+
+func TestIssuerTomlSnapshotsDetectChanges(t *testing.T) {
+	s, _ := openStore(t)
+	ctx := context.Background()
+	at := time.Date(2026, 11, 24, 15, 0, 0, 0, time.UTC)
+
+	old, changed, err := s.SaveIssuerTomlSnapshot(ctx, "GISSUER", "issuer.example", "hash-one", at)
+	if err != nil || old != "" || changed {
+		t.Fatalf("initial snapshot: old=%q changed=%v err=%v", old, changed, err)
+	}
+	old, changed, err = s.SaveIssuerTomlSnapshot(ctx, "GISSUER", "issuer.example", "hash-one", at.Add(time.Hour))
+	if err != nil || old != "hash-one" || changed {
+		t.Fatalf("same snapshot: old=%q changed=%v err=%v", old, changed, err)
+	}
+	old, changed, err = s.SaveIssuerTomlSnapshot(ctx, "GISSUER", "issuer.example", "hash-two", at.Add(2*time.Hour))
+	if err != nil || old != "hash-one" || !changed {
+		t.Fatalf("changed snapshot: old=%q changed=%v err=%v", old, changed, err)
+	}
+	old, changed, err = s.SaveIssuerTomlSnapshot(ctx, "GISSUER", "issuer.example", "hash-two", at.Add(3*time.Hour))
+	if err != nil || old != "hash-two" || changed {
+		t.Fatalf("repeated snapshot: old=%q changed=%v err=%v", old, changed, err)
+	}
+
+	var count int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM issuer_toml_snapshots WHERE issuer = $1`, "GISSUER").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("stored %d snapshots, want 2", count)
+	}
+}
+
+func TestWebhookPersistence(t *testing.T) {
+	s, _ := openStore(t)
+	ctx := context.Background()
+	ciphertext := []byte{1, 2, 3, 4}
+	created, err := s.CreateWebhook(ctx, "https://receiver.example/hook", "sha256-hash", ciphertext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.ID < 1 || created.SecretHash != "sha256-hash" || !bytes.Equal(created.SecretCiphertext, ciphertext) {
+		t.Fatalf("created webhook = %+v", created)
+	}
+
+	list, err := s.ListWebhooks(ctx)
+	if err != nil || len(list) != 1 || list[0].ID != created.ID ||
+		list[0].URL != created.URL || list[0].SecretHash != created.SecretHash ||
+		!bytes.Equal(list[0].SecretCiphertext, ciphertext) {
+		t.Fatalf("listed webhooks = %+v, %v", list, err)
+	}
+	deleted, err := s.DeleteWebhook(ctx, created.ID)
+	if err != nil || !deleted {
+		t.Fatalf("delete webhook: deleted=%v err=%v", deleted, err)
+	}
+	deleted, err = s.DeleteWebhook(ctx, created.ID)
+	if err != nil || deleted {
+		t.Fatalf("delete missing webhook: deleted=%v err=%v", deleted, err)
+	}
+}

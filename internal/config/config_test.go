@@ -24,12 +24,38 @@ func TestKeepAwakeURL(t *testing.T) {
 
 func setBase(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"NETWORK", "STELLAR_RPC_URL", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE"} {
+	for _, k := range []string{"NETWORK", "STELLAR_RPC_URL", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE", "WEBHOOK_ADMIN_TOKEN", "WEBHOOK_ENCRYPTION_KEY"} {
 		t.Setenv(k, "")
 	}
 	t.Setenv("DATABASE_URL", "postgres://x")
 	t.Setenv("COVERAGE_LEDGER_ID", "C1")
 	t.Setenv("REPORTER_REGISTRY_ID", "C2")
+}
+
+func TestWebhookConfigurationMustBeComplete(t *testing.T) {
+	setBase(t)
+	t.Setenv("WEBHOOK_ADMIN_TOKEN", "admin")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "must be configured together") {
+		t.Fatalf("want paired webhook configuration error, got %v", err)
+	}
+
+	setBase(t)
+	t.Setenv("WEBHOOK_ENCRYPTION_KEY", "not-base64")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "must be configured together") {
+		t.Fatalf("want paired webhook configuration error, got %v", err)
+	}
+
+	setBase(t)
+	t.Setenv("WEBHOOK_ADMIN_TOKEN", "admin")
+	t.Setenv("WEBHOOK_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if _, err := Load(); err != nil {
+		t.Fatalf("valid webhook configuration: %v", err)
+	}
+
+	t.Setenv("WEBHOOK_ENCRYPTION_KEY", "short")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "32-byte key") {
+		t.Fatalf("want invalid key error, got %v", err)
+	}
 }
 
 func TestNetworkPresets(t *testing.T) {
