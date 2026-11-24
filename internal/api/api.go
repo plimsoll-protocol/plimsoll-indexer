@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
 	"net/http"
@@ -30,6 +31,7 @@ type Reader interface {
 	ReportHistory(ctx context.Context, sac string, limit int) ([]coverage.Report, error)
 	Reporters(ctx context.Context) ([]coverage.Reporter, error)
 	Breakdown(ctx context.Context, hash string) ([]byte, error)
+	Attestation(ctx context.Context, sac string) (store.Attestation, error)
 	Progress(ctx context.Context, name string) (store.Progress, error)
 }
 
@@ -235,20 +237,53 @@ func (s *Server) assemble(ctx context.Context, a coverage.Asset, minTier uint32)
 	if err != nil {
 		return assetJSON{}, err
 	}
+	att, attErr := s.Store.Attestation(ctx, a.SAC)
+	if attErr != nil && !errors.Is(attErr, store.ErrNotFound) {
+		return assetJSON{}, attErr
+	}
+	tomlBody, err := withAttestation(a.Toml, att, attErr == nil)
+	if err != nil {
+		return assetJSON{}, err
+	}
 	out := assetJSON{
 		Asset:    a,
-		Toml:     json.RawMessage("null"),
+		Toml:     tomlBody,
 		Supply:   toSupply(sp),
 		Reports:  map[string]*reportJSON{},
 		Coverage: s.toCoverage(coverage.Compute(sp, reports, minTier)),
-	}
-	if len(a.Toml) > 0 {
-		out.Toml = a.Toml
 	}
 	for tier, rep := range reports {
 		out.Reports[coverage.TierName(tier)] = toReport(rep)
 	}
 	return out, nil
+}
+
+// withAttestation adds the issuer's attestation document fields to the stored
+// SEP-1 object. The object is re-encoded, so its key order is that of
+// encoding/json; nothing else about it changes.
+func withAttestation(raw []byte, att store.Attestation, found bool) (json.RawMessage, error) {
+	if !found && len(raw) == 0 {
+		return json.RawMessage("null"), nil
+	}
+	obj := map[string]json.RawMessage{}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return nil, fmt.Errorf("decode stored stellar.toml: %w", err)
+		}
+	}
+	if found {
+		hash, _ := json.Marshal(att.Hash)
+		obj["attestation_hash"] = hash
+		if att.ChangedAt != nil {
+			changed, _ := json.Marshal(att.ChangedAt.UTC().Format(time.RFC3339))
+			obj["attestation_changed_at"] = changed
+		}
+	}
+	body, err := json.Marshal(obj)
+	if err != nil {
+		return nil, fmt.Errorf("encode asset toml: %w", err)
+	}
+	return body, nil
 }
 
 func (s *Server) supplyHistory(w http.ResponseWriter, r *http.Request) {

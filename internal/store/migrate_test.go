@@ -151,8 +151,8 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 	if len(want) == 0 {
 		t.Fatal("fresh database has no schema")
 	}
-	if got := appliedVersions(t, fresh); len(got) != 1 || got[0] != 1 {
-		t.Fatalf("fresh database recorded %v, want [1]", got)
+	if got := appliedVersions(t, fresh); len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Fatalf("fresh database recorded %v, want [1 2]", got)
 	}
 
 	for name, schema := range map[string]string{
@@ -175,8 +175,8 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 			if d := schemaDiff(want, schemaOf(t, url)); len(d) > 0 {
 				t.Fatalf("schema differs from a fresh database:\n%s", strings.Join(d, "\n"))
 			}
-			if got := appliedVersions(t, url); len(got) != 1 || got[0] != 1 {
-				t.Fatalf("recorded %v, want [1]", got)
+			if got := appliedVersions(t, url); len(got) != 2 || got[0] != 1 || got[1] != 2 {
+				t.Fatalf("recorded %v, want [1 2]", got)
 			}
 			a, err := s.GetAsset(context.Background(), "CSAC")
 			if err != nil || a.Code != "PUSD" {
@@ -197,8 +197,8 @@ func TestReopeningAppliesNothingTwice(t *testing.T) {
 		t.Fatal(err)
 	}
 	s2.Close()
-	if got := appliedVersions(t, url); len(got) != 1 || got[0] != 1 {
-		t.Fatalf("recorded %v, want [1]", got)
+	if got := appliedVersions(t, url); len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Fatalf("recorded %v, want [1 2]", got)
 	}
 }
 
@@ -230,8 +230,8 @@ func TestConcurrentStartsDoNotRace(t *testing.T) {
 	for err := range errs {
 		t.Errorf("concurrent open: %v", err)
 	}
-	if got := appliedVersions(t, url); len(got) != 1 || got[0] != 1 {
-		t.Fatalf("recorded %v, want [1]", got)
+	if got := appliedVersions(t, url); len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Fatalf("recorded %v, want [1 2]", got)
 	}
 }
 

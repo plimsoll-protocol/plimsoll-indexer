@@ -426,9 +426,20 @@ components:
         listed_at:
           type: string
           format: date-time
-          example: "2026-10-01T00:00:00Z"
-        toml:
+          example: "2026-10-01T00:00:00Z"        toml:
           type: [object, "null"]
+          description: >-
+            The issuer's SEP-1 data. When the asset's stellar.toml lists
+            `attestation_of_reserve`, the object also carries
+            `attestation_hash` (SHA-256 of the document, lower-case hex) and,
+            once an earlier document has been replaced, `attestation_changed_at`.
+          properties:
+            attestation_hash:
+              type: string
+              example: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+            attestation_changed_at:
+              type: [string, "null"]
+              format: date-time
         toml_checked_at:
           type: [string, "null"]
           format: date-time

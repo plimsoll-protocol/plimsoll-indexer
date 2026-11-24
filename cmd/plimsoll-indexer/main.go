@@ -88,11 +88,12 @@ func run(cfg config.Config, log *slog.Logger) error {
 	go every(ctx, cfg.ReconcileInterval, log.With("job", "reconcile"), reconciler.Run)
 
 	tomlSync := &worker.TomlSync{
-		Horizon: hz,
-		Fetcher: stellartoml.NewFetcher(),
-		Store:   db,
-		MaxAge:  cfg.TomlInterval,
-		Log:     log.With("job", "toml"),
+		Horizon:     hz,
+		Fetcher:     stellartoml.NewFetcher(),
+		Store:       db,
+		Attestation: stellartoml.NewDocumentFetcher(),
+		MaxAge:      cfg.TomlInterval,
+		Log:         log.With("job", "toml"),
 	}
 	// Checks every minute; each asset is refreshed once per TOML_INTERVAL.
 	go every(ctx, time.Minute, log.With("job", "toml"), tomlSync.Run)

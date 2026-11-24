@@ -21,10 +21,11 @@ var now = time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
 const sac = "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
 
 type fake struct {
-	assets  []coverage.Asset
-	supply  map[string]*coverage.Supply
-	reports map[string]map[uint32]coverage.Report
-	bodies  map[string][]byte
+	assets      []coverage.Asset
+	supply      map[string]*coverage.Supply
+	reports     map[string]map[uint32]coverage.Report
+	bodies      map[string][]byte
+	attestation map[string]store.Attestation
 }
 
 func (f *fake) Ping(context.Context) error { return nil }
@@ -70,6 +71,12 @@ func (f *fake) Breakdown(_ context.Context, h string) ([]byte, error) {
 	}
 	return nil, store.ErrNotFound
 }
+func (f *fake) Attestation(_ context.Context, s string) (store.Attestation, error) {
+	if a, ok := f.attestation[s]; ok {
+		return a, nil
+	}
+	return store.Attestation{}, store.ErrNotFound
+}
 func (f *fake) Progress(context.Context, string) (store.Progress, error) {
 	return store.Progress{
 		Cursor:        "c",
@@ -92,6 +99,9 @@ func server() *httptest.Server {
 			}},
 		},
 		bodies: map[string][]byte{"abc": []byte(`{"total":"1"}`)},
+		attestation: map[string]store.Attestation{
+			sac: {Hash: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", ChangedAt: &now},
+		},
 	}
 	s := &Server{
 		Store: f,
@@ -130,6 +140,19 @@ func TestGetAssetCoverage(t *testing.T) {
 	}
 	if body["supply"].(map[string]any)["amount"] != "10000000000" {
 		t.Errorf("supply %+v", body["supply"])
+	}
+}
+
+func TestAssetTomlCarriesAttestation(t *testing.T) {
+	srv := server()
+	defer srv.Close()
+	body := get(t, srv, "/v1/assets/"+sac, 200)
+	toml := body["toml"].(map[string]any)
+	if toml["attestation_hash"] != "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" {
+		t.Errorf("attestation_hash = %v", toml["attestation_hash"])
+	}
+	if toml["attestation_changed_at"] != now.Format(time.RFC3339) {
+		t.Errorf("attestation_changed_at = %v, want %v", toml["attestation_changed_at"], now.Format(time.RFC3339))
 	}
 }
 
