@@ -3,6 +3,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -10,7 +11,9 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
@@ -35,6 +38,12 @@ type Reader interface {
 	Progress(ctx context.Context, name string) (store.Progress, error)
 }
 
+// WebhookStore is what the API needs to manage webhook registrations.
+type WebhookStore interface {
+	CreateWebhook(ctx context.Context, w coverage.Webhook) (coverage.Webhook, error)
+	DeleteWebhook(ctx context.Context, id int64) error
+}
+
 // NetworkInfo is served at /v1/network so clients can discover contract ids.
 type NetworkInfo struct {
 	NetworkPassphrase  string `json:"network_passphrase"`
@@ -50,6 +59,10 @@ type Server struct {
 	CORS    []string
 	Log     *slog.Logger
 	Now     func() time.Time
+	// Webhooks and AdminToken enable POST/DELETE /v1/webhooks. Both must be
+	// set; otherwise those endpoints answer 503.
+	Webhooks   WebhookStore
+	AdminToken string
 }
 
 func (s *Server) Handler() http.Handler {
@@ -63,6 +76,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/assets/{sac}/reports", s.reportHistory)
 	mux.HandleFunc("GET /v1/reporters", s.reporters)
 	mux.HandleFunc("GET /v1/breakdowns/{hash}", s.breakdown)
+	mux.HandleFunc("POST /v1/webhooks", s.createWebhook)
+	mux.HandleFunc("DELETE /v1/webhooks/{id}", s.deleteWebhook)
 	return s.cors(mux)
 }
 
@@ -349,6 +364,99 @@ func (s *Server) breakdown(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
+// ---- webhooks -------------------------------------------------------------
+
+// webhookRequest is the body of POST /v1/webhooks.
+type webhookRequest struct {
+	URL     string `json:"url"`
+	SAC     string `json:"sac"`
+	MinBps  uint32 `json:"min_bps"`
+	MinTier uint32 `json:"min_tier"`
+}
+
+func (s *Server) createWebhook(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req webhookRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "body must be a JSON object")
+		return
+	}
+	req.URL = strings.TrimSpace(req.URL)
+	if err := validateWebhook(req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	wh, err := s.Webhooks.CreateWebhook(r.Context(), coverage.Webhook{
+		URL: req.URL, SAC: req.SAC, MinBps: req.MinBps, MinTier: req.MinTier,
+	})
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, wh)
+}
+
+func (s *Server) deleteWebhook(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, "id must be a positive integer")
+		return
+	}
+	err = s.Webhooks.DeleteWebhook(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "webhook not found")
+		return
+	}
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// requireAdmin checks the bearer token on webhook administration requests. It
+// writes the response itself and returns false when the request is refused.
+func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if s.AdminToken == "" || s.Webhooks == nil {
+		writeError(w, http.StatusServiceUnavailable, "webhook administration is disabled")
+		return false
+	}
+	const prefix = "Bearer "
+	token := ""
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, prefix) {
+		token = strings.TrimSpace(auth[len(prefix):])
+	}
+	if subtle.ConstantTimeCompare([]byte(token), []byte(s.AdminToken)) != 1 {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeError(w, http.StatusUnauthorized, "invalid admin token")
+		return false
+	}
+	return true
+}
+
+func validateWebhook(req webhookRequest) error {
+	u, err := url.Parse(req.URL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return errors.New("url must be an absolute http or https URL")
+	}
+	if req.SAC == "" {
+		return errors.New("sac is required")
+	}
+	if req.MinBps < 1 || req.MinBps > 10_000 {
+		return errors.New("min_bps must be between 1 and 10000")
+	}
+	if req.MinTier < 1 || req.MinTier > 3 {
+		return errors.New("min_tier must be 1, 2 or 3")
+	}
+	return nil
+}
+
 // ---- helpers --------------------------------------------------------------
 
 func parseTier(w http.ResponseWriter, r *http.Request) (uint32, bool) {
@@ -387,7 +495,7 @@ func (s *Server) cors(next http.Handler) http.Handler {
 				break
 			}
 		}
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return

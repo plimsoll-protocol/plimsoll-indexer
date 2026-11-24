@@ -26,6 +26,8 @@ type fake struct {
 	reports     map[string]map[uint32]coverage.Report
 	bodies      map[string][]byte
 	attestation map[string]store.Attestation
+	created     []coverage.Webhook
+	deleted     []int64
 }
 
 func (f *fake) Ping(context.Context) error { return nil }
@@ -71,6 +73,21 @@ func (f *fake) Breakdown(_ context.Context, h string) ([]byte, error) {
 	}
 	return nil, store.ErrNotFound
 }
+func (f *fake) CreateWebhook(_ context.Context, w coverage.Webhook) (coverage.Webhook, error) {
+	w.ID = int64(len(f.created) + 1)
+	w.CreatedAt = now
+	f.created = append(f.created, w)
+	return w, nil
+}
+func (f *fake) DeleteWebhook(_ context.Context, id int64) error {
+	for _, w := range f.created {
+		if w.ID == id {
+			f.deleted = append(f.deleted, id)
+			return nil
+		}
+	}
+	return store.ErrNotFound
+}
 func (f *fake) Attestation(_ context.Context, s string) (store.Attestation, error) {
 	if a, ok := f.attestation[s]; ok {
 		return a, nil
@@ -104,10 +121,12 @@ func server() *httptest.Server {
 		},
 	}
 	s := &Server{
-		Store: f,
-		CORS:  []string{"*"},
-		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Now:   func() time.Time { return now },
+		Store:      f,
+		CORS:       []string{"*"},
+		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:        func() time.Time { return now },
+		Webhooks:   f,
+		AdminToken: "test-admin",
 	}
 	return httptest.NewServer(s.Handler())
 }
@@ -207,6 +226,95 @@ func TestBreakdownServedVerbatim(t *testing.T) {
 		t.Fatalf("body %q", b)
 	}
 	get(t, srv, "/v1/breakdowns/zzz", 404)
+}
+
+// adminRequest sends a webhook-administration request and returns the status
+// and decoded body (nil for 204).
+func adminRequest(t *testing.T, srv *httptest.Server, method, path, token, body string) (int, map[string]any) {
+	t.Helper()
+	var r io.Reader
+	if body != "" {
+		r = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, srv.URL+path, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent {
+		return resp.StatusCode, nil
+	}
+	var out map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return resp.StatusCode, out
+}
+
+func TestWebhookAdminEndpoints(t *testing.T) {
+	srv := server()
+	defer srv.Close()
+
+	valid := `{"url":"https://integrator.example/hook","sac":"CSAC","min_bps":9500,"min_tier":2}`
+	if got, _ := adminRequest(t, srv, http.MethodPost, "/v1/webhooks", "", valid); got != http.StatusUnauthorized {
+		t.Fatalf("no token: status %d, want 401", got)
+	}
+	if got, _ := adminRequest(t, srv, http.MethodPost, "/v1/webhooks", "wrong", valid); got != http.StatusUnauthorized {
+		t.Fatalf("wrong token: status %d, want 401", got)
+	}
+
+	status, body := adminRequest(t, srv, http.MethodPost, "/v1/webhooks", "test-admin", valid)
+	if status != http.StatusCreated {
+		t.Fatalf("create: status %d (%v), want 201", status, body)
+	}
+	if body["id"].(float64) != 1 || body["url"] != "https://integrator.example/hook" ||
+		body["sac"] != "CSAC" || body["min_bps"].(float64) != 9500 || body["min_tier"].(float64) != 2 {
+		t.Fatalf("created webhook = %+v", body)
+	}
+	if body["created_at"] == nil {
+		t.Fatal("created webhook has no created_at")
+	}
+
+	for name, payload := range map[string]string{
+		"non-http url": `{"url":"ftp://integrator.example/hook","sac":"CSAC","min_bps":9500,"min_tier":2}`,
+		"no sac":       `{"url":"https://integrator.example/hook","min_bps":9500,"min_tier":2}`,
+		"bad bps":      `{"url":"https://integrator.example/hook","sac":"CSAC","min_bps":0,"min_tier":2}`,
+		"bad tier":     `{"url":"https://integrator.example/hook","sac":"CSAC","min_bps":9500,"min_tier":4}`,
+		"not json":     `nope`,
+	} {
+		if got, _ := adminRequest(t, srv, http.MethodPost, "/v1/webhooks", "test-admin", payload); got != http.StatusBadRequest {
+			t.Errorf("%s: status %d, want 400", name, got)
+		}
+	}
+
+	if got, _ := adminRequest(t, srv, http.MethodDelete, "/v1/webhooks/1", "test-admin", ""); got != http.StatusNoContent {
+		t.Fatalf("delete: status %d, want 204", got)
+	}
+	if got, _ := adminRequest(t, srv, http.MethodDelete, "/v1/webhooks/99", "test-admin", ""); got != http.StatusNotFound {
+		t.Fatalf("delete unknown: status %d, want 404", got)
+	}
+	if got, _ := adminRequest(t, srv, http.MethodDelete, "/v1/webhooks/abc", "test-admin", ""); got != http.StatusBadRequest {
+		t.Fatalf("delete non-numeric: status %d, want 400", got)
+	}
+}
+
+func TestWebhookAdminDisabled(t *testing.T) {
+	s := &Server{
+		Store: &fake{},
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:   func() time.Time { return now },
+	}
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+	status, body := adminRequest(t, srv, http.MethodPost, "/v1/webhooks", "anything", `{}`)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("disabled administration: status %d (%v), want 503", status, body)
+	}
 }
 
 func TestCORSHeader(t *testing.T) {

@@ -98,6 +98,16 @@ func run(cfg config.Config, log *slog.Logger) error {
 	// Checks every minute; each asset is refreshed once per TOML_INTERVAL.
 	go every(ctx, time.Minute, log.With("job", "toml"), tomlSync.Run)
 
+	if cfg.WebhookSigningSecret != "" {
+		notifier := &worker.WebhookNotifier{
+			Store:  db,
+			Secret: cfg.WebhookSigningSecret,
+			Log:    log.With("job", "webhooks"),
+			Now:    time.Now,
+		}
+		go every(ctx, cfg.WebhookInterval, log.With("job", "webhooks"), notifier.Run)
+	}
+
 	if cfg.KeepAwakeURL != "" {
 		keepAwake := worker.NewKeepAwake(cfg.KeepAwakeURL)
 		kaLog := log.With("job", "keepawake")
@@ -159,9 +169,11 @@ func run(cfg config.Config, log *slog.Logger) error {
 				CoverageLedgerID:   cfg.CoverageLedgerID,
 				ReporterRegistryID: cfg.ReporterRegistryID,
 			},
-			CORS: cfg.CORSOrigins,
-			Log:  log.With("component", "api"),
-			Now:  time.Now,
+			CORS:       cfg.CORSOrigins,
+			Log:        log.With("component", "api"),
+			Now:        time.Now,
+			Webhooks:   db,
+			AdminToken: cfg.WebhookAdminToken,
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}

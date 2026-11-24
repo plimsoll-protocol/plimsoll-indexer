@@ -186,6 +186,7 @@ func TestLoadBadDurations(t *testing.T) {
 		"RECONCILE_INTERVAL",
 		"REPOST_AFTER",
 		"TOML_INTERVAL",
+		"WEBHOOK_INTERVAL",
 		"KEEP_AWAKE_INTERVAL",
 	}
 	for _, v := range durationVars {
@@ -200,6 +201,36 @@ func TestLoadBadDurations(t *testing.T) {
 				t.Errorf("error = %q, want it to mention %q", err.Error(), v)
 			}
 		})
+	}
+}
+
+// TestWebhookConfig checks that the admin token and signing secret are only
+// accepted together, and that the notifier interval has a default.
+func TestWebhookConfig(t *testing.T) {
+	setBase(t)
+	t.Setenv("WEBHOOK_ADMIN_TOKEN", "token")
+	t.Setenv("WEBHOOK_SIGNING_SECRET", "")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "WEBHOOK_SIGNING_SECRET must be set together") {
+		t.Fatalf("want a half-configured webhook error, got %v", err)
+	}
+
+	t.Setenv("WEBHOOK_ADMIN_TOKEN", "")
+	t.Setenv("WEBHOOK_SIGNING_SECRET", "secret")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "WEBHOOK_ADMIN_TOKEN and WEBHOOK_SIGNING_SECRET") {
+		t.Fatalf("want a half-configured webhook error, got %v", err)
+	}
+
+	t.Setenv("WEBHOOK_ADMIN_TOKEN", "token")
+	t.Setenv("WEBHOOK_SIGNING_SECRET", "secret")
+	got, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.WebhookAdminToken != "token" || got.WebhookSigningSecret != "secret" {
+		t.Errorf("webhook config: %+v", got)
+	}
+	if got.WebhookInterval.String() != "1m0s" {
+		t.Errorf("WebhookInterval = %v, want 1m0s", got.WebhookInterval)
 	}
 }
 

@@ -262,7 +262,97 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  /v1/webhooks:
+    post:
+      summary: Register a coverage-threshold webhook
+      description: >-
+        Requires `Authorization: Bearer <WEBHOOK_ADMIN_TOKEN>`. When the
+        asset's coverage falls below `min_bps`, using reports of at least
+        `min_tier`, the indexer POSTs JSON to `url` with
+        `X-Plimsoll-Signature: sha256=<hex HMAC-SHA256 of the body keyed with
+        WEBHOOK_SIGNING_SECRET>` and `X-Plimsoll-Delivery: <delivery id>`.
+        One alert is sent per crossing, re-armed when coverage recovers;
+        failed deliveries are retried with exponential backoff, at most five
+        attempts in total.
+      operationId: createWebhook
+      security:
+        - adminToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookRequest'
+      responses:
+        '201':
+          description: Webhook registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Webhook'
+        '400':
+          description: Invalid body or thresholds
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing or invalid admin token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Webhook administration is disabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/webhooks/{id}:
+    delete:
+      summary: Remove a webhook registration
+      description: Requires `Authorization: Bearer <WEBHOOK_ADMIN_TOKEN>`.
+      operationId: deleteWebhook
+      security:
+        - adminToken: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '204':
+          description: Webhook and its delivery log removed
+        '400':
+          description: Invalid id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing or invalid admin token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Webhook not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Webhook administration is disabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 components:
+  securitySchemes:
+    adminToken:
+      type: http
+      scheme: bearer
   schemas:
     NetworkInfo:
       type: object
@@ -485,6 +575,55 @@ components:
         - address
         - name
         - updated_at
+    WebhookRequest:
+      type: object
+      properties:
+        url:
+          type: string
+          format: uri
+          example: "https://integrator.example/plimsoll"
+        sac:
+          type: string
+          example: "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
+        min_bps:
+          type: integer
+          minimum: 1
+          maximum: 10000
+          example: 9500
+        min_tier:
+          type: integer
+          enum: [1, 2, 3]
+          example: 2
+      required:
+        - url
+        - sac
+        - min_bps
+        - min_tier
+    Webhook:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 1
+        url:
+          type: string
+          format: uri
+        sac:
+          type: string
+        min_bps:
+          type: integer
+        min_tier:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+      required:
+        - id
+        - url
+        - sac
+        - min_bps
+        - min_tier
+        - created_at
     ErrorResponse:
       type: object
       properties:
