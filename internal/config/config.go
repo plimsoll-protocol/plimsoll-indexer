@@ -90,8 +90,13 @@ type Config struct {
 }
 
 // Load reads the environment. Missing required values are reported together.
+// A local .env.local overlay is applied first when present, unless
+// GO_ENV=production.
 func Load() (Config, error) {
 	var errs []error
+	if err := loadEnvLocal(); err != nil {
+		errs = append(errs, err)
+	}
 	network := strings.ToLower(envOr("NETWORK", "testnet"))
 	preset, ok := Presets[network]
 	if !ok {

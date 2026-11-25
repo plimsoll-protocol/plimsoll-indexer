@@ -102,6 +102,10 @@ go run ./cmd/plimsoll-indexer
 curl localhost:8080/v1/assets
 ```
 
+To override any value locally, put it in `.env.local` in the repository root.
+The indexer loads that file automatically, after the shell has exported `.env`,
+and skips it entirely when `GO_ENV=production`.
+
 Leave `SUPPLY_POSTER_SECRET` empty to run read-only. To post supply, use the
 secret of an account registered in the reporter registry with the
 `SupplyPoster` role.
@@ -113,7 +117,9 @@ go test ./...
 ## Configuration
 
 Every variable is documented in [.env.example](.env.example). Required:
-`DATABASE_URL`, `COVERAGE_LEDGER_ID`, `REPORTER_REGISTRY_ID`.
+`DATABASE_URL`, `COVERAGE_LEDGER_ID`, `REPORTER_REGISTRY_ID`. A `.env.local`
+file in the working directory is applied over the environment (see
+[Quick start](#quick-start)); set `GO_ENV=production` to disable it.
 
 `NETWORK` selects a preset (`testnet`, the default, `mainnet` or `standalone`)
 that supplies defaults for `STELLAR_RPC_URL`, `HORIZON_URL` and

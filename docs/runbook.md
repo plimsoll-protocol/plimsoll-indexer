@@ -42,6 +42,7 @@ values are reported together at startup.
 | `PORT` | `8080` | |
 | `CORS_ORIGINS` | `*` | Comma separated. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. Logs are JSON on stdout. |
+| `GO_ENV` | empty | `production` disables the local `.env.local` overlay. Set it on every deployed instance. |
 | `KEEP_AWAKE_URL` | derived | `none` disables; otherwise `$RENDER_EXTERNAL_URL/healthz` on Render. |
 
 Intervals use Go duration syntax (`10s`, `15m`, `6h`).
