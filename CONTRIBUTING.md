@@ -97,7 +97,7 @@ changes.
 - Log with `log/slog`, structured key/value pairs, no string concatenation.
 - Amounts are `*big.Int` from Horizon to Postgres (`NUMERIC(40,0)`) to JSON (strings). No floats.
 - The canonical breakdown encoding is part of the protocol. Changing `horizon.Breakdown` changes every future hash and needs an issue first.
-- Secrets come from the environment only.
+- Secrets come from the environment or the configured secrets backend (`SECRETS_PROVIDER`); never log them.
 
 ## AI-assisted contributions
 

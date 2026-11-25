@@ -1,11 +1,18 @@
 package config
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
 	"os"
 	"regexp"
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/secrets"
 )
 
 func TestEnvExampleDocumentsLoadVariables(t *testing.T) {
@@ -61,7 +68,7 @@ func TestKeepAwakeURL(t *testing.T) {
 
 func setBase(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"NETWORK", "STELLAR_RPC_URL", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE", "WEBHOOK_ADMIN_TOKEN", "WEBHOOK_API_KEYS", "WEBHOOK_ENCRYPTION_KEY", "WEBHOOK_SIGNING_SECRET"} {
+	for _, k := range []string{"NETWORK", "STELLAR_RPC_URL", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE", "WEBHOOK_ADMIN_TOKEN", "WEBHOOK_API_KEYS", "WEBHOOK_ENCRYPTION_KEY", "WEBHOOK_SIGNING_SECRET", "SECRETS_PROVIDER", "SUPPLY_POSTER_SECRET", "SUPPLY_POSTER_SECRET_NAME", "DATABASE_PASSWORD_SECRET_NAME"} {
 		t.Setenv(k, "")
 	}
 	t.Setenv("DATABASE_URL", "postgres://x")
@@ -447,5 +454,155 @@ func TestPostingEnabled(t *testing.T) {
 	}
 	if !got.PostingEnabled() {
 		t.Error("PostingEnabled() = false with SUPPLY_POSTER_SECRET set, want true")
+	}
+}
+
+// TestSecretsProviderSelection checks that SECRETS_PROVIDER accepts the three
+// documented backends, defaults to env, and rejects anything else.
+func TestSecretsProviderSelection(t *testing.T) {
+	cases := []struct {
+		value, want string
+	}{
+		{"", secrets.Env},
+		{"env", secrets.Env},
+		{"SSM", secrets.SSM},
+		{" gcp ", secrets.GCP},
+	}
+	for _, c := range cases {
+		setBase(t)
+		t.Setenv("SECRETS_PROVIDER", c.value)
+		got, err := Load()
+		if err != nil {
+			t.Fatalf("SECRETS_PROVIDER=%q: %v", c.value, err)
+		}
+		if got.SecretsProvider != c.want {
+			t.Errorf("SECRETS_PROVIDER=%q: SecretsProvider = %q, want %q", c.value, got.SecretsProvider, c.want)
+		}
+	}
+
+	setBase(t)
+	t.Setenv("SECRETS_PROVIDER", "vault")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SECRETS_PROVIDER") {
+		t.Fatalf("want unknown provider error, got %v", err)
+	}
+}
+
+// stubProvider is a secrets.Provider backed by a map.
+type stubProvider struct {
+	values map[string]string
+	err    error
+	asked  []string
+}
+
+func (s *stubProvider) Get(_ context.Context, key string) (string, error) {
+	s.asked = append(s.asked, key)
+	if s.err != nil {
+		return "", s.err
+	}
+	v, ok := s.values[key]
+	if !ok {
+		return "", fmt.Errorf("no such secret %q", key)
+	}
+	return v, nil
+}
+
+func (s *stubProvider) Name() string { return "stub" }
+func (s *stubProvider) Close() error { return nil }
+
+// TestResolveSecrets checks that named credentials replace the environment
+// values and that an unnamed one keeps its environment fallback.
+func TestResolveSecrets(t *testing.T) {
+	p := &stubProvider{values: map[string]string{
+		"/plimsoll/poster": "poster-from-backend",
+		"/plimsoll/db":     "db-from-backend",
+	}}
+	cfg := Config{
+		SecretsProvider:      secrets.SSM,
+		PosterSecret:         "poster-from-env",
+		PosterSecretName:     "/plimsoll/poster",
+		DatabasePasswordName: "/plimsoll/db",
+	}
+	if err := cfg.ResolveSecrets(context.Background(), p); err != nil {
+		t.Fatalf("ResolveSecrets: %v", err)
+	}
+	if cfg.PosterSecret != "poster-from-backend" {
+		t.Errorf("PosterSecret = %q, want the backend value", cfg.PosterSecret)
+	}
+	if cfg.DatabasePassword != "db-from-backend" {
+		t.Errorf("DatabasePassword = %q, want the backend value", cfg.DatabasePassword)
+	}
+}
+
+func TestResolveSecretsKeepsEnvFallback(t *testing.T) {
+	p := &stubProvider{}
+	cfg := Config{SecretsProvider: secrets.SSM, PosterSecret: "poster-from-env"}
+	if err := cfg.ResolveSecrets(context.Background(), p); err != nil {
+		t.Fatalf("ResolveSecrets: %v", err)
+	}
+	if cfg.PosterSecret != "poster-from-env" {
+		t.Errorf("PosterSecret = %q, want the environment fallback", cfg.PosterSecret)
+	}
+	if cfg.DatabasePassword != "" {
+		t.Errorf("DatabasePassword = %q, want it unset", cfg.DatabasePassword)
+	}
+	if len(p.asked) != 0 {
+		t.Errorf("asked for %v, want no lookups without a *_SECRET_NAME", p.asked)
+	}
+}
+
+// TestResolveSecretsReportsKeysNotValues checks that a backend failure names the
+// configuration variable and the secret key without changing either credential.
+func TestResolveSecretsReportsKeysNotValues(t *testing.T) {
+	p := &stubProvider{err: errors.New("access denied")}
+	cfg := Config{
+		PosterSecret:         "poster-from-env",
+		PosterSecretName:     "/plimsoll/poster",
+		DatabasePasswordName: "/plimsoll/db",
+	}
+	err := cfg.ResolveSecrets(context.Background(), p)
+	if err == nil {
+		t.Fatal("ResolveSecrets = nil error, want error")
+	}
+	for _, want := range []string{"SUPPLY_POSTER_SECRET_NAME", "DATABASE_PASSWORD_SECRET_NAME", "/plimsoll/poster", "/plimsoll/db"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to mention %q", err, want)
+		}
+	}
+	if cfg.PosterSecret != "poster-from-env" {
+		t.Errorf("PosterSecret = %q, want the failed lookup to leave it unchanged", cfg.PosterSecret)
+	}
+}
+
+func TestResolveSecretsRejectsNilProvider(t *testing.T) {
+	cfg := Config{PosterSecretName: "/plimsoll/poster"}
+	if err := cfg.ResolveSecrets(context.Background(), nil); err == nil {
+		t.Fatal("ResolveSecrets(nil) = nil error, want error")
+	}
+}
+
+// TestConfigLogValueRedactsCredentials checks that logging a Config records
+// whether credentials are set but never their values.
+func TestConfigLogValueRedactsCredentials(t *testing.T) {
+	cfg := Config{
+		Network:              "testnet",
+		SecretsProvider:      secrets.SSM,
+		DatabaseURL:          "postgres://plimsoll:db-password-value@db:5432/plimsoll",
+		PosterSecret:         "poster-secret-value",
+		DatabasePassword:     "db-password-value",
+		WebhookAdminToken:    "admin-token-value",
+		WebhookEncryptionKey: "encryption-key-value",
+	}
+	var buf bytes.Buffer
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("config", "config", cfg)
+	out := buf.String()
+	for _, leaked := range []string{"poster-secret-value", "db-password-value", "admin-token-value", "encryption-key-value", "postgres://"} {
+		if strings.Contains(out, leaked) {
+			t.Errorf("log output %q leaks %q", out, leaked)
+		}
+	}
+	for _, want := range []string{`"poster_secret_set":true`, `"database_password_set":true`, `"secrets_provider":"ssm"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log output %q missing %q", out, want)
+		}
 	}
 }

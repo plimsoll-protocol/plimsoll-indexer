@@ -2,13 +2,17 @@
 package config
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/secrets"
 )
 
 const (
@@ -52,24 +56,37 @@ type Config struct {
 	// supply against before signing it on chain. One Horizon is one point of
 	// trust for the only figure this indexer asserts itself. Empty disables the
 	// comparison.
-	HorizonCheckURL      string
-	NetworkPassphrase    string
-	CoverageLedgerID     string
-	ReporterRegistryID   string
-	StartLedger          uint32
-	IngestWorkers        int
+	HorizonCheckURL    string
+	NetworkPassphrase  string
+	CoverageLedgerID   string
+	ReporterRegistryID string
+	StartLedger        uint32
+	IngestWorkers      int
+	// SecretsProvider selects where PosterSecret and DatabasePassword come
+	// from: env (the plain environment variables), ssm (AWS Systems Manager
+	// Parameter Store) or gcp (GCP Secret Manager).
+	SecretsProvider string
+	// PosterSecretName is the SSM parameter or GCP secret that holds the
+	// poster secret. Empty leaves PosterSecret as read from the environment.
+	PosterSecretName string
+	// DatabasePasswordName is the SSM parameter or GCP secret that holds the
+	// database password. Empty keeps the password DATABASE_URL carries.
+	DatabasePasswordName string
+	// DatabasePassword is fetched by ResolveSecrets and overrides the password
+	// in DATABASE_URL. Never log it.
+	DatabasePassword     string
 	PosterSecret         string
 	WebhookAdminToken    string
 	WebhookAPIKeys       []string
 	WebhookEncryptionKey string
 	SlackWebhookURL      string
 	DiscordWebhookURL    string
-	HorizonCheckURL    string
-	NetworkPassphrase  string
-	CoverageLedgerID   string
-	ReporterRegistryID string
-	StartLedger        uint32
-	PosterSecret       string
+	HorizonCheckURL      string
+	NetworkPassphrase    string
+	CoverageLedgerID     string
+	ReporterRegistryID   string
+	StartLedger          uint32
+	PosterSecret         string
 	// WebhookAdminToken protects webhook administration. It is shared by
 	// issuer TOML change subscriptions and coverage alerts.
 	WebhookAdminToken string
@@ -134,6 +151,9 @@ func Load() (Config, error) {
 		NetworkPassphrase:    envOr("STELLAR_NETWORK_PASSPHRASE", preset.Passphrase),
 		CoverageLedgerID:     os.Getenv("COVERAGE_LEDGER_ID"),
 		ReporterRegistryID:   os.Getenv("REPORTER_REGISTRY_ID"),
+		SecretsProvider:      strings.ToLower(strings.TrimSpace(envOr("SECRETS_PROVIDER", secrets.Env))),
+		PosterSecretName:     strings.TrimSpace(os.Getenv("SUPPLY_POSTER_SECRET_NAME")),
+		DatabasePasswordName: strings.TrimSpace(os.Getenv("DATABASE_PASSWORD_SECRET_NAME")),
 		PosterSecret:         os.Getenv("SUPPLY_POSTER_SECRET"),
 		WebhookAdminToken:    os.Getenv("WEBHOOK_ADMIN_TOKEN"),
 		WebhookEncryptionKey: os.Getenv("WEBHOOK_ENCRYPTION_KEY"),
@@ -151,6 +171,12 @@ func Load() (Config, error) {
 		} else {
 			c.WebhookAPIKeys = keys
 		}
+	}
+
+	switch c.SecretsProvider {
+	case secrets.Env, secrets.SSM, secrets.GCP:
+	default:
+		errs = append(errs, fmt.Errorf("SECRETS_PROVIDER %q is not one of env, ssm, gcp", c.SecretsProvider))
 	}
 
 	if c.RPCURL == "" {
@@ -172,6 +198,7 @@ func Load() (Config, error) {
 	}
 	if len(c.WebhookAPIKeys) > 0 && c.WebhookAdminToken == "" {
 		errs = append(errs, errors.New("WEBHOOK_API_KEYS requires WEBHOOK_ADMIN_TOKEN and WEBHOOK_ENCRYPTION_KEY"))
+	}
 	if c.WebhookSigningSecret != "" && c.WebhookAdminToken == "" {
 		errs = append(errs, errors.New("WEBHOOK_ADMIN_TOKEN and WEBHOOK_SIGNING_SECRET must be configured together"))
 	}
@@ -280,6 +307,44 @@ func keepAwakeURL(explicit, renderExternal string) string {
 	default:
 		return ""
 	}
+}
+
+// ResolveSecrets fills PosterSecret and DatabasePassword from p. A credential
+// with no *_SECRET_NAME keeps the value from the environment, so either one can
+// stay in env vars while the other comes from the backend.
+func (c *Config) ResolveSecrets(ctx context.Context, p secrets.Provider) error {
+	if p == nil {
+		return errors.New("resolve secrets: nil provider")
+	}
+	var errs []error
+	if c.PosterSecretName != "" {
+		v, err := p.Get(ctx, c.PosterSecretName)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("SUPPLY_POSTER_SECRET_NAME %q: %w", c.PosterSecretName, err))
+		} else {
+			c.PosterSecret = v
+		}
+	}
+	if c.DatabasePasswordName != "" {
+		v, err := p.Get(ctx, c.DatabasePasswordName)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("DATABASE_PASSWORD_SECRET_NAME %q: %w", c.DatabasePasswordName, err))
+		} else {
+			c.DatabasePassword = v
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// LogValue implements slog.LogValuer so that logging a Config records which
+// credentials were supplied, never their values.
+func (c Config) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("network", c.Network),
+		slog.String("secrets_provider", c.SecretsProvider),
+		slog.Bool("poster_secret_set", c.PosterSecret != ""),
+		slog.Bool("database_password_set", c.DatabasePassword != ""),
+	)
 }
 
 // PostingEnabled reports whether this instance should post supply snapshots.
