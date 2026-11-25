@@ -96,6 +96,25 @@ secret of an account registered in the reporter registry with the
 go test ./...
 ```
 
+### Linting
+
+CI runs two complementary Go static analyzers on every pull request:
+
+- **`golangci-lint`** (configured in [.golangci.yml](.golangci.yml)): enforces `errcheck`, `govet`, `ineffassign`, `unused`, `gosec`, `bodyclose`, and `staticcheck` on production packages.
+- **`staticcheck`** (standalone `staticcheck ./...`): runs the full `SA`/`S`/`ST` check suite across all packages including `_test.go` files, catching Go-specific bugs, deprecated APIs, and style issues that `.golangci.yml` excludes from test files.
+
+Run both locally before pushing:
+
+```bash
+golangci-lint run
+staticcheck ./...
+```
+
+Only suppress a finding when it is a verified false positive or intentional legacy/regression test coverage (never to hide real bugs), and always include a short justification comment:
+
+- `golangci-lint`: `//nolint:<linter> // reason` (or a scoped rule in `.golangci.yml`).
+- `staticcheck`: `//lint:ignore <CHECK> <reason>` on the line above the finding.
+
 ## Configuration
 
 Every variable is documented in [.env.example](.env.example). Required:
