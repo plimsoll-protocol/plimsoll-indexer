@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -70,6 +71,9 @@ type Config struct {
 	TomlInterval      time.Duration
 	CORSOrigins       []string
 	LogLevel          string
+	LogLevelAPI       string
+	LogLevelWorker    string
+	LogLevelIngest    string
 	// KeepAwakeURL is requested every KeepAwakeInterval so a host that sleeps
 	// idle services (Render's free tier) keeps this one, and its poster, up.
 	KeepAwakeURL      string
@@ -99,6 +103,7 @@ func Load() (Config, error) {
 		preset = Presets["testnet"]
 	}
 
+	levels := LoadLogLevels()
 	c := Config{
 		Network:              network,
 		DatabaseURL:          os.Getenv("DATABASE_URL"),
@@ -112,7 +117,10 @@ func Load() (Config, error) {
 		PosterSecret:         os.Getenv("SUPPLY_POSTER_SECRET"),
 		WebhookAdminToken:    os.Getenv("WEBHOOK_ADMIN_TOKEN"),
 		WebhookEncryptionKey: os.Getenv("WEBHOOK_ENCRYPTION_KEY"),
-		LogLevel:             envOr("LOG_LEVEL", "info"),
+		LogLevel:             levels.Default,
+		LogLevelAPI:          levels.API,
+		LogLevelWorker:       levels.Worker,
+		LogLevelIngest:       levels.Ingest,
 		KeepAwakeURL:         keepAwakeURL(os.Getenv("KEEP_AWAKE_URL"), os.Getenv("RENDER_EXTERNAL_URL")),
 	}
 
@@ -212,6 +220,43 @@ func keepAwakeURL(explicit, renderExternal string) string {
 
 // PostingEnabled reports whether this instance should post supply snapshots.
 func (c Config) PostingEnabled() bool { return c.PosterSecret != "" }
+
+// LogLevels holds the configured log level names for the indexer and its
+// individual components.
+type LogLevels struct {
+	Default string
+	API     string
+	Worker  string
+	Ingest  string
+}
+
+// LoadLogLevels reads LOG_LEVEL and component-specific overrides
+// (LOG_LEVEL_API, LOG_LEVEL_WORKER, LOG_LEVEL_INGEST) from the environment.
+// Unset or empty component variables fall back to LOG_LEVEL.
+func LoadLogLevels() LogLevels {
+	def := envOr("LOG_LEVEL", "info")
+	return LogLevels{
+		Default: def,
+		API:     envOr("LOG_LEVEL_API", def),
+		Worker:  envOr("LOG_LEVEL_WORKER", def),
+		Ingest:  envOr("LOG_LEVEL_INGEST", def),
+	}
+}
+
+// ParseLogLevel converts a level name ("debug", "info", "warn", "error") into
+// a slog.Level, defaulting to slog.LevelInfo for unrecognized values.
+func ParseLogLevel(level string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
 
 func envOr(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
