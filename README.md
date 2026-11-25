@@ -68,6 +68,12 @@ The command fetches the asset's snapshot breakdown from the indexer, verifies th
 | `GET /v1/breakdowns/{hash}` | Exact bytes of a supply breakdown |
 | `POST /v1/webhooks`, `GET /v1/webhooks`, `DELETE /v1/webhooks/{id}` | Manage authenticated issuer TOML change subscriptions |
 
+Every `4xx` and `5xx` response has the same body:
+`{"code":"asset_not_listed","message":"…"}`, with an optional `details` object.
+`code` is machine-readable and stable, so clients should match on it instead of
+on `message`. See `ErrorResponse` in
+[`internal/api/openapi.yaml`](internal/api/openapi.yaml).
+
 Webhook registration and signature verification are covered in the
 [webhook guide](docs/webhooks.md).
 
