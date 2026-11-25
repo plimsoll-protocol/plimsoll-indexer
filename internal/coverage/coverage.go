@@ -103,6 +103,15 @@ type Reporter struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// Vault holds metadata for a covered vault indexed for an asset.
+type Vault struct {
+	SAC            string    `json:"sac"`
+	VaultAddress   string    `json:"vault_address"`
+	ReserveBalance *big.Int  `json:"-"`
+	ThresholdBps   uint32    `json:"threshold_bps"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
 // Result mirrors the contract's Coverage struct.
 type Result struct {
 	Bps            uint32
