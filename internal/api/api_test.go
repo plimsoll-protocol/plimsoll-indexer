@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"math/big"
@@ -165,6 +166,7 @@ func serverWithWebhooks(manager WebhookManager, codec *webhook.SecretCodec, toke
 		CORS:              []string{"*"},
 		Log:               slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Now:               func() time.Time { return now },
+		Changelog:         testChangelog,
 	}
 	return httptest.NewServer(s.Handler())
 }
@@ -197,6 +199,42 @@ func TestGetAssetCoverage(t *testing.T) {
 	}
 	if body["supply"].(map[string]any)["amount"] != "10000000000" {
 		t.Errorf("supply %+v", body["supply"])
+	}
+}
+
+// HEAD answers existence with a status code and no body, so a client can
+// check a listing without downloading the asset document.
+func TestHeadAsset(t *testing.T) {
+	srv := server()
+	defer srv.Close()
+	for _, tc := range []struct {
+		name string
+		path string
+		want int
+	}{
+		{"listed", "/v1/assets/" + sac, http.StatusOK},
+		{"unlisted", "/v1/assets/" + unlistedSAC(t), http.StatusNotFound},
+		{"malformed", "/v1/assets/not-a-sac", http.StatusBadRequest},
+	} {
+		req, err := http.NewRequest(http.MethodHead, srv.URL+tc.path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if resp.StatusCode != tc.want {
+			t.Errorf("%s: status %d want %d", tc.name, resp.StatusCode, tc.want)
+		}
+		if len(body) != 0 {
+			t.Errorf("%s: body %q, want empty", tc.name, body)
+		}
 	}
 }
 
@@ -265,14 +303,14 @@ func TestMalformedPathIDs(t *testing.T) {
 		"/v1/assets/not-a-sac/reports",
 	} {
 		body := get(t, srv, path, 400)
-		if body["error"] == nil {
-			t.Errorf("%s: expected an error message, got %+v", path, body)
+		if body["code"] != "invalid_sac" || body["message"] == nil {
+			t.Errorf("%s: expected an invalid_sac error, got %+v", path, body)
 		}
 	}
 	for _, hash := range []string{"abc", strings.Repeat("a", 63), strings.Repeat("z", 64)} {
 		body := get(t, srv, "/v1/breakdowns/"+hash, 400)
-		if body["error"] == nil {
-			t.Errorf("hash %q: expected an error message, got %+v", hash, body)
+		if body["code"] != "invalid_breakdown_hash" || body["message"] == nil {
+			t.Errorf("hash %q: expected an invalid_breakdown_hash error, got %+v", hash, body)
 		}
 	}
 }
@@ -287,9 +325,79 @@ func TestUnlistedPathIDs(t *testing.T) {
 		"/v1/assets/" + unknown + "/reports",
 	} {
 		body := get(t, srv, path, 404)
-		if body["error"] != "asset not listed" {
+		if body["code"] != "asset_not_listed" || body["message"] != "asset not listed" {
 			t.Errorf("%s: body %+v", path, body)
 		}
+	}
+}
+
+// failingStore breaks Ping so the health handler's error path can be checked.
+type failingStore struct{ Reader }
+
+func (failingStore) Ping(context.Context) error { return errors.New("down") }
+
+// Every failure, including the plain-text 404 and 405 net/http writes for an
+// unknown path or method, carries the same structured body.
+func TestStructuredErrorBody(t *testing.T) {
+	srv := server()
+	defer srv.Close()
+	cases := []struct {
+		method, path, code, parameter string
+		status                        int
+	}{
+		{http.MethodGet, "/v1/assets/CNOPE", "invalid_sac", "", 400},
+		{http.MethodGet, "/v1/assets/" + sac + "?min_tier=9", "invalid_min_tier", "min_tier", 400},
+		{http.MethodGet, "/v1/assets/" + sac + "/supply?limit=0", "invalid_limit", "limit", 400},
+		{http.MethodGet, "/v1/breakdowns/abc", "invalid_breakdown_hash", "", 400},
+		{http.MethodGet, "/v1/breakdowns/" + strings.Repeat("0", 64), "breakdown_not_found", "", 404},
+		{http.MethodGet, "/v1/assets/" + unlistedSAC(t), "asset_not_listed", "", 404},
+		{http.MethodGet, "/v1/nope", "not_found", "", 404},
+		{http.MethodPost, "/v1/assets", "method_not_allowed", "", 405},
+		{http.MethodPost, "/v1/webhooks", "webhooks_not_configured", "", 503},
+	}
+	for _, tc := range cases {
+		req, err := http.NewRequest(tc.method, srv.URL+tc.path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body errorBody
+		decodeErr := json.NewDecoder(resp.Body).Decode(&body)
+		resp.Body.Close()
+		if resp.StatusCode != tc.status {
+			t.Errorf("%s %s: status %d want %d", tc.method, tc.path, resp.StatusCode, tc.status)
+		}
+		if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+			t.Errorf("%s %s: Content-Type %q", tc.method, tc.path, ct)
+		}
+		if decodeErr != nil {
+			t.Errorf("%s %s: decode: %v", tc.method, tc.path, decodeErr)
+			continue
+		}
+		if body.Code != tc.code || body.Message == "" {
+			t.Errorf("%s %s: body %+v want code %q", tc.method, tc.path, body, tc.code)
+		}
+		if tc.parameter != "" && body.Details["parameter"] != tc.parameter {
+			t.Errorf("%s %s: details %+v want parameter %q", tc.method, tc.path, body.Details, tc.parameter)
+		}
+	}
+}
+
+func TestHealthErrorBody(t *testing.T) {
+	s := &Server{
+		Store: failingStore{&fake{}},
+		CORS:  []string{"*"},
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:   func() time.Time { return now },
+	}
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+	body := get(t, srv, "/healthz", 503)
+	if body["code"] != "db_unavailable" || body["message"] == nil {
+		t.Fatalf("body %+v", body)
 	}
 }
 
@@ -338,6 +446,9 @@ func TestOpenAPISpec(t *testing.T) {
 	if !strings.Contains(string(body), "openapi: 3.1.0") {
 		t.Fatalf("expected openapi 3.1.0 spec, got: %s", string(body))
 	}
+	if !strings.Contains(string(body), "operationId: headAsset") {
+		t.Error("expected the spec to document the HEAD asset operation")
+	}
 }
 
 func TestWebhookSecretReturnedOnlyAtCreation(t *testing.T) {
@@ -369,9 +480,13 @@ func TestWebhookSecretReturnedOnlyAtCreation(t *testing.T) {
 	}
 
 	unauthorized := request(http.MethodPost, "/v1/webhooks", `{"url":"https://receiver.example/hook"}`, false)
+	var unauthorizedBody errorBody
+	if err := json.NewDecoder(unauthorized.Body).Decode(&unauthorizedBody); err != nil {
+		t.Fatal(err)
+	}
 	unauthorized.Body.Close()
-	if unauthorized.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("unauthorized create status = %d, want 401", unauthorized.StatusCode)
+	if unauthorized.StatusCode != http.StatusUnauthorized || unauthorizedBody.Code != "unauthorized" {
+		t.Fatalf("unauthorized create = %d %+v, want 401 unauthorized", unauthorized.StatusCode, unauthorizedBody)
 	}
 
 	created := request(http.MethodPost, "/v1/webhooks", `{"url":"https://receiver.example/hook"}`, true)
@@ -433,8 +548,14 @@ func TestGetAssetVault(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
 
-	get(t, srv, "/v1/assets/not-a-sac/vault", http.StatusBadRequest)
-	get(t, srv, "/v1/assets/"+unlistedSAC(t)+"/vault", http.StatusNotFound)
+	bad := get(t, srv, "/v1/assets/not-a-sac/vault", http.StatusBadRequest)
+	if bad["code"] != "invalid_sac" {
+		t.Fatalf("unexpected error code: %+v", bad)
+	}
+	missing := get(t, srv, "/v1/assets/"+unlistedSAC(t)+"/vault", http.StatusNotFound)
+	if missing["code"] != "vault_not_found" {
+		t.Fatalf("unexpected error code: %+v", missing)
+	}
 
 	body := get(t, srv, "/v1/assets/"+sac+"/vault", http.StatusOK)
 	if body["sac"] != sac || body["vault_address"] != vaultAddr ||
@@ -479,8 +600,14 @@ func TestGetIssuerToml(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
 
-	get(t, srv, "/v1/issuers/not-an-issuer/toml", http.StatusBadRequest)
-	get(t, srv, "/v1/issuers/"+otherIssuer+"/toml", http.StatusNotFound)
+	bad := get(t, srv, "/v1/issuers/not-an-issuer/toml", http.StatusBadRequest)
+	if bad["code"] != "invalid_issuer" {
+		t.Fatalf("unexpected error code: %+v", bad)
+	}
+	missing := get(t, srv, "/v1/issuers/"+otherIssuer+"/toml", http.StatusNotFound)
+	if missing["code"] != "issuer_toml_not_found" {
+		t.Fatalf("unexpected error code: %+v", missing)
+	}
 
 	resp, err := http.Get(srv.URL + "/v1/issuers/" + issuerAddr + "/toml")
 	if err != nil {

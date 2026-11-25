@@ -255,21 +255,41 @@ func (s *Store) LatestSupply(ctx context.Context, sac string) (*coverage.Supply,
 	return &h[0], nil
 }
 
+// reportHistorySQL returns one asset's reports newest-posted first. The
+// reserve_reports_sac_posted_ledger index (migration 0004) supplies that order,
+// so LIMIT stops the scan early instead of sorting the whole history.
+const reportHistorySQL = `
+	SELECT tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source,
+	       COALESCE(doc_check, '')
+	FROM reserve_reports WHERE sac = $1
+	ORDER BY posted_ledger DESC, as_of DESC LIMIT $2`
+
 func (s *Store) ReportHistory(ctx context.Context, sac string, limit int) ([]coverage.Report, error) {
-	return s.queryReports(ctx, `
-		SELECT tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source,
-		       COALESCE(doc_check, '')
-		FROM reserve_reports WHERE sac = $1
-		ORDER BY posted_ledger DESC, as_of DESC LIMIT $2`, sac, limit)
+	return s.queryReports(ctx, reportHistorySQL, sac, limit)
 }
+
+// latestReportsSQL asks for one report per tier, each the newest by as_of.
+//
+// It is written as one bounded lookup per tier rather than
+// `DISTINCT ON (tier)` over the asset's reports: the composite index
+// reserve_reports_sac_tier_asof (migration 0001) answers each lookup with a
+// single index probe, so the cost is O(log n) in the asset's report count
+// instead of reading and sorting every report it has ever posted.
+const latestReportsSQL = `
+	SELECT r.tier, r.amount::text, r.as_of, r.posted_at, r.reporter, r.doc_hash, r.doc_uri, r.tx_hash, r.source,
+	       COALESCE(r.doc_check, '')
+	FROM (VALUES (1::smallint), (2::smallint), (3::smallint)) AS wanted(tier)
+	CROSS JOIN LATERAL (
+		SELECT tier, amount, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source, doc_check
+		FROM reserve_reports
+		WHERE sac = $1 AND tier = wanted.tier
+		ORDER BY as_of DESC
+		LIMIT 1
+	) AS r`
 
 // LatestReports returns the newest report (by as_of) for each tier.
 func (s *Store) LatestReports(ctx context.Context, sac string) (map[uint32]coverage.Report, error) {
-	list, err := s.queryReports(ctx, `
-		SELECT DISTINCT ON (tier) tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source,
-		                           COALESCE(doc_check, '')
-		FROM reserve_reports WHERE sac = $1
-		ORDER BY tier, as_of DESC`, sac)
+	list, err := s.queryReports(ctx, latestReportsSQL, sac)
 	if err != nil {
 		return nil, err
 	}

@@ -1,0 +1,102 @@
+name: Weekly testnet integration
+
+# The contracts this indexer reads live on testnet, deployed from another
+# repository on their own schedule. A redeploy, an ABI change, an archived
+# entry, an RPC/Horizon disagreement or a stale ledger can break ingestion
+# without any commit here, so no pull-request check can catch it. This runs the
+# integration suite against the live contracts weekly and reports failures where
+# the maintainers will see them.
+on:
+  schedule:
+    # Every Sunday at 06:00 UTC.
+    - cron: "0 6 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: weekly-testnet
+  cancel-in-progress: false
+
+env:
+  # Hosted instance used by the freshness checks; only read, never written.
+  INDEXER_URL: https://plimsoll-indexer.onrender.com
+
+jobs:
+  testnet:
+    name: live testnet
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # The manifest is the single source of truth for the addresses, so check
+      # that it parses and carries everything the suite needs before spending
+      # time on the network.
+      - name: Check the testnet deployment manifest
+        run: |
+          set -euo pipefail
+          jq -e '
+            .network == "testnet" and
+            (.network_passphrase | length > 0) and
+            (.rpc_url | startswith("https://")) and
+            (.horizon_url | startswith("https://")) and
+            (.start_ledger > 0) and
+            (.coverage_ledger_id | startswith("C") and length == 56) and
+            (.reporter_registry_id | startswith("C") and length == 56) and
+            (.assets | length > 0)
+          ' deployments/testnet.json > /dev/null
+          {
+            echo "COVERAGE_LEDGER_ID=$(jq -r .coverage_ledger_id deployments/testnet.json)"
+            echo "REPORTER_REGISTRY_ID=$(jq -r .reporter_registry_id deployments/testnet.json)"
+            echo "START_LEDGER=$(jq -r .start_ledger deployments/testnet.json)"
+          } >> "$GITHUB_ENV"
+
+      - name: Offline suite
+        run: go test -race ./...
+
+      # Exercises the contract ABI and both public services: get_supply on the
+      # coverage ledger, decode, Horizon, and the deployment addresses. Reads
+      # only; nothing is signed or submitted.
+      - name: Live contracts
+        run: PLIMSOLL_TESTNET=1 go test ./internal/e2e/ -run TestTestnet -v -timeout 10m
+
+      # The read-only simulation path in internal/worker, which is the premise
+      # every poster tick and reconcile rests on.
+      - name: Live contract state read
+        run: PLIMSOLL_LIVE=1 go test ./internal/worker/ -run TestLive -v -timeout 5m
+
+      # A scheduled run that nobody watches is not a monitor. Open or append to
+      # one issue so repeats do not spam the tracker, and post to the optional
+      # webhook (slack-compatible) when the repository has one configured.
+      - name: Notify on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TESTNET_ALERT_WEBHOOK_URL: ${{ secrets.TESTNET_ALERT_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          title="Weekly testnet integration is failing"
+          body=$(printf '%s\n\nRun: %s\nCommit: %s\nTriggered by: %s\n' \
+            "The weekly integration run against the live testnet contracts failed. Check whether the contracts were redeployed, the RPC or Horizon endpoints moved, or entries were archived." \
+            "$run_url" "$GITHUB_SHA" "$GITHUB_EVENT_NAME")
+          existing=$(gh issue list --state open --search "$title in:title" \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
+          if [ -n "${TESTNET_ALERT_WEBHOOK_URL:-}" ]; then
+            jq -n --arg text "$body" '{text: $text}' |
+              curl -fsS -X POST -H 'Content-Type: application/json' --data @- "$TESTNET_ALERT_WEBHOOK_URL"
+          else
+            echo "TESTNET_ALERT_WEBHOOK_URL is not set; only the issue was updated."
+          fi

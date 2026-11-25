@@ -62,14 +62,28 @@ The command fetches the asset's snapshot breakdown from the indexer, verifies th
 | `GET /v1/network` | Contract ids, RPC and Horizon URLs |
 | `GET /v1/assets?min_tier=1` | Every asset with latest supply, latest report per tier, coverage and stellar.toml data |
 | `GET /v1/assets/{sac}?min_tier=1` | One asset, same shape |
+| `HEAD /v1/assets/{sac}` | Status only, no response body: `200` if the asset is listed, `404` if not |
 | `GET /v1/assets/{sac}/supply?limit=100` | Supply snapshot history. Each row carries `source`: `event` for a figure decoded from a contract event, with the `tx_hash` that produced it, or `chain` for one recovered from contract state after an ingestion gap, where `tx_hash` is empty. |
 | `GET /v1/assets/{sac}/reports?limit=100` | Reserve report history |
 | `GET /v1/reporters` | Active registered reporters |
+| `GET /v1/changelog` | Breaking API changes per released version, newest first |
 | `GET /v1/breakdowns/{hash}` | Exact bytes of a supply breakdown |
 | `POST /v1/webhooks`, `GET /v1/webhooks`, `DELETE /v1/webhooks/{id}` | Manage authenticated issuer TOML change subscriptions |
 
+Every `4xx` and `5xx` response has the same body:
+`{"code":"asset_not_listed","message":"…"}`, with an optional `details` object.
+`code` is machine-readable and stable, so clients should match on it instead of
+on `message`. See `ErrorResponse` in
+[`internal/api/openapi.yaml`](internal/api/openapi.yaml).
+
 Webhook registration and signature verification are covered in the
 [webhook guide](docs/webhooks.md).
+
+Breaking API changes (a removed field, a renamed endpoint, a newly required
+parameter) are recorded by hand in
+[internal/changelog/CHANGELOG.yaml](internal/changelog/CHANGELOG.yaml) and served
+at `GET /v1/changelog`, newest version first. The indexer refuses to start if
+that file is malformed.
 
 Coverage in the API uses the same selection and rounding rules as the contract
 (`internal/coverage`), so the API and `coverage()` on-chain agree.
