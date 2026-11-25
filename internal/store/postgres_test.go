@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
 )
 
@@ -216,6 +217,52 @@ func TestWebhookPersistence(t *testing.T) {
 	deleted, err = s.DeleteWebhook(ctx, created.ID)
 	if err != nil || deleted {
 		t.Fatalf("delete missing webhook: deleted=%v err=%v", deleted, err)
+	}
+}
+
+func TestReporterSetPersistsDisplayNameAndPreservesMetadata(t *testing.T) {
+	s, _ := openStore(t)
+	ctx := context.Background()
+	at := time.Date(2026, 11, 25, 5, 0, 0, 0, time.UTC)
+
+	registered := soroban.ReporterSet{
+		Meta:     soroban.Meta{ID: "reporter-set-1", Ledger: 100, ClosedAt: at},
+		Reporter: "GREPORTER",
+		Role:     coverage.RoleAuditor,
+		Name:     "Acme",
+	}
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-1", 100, []any{registered}); err != nil {
+		t.Fatalf("apply registration: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE reporters SET website_uri = $2, contact_hash = $3 WHERE address = $1`,
+		registered.Reporter, "https://acme.example", "sha256:contact"); err != nil {
+		t.Fatal(err)
+	}
+
+	updated := registered
+	updated.ID = "reporter-set-2"
+	updated.Ledger = 101
+	updated.ClosedAt = at.Add(time.Minute)
+	updated.Role = coverage.RoleTranscriber
+	updated.Name = "Acme Updated"
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-2", 101, []any{updated}); err != nil {
+		t.Fatalf("apply update: %v", err)
+	}
+
+	reporters, err := s.Reporters(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reporters) != 1 {
+		t.Fatalf("got %d reporters, want 1", len(reporters))
+	}
+	got := reporters[0]
+	if got.Name != "Acme Updated" || got.DisplayName != "Acme Updated" ||
+		got.Role != coverage.RoleTranscriber || got.WebsiteURI == nil ||
+		*got.WebsiteURI != "https://acme.example" || got.ContactHash == nil ||
+		*got.ContactHash != "sha256:contact" {
+		t.Fatalf("reporter metadata after update = %+v", got)
 	}
 }
 

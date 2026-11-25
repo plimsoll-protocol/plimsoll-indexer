@@ -81,7 +81,11 @@ func (f *fake) ReportHistory(_ context.Context, s string, _ int) ([]coverage.Rep
 	return out, nil
 }
 func (f *fake) Reporters(context.Context) ([]coverage.Reporter, error) {
-	return []coverage.Reporter{{Address: "GAUD", Role: coverage.RoleAuditor, Name: "Acme"}}, nil
+	websiteURI, contactHash := "https://acme.example", "sha256:contact"
+	return []coverage.Reporter{{
+		Address: "GAUD", Role: coverage.RoleAuditor, Name: "Acme", DisplayName: "Acme Inc.",
+		WebsiteURI: &websiteURI, ContactHash: &contactHash,
+	}}, nil
 }
 func (f *fake) Breakdown(_ context.Context, h string) ([]byte, error) {
 	if b, ok := f.bodies[h]; ok {
@@ -205,7 +209,9 @@ func TestListAndMisc(t *testing.T) {
 	}
 	get(t, srv, "/v1/assets/CNOPE", 400)
 	rep := get(t, srv, "/v1/reporters", 200)
-	if rep["reporters"].([]any)[0].(map[string]any)["role"] != "auditor" {
+	reporter := rep["reporters"].([]any)[0].(map[string]any)
+	if reporter["role"] != "auditor" || reporter["display_name"] != "Acme Inc." ||
+		reporter["website_uri"] != "https://acme.example" || reporter["contact_hash"] != "sha256:contact" {
 		t.Fatal("role name missing")
 	}
 	h := get(t, srv, "/healthz", 200)

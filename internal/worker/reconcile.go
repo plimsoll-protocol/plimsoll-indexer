@@ -185,9 +185,10 @@ func (rc *Reconciler) reconcileReporters(ctx context.Context) error {
 		}
 		if state != nil {
 			added, err := rc.Store.SaveChainReporter(ctx, coverage.Reporter{
-				Address: addr,
-				Role:    state.Role,
-				Name:    state.Name,
+				Address:     addr,
+				Role:        state.Role,
+				Name:        state.Name,
+				DisplayName: state.Name,
 			})
 			if err != nil {
 				errs = append(errs, err)

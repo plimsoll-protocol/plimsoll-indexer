@@ -151,8 +151,8 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 	if len(want) == 0 {
 		t.Fatal("fresh database has no schema")
 	}
-	if got := appliedVersions(t, fresh); len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3 {
-		t.Fatalf("fresh database recorded %v, want [1 2 3]", got)
+	if got := appliedVersions(t, fresh); len(got) != 4 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 {
+		t.Fatalf("fresh database recorded %v, want [1 2 3 4]", got)
 	}
 
 	for name, schema := range map[string]string{
@@ -165,6 +165,8 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 			execSQL(t, url, `INSERT INTO assets (sac, code, issuer, listed_ledger, listed_at, event_id)
 				VALUES ('CSAC', 'PUSD', 'GISS', 7, now(), 'ev-1')`)
 			execSQL(t, url, `INSERT INTO breakdowns (hash, sac, body) VALUES ('h1', 'CSAC', '{"total":"5"}')`)
+			execSQL(t, url, `INSERT INTO reporters (address, role, name, active, updated_ledger, updated_at)
+				VALUES ('GREPORTER', 1, 'Acme', true, 7, now())`)
 
 			s, err := Open(context.Background(), url)
 			if err != nil {
@@ -175,8 +177,8 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 			if d := schemaDiff(want, schemaOf(t, url)); len(d) > 0 {
 				t.Fatalf("schema differs from a fresh database:\n%s", strings.Join(d, "\n"))
 			}
-			if got := appliedVersions(t, url); len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3 {
-				t.Fatalf("recorded %v, want [1 2 3]", got)
+			if got := appliedVersions(t, url); len(got) != 4 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 {
+				t.Fatalf("recorded %v, want [1 2 3 4]", got)
 			}
 			a, err := s.GetAsset(context.Background(), "CSAC")
 			if err != nil || a.Code != "PUSD" {
@@ -184,6 +186,10 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 			}
 			if body, err := s.Breakdown(context.Background(), "h1"); err != nil || string(body) != `{"total":"5"}` {
 				t.Fatalf("existing breakdown after migration: %q, %v", body, err)
+			}
+			reporters, err := s.Reporters(context.Background())
+			if err != nil || len(reporters) != 1 || reporters[0].DisplayName != "Acme" {
+				t.Fatalf("existing reporter after migration: %+v, %v", reporters, err)
 			}
 		})
 	}
@@ -197,8 +203,8 @@ func TestReopeningAppliesNothingTwice(t *testing.T) {
 		t.Fatal(err)
 	}
 	s2.Close()
-	if got := appliedVersions(t, url); len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3 {
-		t.Fatalf("recorded %v, want [1 2 3]", got)
+	if got := appliedVersions(t, url); len(got) != 4 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 {
+		t.Fatalf("recorded %v, want [1 2 3 4]", got)
 	}
 }
 
@@ -230,8 +236,8 @@ func TestConcurrentStartsDoNotRace(t *testing.T) {
 	for err := range errs {
 		t.Errorf("concurrent open: %v", err)
 	}
-	if got := appliedVersions(t, url); len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3 {
-		t.Fatalf("recorded %v, want [1 2 3]", got)
+	if got := appliedVersions(t, url); len(got) != 4 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 {
+		t.Fatalf("recorded %v, want [1 2 3 4]", got)
 	}
 }
 

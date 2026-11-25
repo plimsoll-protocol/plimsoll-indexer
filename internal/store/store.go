@@ -167,10 +167,10 @@ func applyEvent(ctx context.Context, tx pgx.Tx, ev any) error {
 			int64(e.Ledger), e.ClosedAt, e.TxHash)
 	case soroban.ReporterSet:
 		_, err = tx.Exec(ctx, `
-			INSERT INTO reporters (address, role, name, active, updated_ledger, updated_at)
-			VALUES ($1, $2, $3, true, $4, $5)
+			INSERT INTO reporters (address, role, name, display_name, active, updated_ledger, updated_at)
+			VALUES ($1, $2, $3, $3, true, $4, $5)
 			ON CONFLICT (address) DO UPDATE
-			SET role = EXCLUDED.role, name = EXCLUDED.name, active = true,
+			SET role = EXCLUDED.role, name = EXCLUDED.name, display_name = EXCLUDED.display_name, active = true,
 			    updated_ledger = EXCLUDED.updated_ledger, updated_at = EXCLUDED.updated_at`,
 			e.Reporter, int16(e.Role), e.Name, int64(e.Ledger), e.ClosedAt)
 	case soroban.ReporterRevoked:
@@ -303,7 +303,7 @@ func (s *Store) queryReports(ctx context.Context, sql string, args ...any) ([]co
 
 func (s *Store) Reporters(ctx context.Context) ([]coverage.Reporter, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT address, role, name, updated_at FROM reporters
+		SELECT address, role, name, display_name, website_uri, contact_hash, updated_at FROM reporters
 		WHERE active ORDER BY role, name`)
 	if err != nil {
 		return nil, err
@@ -313,10 +313,12 @@ func (s *Store) Reporters(ctx context.Context) ([]coverage.Reporter, error) {
 	for rows.Next() {
 		var r coverage.Reporter
 		var role int16
-		if err := rows.Scan(&r.Address, &role, &r.Name, &r.UpdatedAt); err != nil {
+		var websiteURI, contactHash *string
+		if err := rows.Scan(&r.Address, &role, &r.Name, &r.DisplayName, &websiteURI, &contactHash, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		r.Role = uint32(role)
+		r.WebsiteURI, r.ContactHash = websiteURI, contactHash
 		out = append(out, r)
 	}
 	return out, rows.Err()
@@ -566,16 +568,21 @@ func (s *Store) ReportReporterAddresses(ctx context.Context) ([]string, error) {
 // updated_ledger is set to 0 because the reconciler reads current state without
 // knowing which specific ledger set it.
 func (s *Store) SaveChainReporter(ctx context.Context, r coverage.Reporter) (bool, error) {
+	displayName := r.DisplayName
+	if displayName == "" {
+		displayName = r.Name
+	}
 	tag, err := s.pool.Exec(ctx, `
-		INSERT INTO reporters (address, role, name, active, updated_ledger, updated_at)
-		VALUES ($1, $2, $3, true, 0, now())
+		INSERT INTO reporters (address, role, name, display_name, active, updated_ledger, updated_at)
+		VALUES ($1, $2, $3, $4, true, 0, now())
 		ON CONFLICT (address) DO UPDATE
-		SET role = EXCLUDED.role, name = EXCLUDED.name, active = true,
+		SET role = EXCLUDED.role, name = EXCLUDED.name, display_name = EXCLUDED.display_name, active = true,
 		    updated_at = now()
 		WHERE reporters.active = false
 		   OR reporters.role <> EXCLUDED.role
-		   OR reporters.name <> EXCLUDED.name`,
-		r.Address, int16(r.Role), r.Name)
+		   OR reporters.name <> EXCLUDED.name
+		   OR reporters.display_name <> EXCLUDED.display_name`,
+		r.Address, int16(r.Role), r.Name, displayName)
 	if err != nil {
 		return false, fmt.Errorf("save chain reporter: %w", err)
 	}
