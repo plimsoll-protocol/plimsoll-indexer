@@ -63,6 +63,7 @@ The command fetches the asset's snapshot breakdown from the indexer, verifies th
 | `GET /v1/network` | Contract ids, RPC and Horizon URLs |
 | `GET /v1/assets?min_tier=1` | Every asset with latest supply, latest report per tier, coverage and stellar.toml data |
 | `GET /v1/assets/{sac}?min_tier=1` | One asset, same shape |
+| `HEAD /v1/assets/{sac}` | Status only, no response body: `200` if the asset is listed, `404` if not |
 | `GET /v1/assets/{sac}/supply?limit=100` | Supply snapshot history. Each row carries `source`: `event` for a figure decoded from a contract event, with the `tx_hash` that produced it, or `chain` for one recovered from contract state after an ingestion gap, where `tx_hash` is empty. |
 | `GET /v1/assets/{sac}/reports?limit=100` | Reserve report history |
 | `GET /v1/reporters` | Active registered reporters |

@@ -135,6 +135,29 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+    head:
+      summary: Check whether an asset is listed
+      operationId: headAsset
+      description: >-
+        Returns 200 when the asset is listed and 404 when it is not, so clients
+        can check existence without downloading the full asset document. The
+        response never has a body.
+      parameters:
+        - name: sac
+          in: path
+          required: true
+          description: Stellar Asset Contract (SAC) address
+          schema:
+            type: string
+            pattern: '^C[A-Z2-7]{55}$'
+            example: "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
+      responses:
+        '200':
+          description: Asset is listed. No response body.
+        '400':
+          description: sac is not a contract strkey. No response body.
+        '404':
+          description: Asset is not listed. No response body.
   /v1/assets/{sac}/supply:
     get:
       summary: Get historical supply snapshots for an asset

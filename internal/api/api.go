@@ -93,6 +93,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/network", s.network)
 	mux.HandleFunc("GET /v1/assets", s.listAssets)
 	mux.HandleFunc("GET /v1/assets/{sac}", s.getAsset)
+	mux.HandleFunc("HEAD /v1/assets/{sac}", s.headAsset)
 	mux.HandleFunc("GET /v1/assets/{sac}/supply", s.supplyHistory)
 	mux.HandleFunc("GET /v1/assets/{sac}/reports", s.reportHistory)
 	mux.HandleFunc("GET /v1/reporters", s.reporters)
@@ -278,6 +279,26 @@ func (s *Server) getAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, aj)
+}
+
+// headAsset answers whether an asset is listed without building the asset
+// document, so clients can check existence cheaply. It never writes a body of
+// its own: HEAD has no response body on the wire regardless of what a handler
+// writes, and this one only needs a status.
+func (s *Server) headAsset(w http.ResponseWriter, r *http.Request) {
+	sac, ok := parseSAC(w, r)
+	if !ok {
+		return
+	}
+	if _, err := s.Store.GetAsset(r.Context(), sac); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, codeAssetNotListed, "asset not listed")
+			return
+		}
+		s.fail(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) assemble(ctx context.Context, a coverage.Asset, minTier uint32) (assetJSON, error) {

@@ -86,7 +86,7 @@ func freePort() (uint32, error) {
 
 // newDatabase creates an empty database for one test, drops it when the test
 // ends, and returns its URL.
-func newDatabase(t *testing.T) string {
+func newDatabase(t testing.TB) string {
 	t.Helper()
 	if adminURL == "" {
 		t.Skip("embedded postgres is not running (go test -short)")
@@ -117,7 +117,7 @@ func newDatabase(t *testing.T) string {
 
 // openStore opens a Store on a fresh database, applying the schema the way
 // the indexer does on start.
-func openStore(t *testing.T) (*Store, string) {
+func openStore(t testing.TB) (*Store, string) {
 	t.Helper()
 	url := newDatabase(t)
 	s, err := Open(context.Background(), url)
