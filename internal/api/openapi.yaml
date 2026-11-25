@@ -266,6 +266,44 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  /v1/issuers/{issuer}/toml:
+    get:
+      summary: Get the latest cached stellar.toml snapshot for an issuer
+      operationId: getIssuerToml
+      parameters:
+        - name: issuer
+          in: path
+          required: true
+          description: Stellar issuer account public key
+          schema:
+            type: string
+            pattern: '^G[A-Z2-7]{55}$'
+            example: "GBIE3ANCRVCBWETUZXWYKRMP27LQVJHX757XXAQUT3LYHVTNFPPPXEY4"
+      responses:
+        '200':
+          description: Latest cached stellar.toml snapshot
+          headers:
+            Last-Modified:
+              description: HTTP-date timestamp when the snapshot was most recently fetched
+              schema:
+                type: string
+                example: "Tue, 24 Nov 2026 15:00:00 GMT"
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssuerTomlSnapshot'
+        '400':
+          description: issuer is not a Stellar account public key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Issuer has not been synced yet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/reporters:
     get:
       summary: List registered reporters and their roles
@@ -664,3 +702,28 @@ components:
         - reserve_balance
         - threshold_bps
         - updated_at
+    IssuerTomlSnapshot:
+      type: object
+      properties:
+        issuer:
+          type: string
+          example: "GBIE3ANCRVCBWETUZXWYKRMP27LQVJHX757XXAQUT3LYHVTNFPPPXEY4"
+        home_domain:
+          type: string
+          example: "example.money"
+        sha256_hash:
+          type: string
+          example: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        content:
+          type: string
+          example: "VERSION = \"2.7.0\"\n"
+        fetched_at:
+          type: string
+          format: date-time
+          example: "2026-11-24T15:00:00Z"
+      required:
+        - issuer
+        - home_domain
+        - sha256_hash
+        - content
+        - fetched_at

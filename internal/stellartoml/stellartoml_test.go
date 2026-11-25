@@ -158,3 +158,25 @@ func TestFetchSnapshotHashesExactResponseBytes(t *testing.T) {
 		t.Fatalf("hash %q, want SHA-256 of exact response bytes %q", gotHash, hex.EncodeToString(sum[:]))
 	}
 }
+
+func TestFetchRawSnapshotReturnsContentAndHash(t *testing.T) {
+	body := []byte(sample)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	f := NewFetcher()
+	f.URLFor = func(string) string { return srv.URL }
+
+	snap, err := f.FetchRawSnapshot(context.Background(), "example.money", "USDX", "GISSUER")
+	if err != nil || snap.Info.Currency == nil {
+		t.Fatalf("FetchRawSnapshot: snap=%+v err=%v", snap, err)
+	}
+	sum := sha256.Sum256(body)
+	if snap.Hash != hex.EncodeToString(sum[:]) {
+		t.Fatalf("hash %q, want %q", snap.Hash, hex.EncodeToString(sum[:]))
+	}
+	if snap.Content != string(body) {
+		t.Fatalf("content mismatch: got %q, want %q", snap.Content, string(body))
+	}
+}

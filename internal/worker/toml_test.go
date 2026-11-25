@@ -22,9 +22,10 @@ func (tomlTestHorizon) HomeDomain(context.Context, string) (string, error) {
 }
 
 type tomlTestStore struct {
-	assets  []coverage.Asset
-	hashes  map[string]string
-	changed int
+	assets   []coverage.Asset
+	hashes   map[string]string
+	contents map[string]string
+	changed  int
 }
 
 func (s *tomlTestStore) ListAssets(context.Context) ([]coverage.Asset, error) {
@@ -35,12 +36,14 @@ func (s *tomlTestStore) SaveToml(context.Context, string, []byte, string, time.T
 	return nil
 }
 
-func (s *tomlTestStore) SaveIssuerTomlSnapshot(_ context.Context, issuer, _, hash string, _ time.Time) (string, bool, error) {
+func (s *tomlTestStore) SaveIssuerTomlSnapshotWithContent(_ context.Context, issuer, _, hash, content string, _ time.Time) (string, bool, error) {
 	old := s.hashes[issuer]
 	if old == hash {
+		s.contents[issuer] = content
 		return old, false, nil
 	}
 	s.hashes[issuer] = hash
+	s.contents[issuer] = content
 	s.changed++
 	return old, old != "", nil
 }
@@ -65,8 +68,9 @@ func TestTomlSyncDetectsAndDeliversContentChange(t *testing.T) {
 	fetcher.URLFor = func(string) string { return server.URL }
 
 	db := &tomlTestStore{
-		assets: []coverage.Asset{{SAC: "CSAC", Code: "PUSD", Issuer: "GISSUER"}},
-		hashes: make(map[string]string),
+		assets:   []coverage.Asset{{SAC: "CSAC", Code: "PUSD", Issuer: "GISSUER"}},
+		hashes:   make(map[string]string),
+		contents: make(map[string]string),
 	}
 	notifier := &tomlTestNotifier{}
 	syncer := &TomlSync{
@@ -101,5 +105,8 @@ func TestTomlSyncDetectsAndDeliversContentChange(t *testing.T) {
 	}
 	if db.changed != 2 {
 		t.Fatalf("stored %d changed snapshots, want initial and changed snapshots", db.changed)
+	}
+	if db.contents["GISSUER"] != string(document) {
+		t.Fatalf("stored content = %q, want %q", db.contents["GISSUER"], string(document))
 	}
 }

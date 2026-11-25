@@ -176,3 +176,48 @@ func TestVaultEndpointIntegration(t *testing.T) {
 		t.Fatalf("unexpected vault integration response: %+v", got)
 	}
 }
+
+func TestIssuerTomlEndpointIntegration(t *testing.T) {
+	db := openIntegrationStore(t)
+	ctx := context.Background()
+
+	const issuerAddr = "GBIE3ANCRVCBWETUZXWYKRMP27LQVJHX757XXAQUT3LYHVTNFPPPXEY4"
+	srv := httptest.NewServer((&Server{
+		Store: db,
+		CORS:  []string{"*"},
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:   func() time.Time { return now },
+	}).Handler())
+	defer srv.Close()
+
+	// Unsynced issuer returns 404.
+	get(t, srv, "/v1/issuers/"+issuerAddr+"/toml", http.StatusNotFound)
+
+	fetchedAt := time.Date(2026, 11, 25, 11, 30, 0, 0, time.UTC)
+	const tomlBody = "[DOCUMENTATION]\nORG_NAME = \"Plimsoll\"\n"
+	hash := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	if _, _, err := db.SaveIssuerTomlSnapshotWithContent(ctx, issuerAddr, "plimsoll.example", hash, tomlBody, fetchedAt); err != nil {
+		t.Fatalf("save issuer toml snapshot: %v", err)
+	}
+
+	resp, err := http.Get(srv.URL + "/v1/issuers/" + issuerAddr + "/toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	lastMod, err := http.ParseTime(resp.Header.Get("Last-Modified"))
+	if err != nil || !lastMod.Equal(fetchedAt) {
+		t.Fatalf("Last-Modified = %q (%v), want %v", resp.Header.Get("Last-Modified"), err, fetchedAt)
+	}
+	var got coverage.IssuerTomlSnapshot
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Issuer != issuerAddr || got.HomeDomain != "plimsoll.example" ||
+		got.SHA256Hash != hash || got.Content != tomlBody || !got.FetchedAt.Equal(fetchedAt) {
+		t.Fatalf("unexpected issuer toml integration response: %+v", got)
+	}
+}

@@ -112,6 +112,15 @@ type Vault struct {
 	UpdatedAt      time.Time `json:"updated_at"`
 }
 
+// IssuerTomlSnapshot is the latest cached stellar.toml snapshot for an issuer.
+type IssuerTomlSnapshot struct {
+	Issuer     string    `json:"issuer"`
+	HomeDomain string    `json:"home_domain"`
+	SHA256Hash string    `json:"sha256_hash"`
+	Content    string    `json:"content"`
+	FetchedAt  time.Time `json:"fetched_at"`
+}
+
 // Result mirrors the contract's Coverage struct.
 type Result struct {
 	Bps            uint32

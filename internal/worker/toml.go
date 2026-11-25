@@ -16,13 +16,13 @@ type tomlHorizon interface {
 }
 
 type tomlFetcher interface {
-	FetchSnapshot(context.Context, string, string, string) (stellartoml.Info, string, error)
+	FetchRawSnapshot(context.Context, string, string, string) (stellartoml.Snapshot, error)
 }
 
 type tomlStore interface {
 	ListAssets(context.Context) ([]coverage.Asset, error)
 	SaveToml(context.Context, string, []byte, string, time.Time) error
-	SaveIssuerTomlSnapshot(context.Context, string, string, string, time.Time) (string, bool, error)
+	SaveIssuerTomlSnapshotWithContent(context.Context, string, string, string, string, time.Time) (string, bool, error)
 }
 
 type tomlChangeNotifier interface {
@@ -51,9 +51,10 @@ func (t *TomlSync) Run(ctx context.Context) error {
 		if a.TomlCheckedAt != nil && now.Sub(*a.TomlCheckedAt) < t.MaxAge {
 			continue
 		}
-		info, hash, lookupErr := t.lookup(ctx, a.Code, a.Issuer)
-		if hash != "" {
-			oldHash, changed, err := t.Store.SaveIssuerTomlSnapshot(ctx, a.Issuer, info.HomeDomain, hash, now)
+		snap, lookupErr := t.lookup(ctx, a.Code, a.Issuer)
+		info := snap.Info
+		if snap.Hash != "" {
+			oldHash, changed, err := t.Store.SaveIssuerTomlSnapshotWithContent(ctx, a.Issuer, info.HomeDomain, snap.Hash, snap.Content, now)
 			if err != nil {
 				return fmt.Errorf("save TOML hash for issuer %s: %w", a.Issuer, err)
 			}
@@ -62,14 +63,14 @@ func (t *TomlSync) Run(ctx context.Context) error {
 					"issuer", a.Issuer,
 					"home_domain", info.HomeDomain,
 					"old_hash", oldHash,
-					"new_hash", hash)
+					"new_hash", snap.Hash)
 				if t.Webhooks != nil {
-					if err := t.Webhooks.TOMLChanged(ctx, a.Issuer, info.HomeDomain, oldHash, hash); err != nil {
+					if err := t.Webhooks.TOMLChanged(ctx, a.Issuer, info.HomeDomain, oldHash, snap.Hash); err != nil {
 						t.Log.Error("issuer stellar.toml change webhook delivery failed",
 							"issuer", a.Issuer,
 							"home_domain", info.HomeDomain,
 							"old_hash", oldHash,
-							"new_hash", hash,
+							"new_hash", snap.Hash,
 							"err", err)
 					}
 				}
@@ -94,10 +95,10 @@ func (t *TomlSync) Run(ctx context.Context) error {
 	return nil
 }
 
-func (t *TomlSync) lookup(ctx context.Context, code, issuer string) (stellartoml.Info, string, error) {
+func (t *TomlSync) lookup(ctx context.Context, code, issuer string) (stellartoml.Snapshot, error) {
 	domain, err := t.Horizon.HomeDomain(ctx, issuer)
 	if err != nil {
-		return stellartoml.Info{}, "", err
+		return stellartoml.Snapshot{}, err
 	}
-	return t.Fetcher.FetchSnapshot(ctx, domain, code, issuer)
+	return t.Fetcher.FetchRawSnapshot(ctx, domain, code, issuer)
 }

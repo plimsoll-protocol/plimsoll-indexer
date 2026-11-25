@@ -371,3 +371,40 @@ func TestVaultPersistence(t *testing.T) {
 		t.Fatalf("updated vault = %+v, want %+v", got, want)
 	}
 }
+
+func TestIssuerTomlSnapshotContentPersistence(t *testing.T) {
+	s, _ := openStore(t)
+	ctx := context.Background()
+
+	if _, err := s.LatestIssuerToml(ctx, "GISSUER"); err != ErrNotFound {
+		t.Fatalf("missing issuer toml err = %v, want ErrNotFound", err)
+	}
+
+	at := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+	if _, _, err := s.SaveIssuerTomlSnapshotWithContent(ctx, "GISSUER", "issuer.example", "hash-one", "v1", at); err != nil {
+		t.Fatal(err)
+	}
+	refreshedAt := at.Add(30 * time.Minute)
+	if _, changed, err := s.SaveIssuerTomlSnapshotWithContent(ctx, "GISSUER", "issuer.example", "hash-one", "v1", refreshedAt); err != nil || changed {
+		t.Fatalf("unchanged snapshot: changed=%v err=%v", changed, err)
+	}
+	got, err := s.LatestIssuerToml(ctx, "GISSUER")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Content != "v1" || got.SHA256Hash != "hash-one" || !got.FetchedAt.Equal(refreshedAt) {
+		t.Fatalf("refreshed snapshot = %+v, want v1 at %v", got, refreshedAt)
+	}
+
+	changedAt := at.Add(time.Hour)
+	if _, changed, err := s.SaveIssuerTomlSnapshotWithContent(ctx, "GISSUER", "issuer.example", "hash-two", "v2", changedAt); err != nil || !changed {
+		t.Fatalf("changed snapshot: changed=%v err=%v", changed, err)
+	}
+	got, err = s.LatestIssuerToml(ctx, "GISSUER")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Content != "v2" || got.SHA256Hash != "hash-two" || !got.FetchedAt.Equal(changedAt) {
+		t.Fatalf("changed snapshot = %+v, want v2 at %v", got, changedAt)
+	}
+}
