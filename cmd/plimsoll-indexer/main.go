@@ -6,11 +6,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -36,20 +36,28 @@ func main() {
 	}
 
 	cfg, err := config.Load()
-	log := newLogger(cfg.LogLevel)
+	loggers := newComponentLoggers(os.Stdout, config.LogLevels{
+		Default: cfg.LogLevel,
+		API:     cfg.LogLevelAPI,
+		Worker:  cfg.LogLevelWorker,
+		Ingest:  cfg.LogLevelIngest,
+	})
 	if err != nil {
-		log.Error("invalid configuration", "err", err)
+		loggers.base.Error("invalid configuration", "err", err)
 		os.Exit(1)
 	}
-	if err := run(cfg, log); err != nil {
-		log.Error("indexer stopped", "err", err)
+	if err := run(cfg, loggers); err != nil {
+		loggers.base.Error("indexer stopped", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(cfg config.Config, log *slog.Logger) error {
+func run(cfg config.Config, loggers *componentLoggers) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	stopReload := watchLogLevelReload(ctx, loggers, config.LoadLogLevels)
+	defer stopReload()
 
 	db, err := store.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -71,47 +79,50 @@ func run(cfg config.Config, log *slog.Logger) error {
 		webhookDispatcher = webhook.NewDispatcher(db, webhookCodec)
 	}
 
+	ingestLog := loggers.ingest.With("job", "ingest")
 	ingester := &worker.Ingester{
 		RPC:         rpc,
 		Store:       db,
 		ContractIDs: []string{cfg.CoverageLedgerID, cfg.ReporterRegistryID},
 		StartLedger: cfg.StartLedger,
-		Log:         log.With("job", "ingest"),
+		Log:         ingestLog,
 	}
 	// Ingest once before the other jobs start, so they see the listed assets.
 	if err := ingester.Run(ctx); err != nil {
-		log.Error("initial ingest failed", "err", err)
+		ingestLog.Error("initial ingest failed", "err", err)
 	}
-	go every(ctx, cfg.IngestInterval, log.With("job", "ingest"), ingester.Run)
+	go every(ctx, cfg.IngestInterval, ingestLog, ingester.Run)
 
 	// Repairs what an ingestion gap lost by reading contract state back.
 	// Reading is simulation, so this needs no key and runs even on an instance
 	// that cannot sign.
+	reconcileLog := loggers.worker.With("job", "reconcile")
 	reconciler := &worker.Reconciler{
 		Invoker:  &soroban.Reader{RPC: rpc},
 		Store:    db,
 		LedgerID: cfg.CoverageLedgerID,
-		Log:      log.With("job", "reconcile"),
+		Log:      reconcileLog,
 	}
 	if err := reconciler.Run(ctx); err != nil {
-		log.Error("initial reconcile failed", "err", err)
+		reconcileLog.Error("initial reconcile failed", "err", err)
 	}
-	go every(ctx, cfg.ReconcileInterval, log.With("job", "reconcile"), reconciler.Run)
+	go every(ctx, cfg.ReconcileInterval, reconcileLog, reconciler.Run)
 
+	tomlLog := loggers.worker.With("job", "toml")
 	tomlSync := &worker.TomlSync{
 		Horizon:  hz,
 		Fetcher:  stellartoml.NewFetcher(),
 		Store:    db,
 		Webhooks: webhookDispatcher,
 		MaxAge:   cfg.TomlInterval,
-		Log:      log.With("job", "toml"),
+		Log:      tomlLog,
 	}
 	// Checks every minute; each asset is refreshed once per TOML_INTERVAL.
-	go every(ctx, time.Minute, log.With("job", "toml"), tomlSync.Run)
+	go every(ctx, time.Minute, tomlLog, tomlSync.Run)
 
 	if cfg.KeepAwakeURL != "" {
 		keepAwake := worker.NewKeepAwake(cfg.KeepAwakeURL)
-		kaLog := log.With("job", "keepawake")
+		kaLog := loggers.worker.With("job", "keepawake")
 		kaLog.Info("keep-awake enabled", "url", cfg.KeepAwakeURL, "interval", cfg.KeepAwakeInterval)
 		go func() {
 			// Wait one interval first: the HTTP server is not listening yet.
@@ -134,6 +145,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 			Signer:     signer,
 			Passphrase: cfg.NetworkPassphrase,
 		}
+		posterLog := loggers.worker.With("job", "poster")
 		poster := &worker.Poster{
 			Horizon:     hz,
 			RPC:         rpc,
@@ -141,22 +153,22 @@ func run(cfg config.Config, log *slog.Logger) error {
 			Store:       db,
 			LedgerID:    cfg.CoverageLedgerID,
 			RepostAfter: cfg.RepostAfter,
-			Log:         log.With("job", "poster"),
+			Log:         posterLog,
 			Now:         time.Now,
 		}
 		// Left nil when no second Horizon is configured: comparing hz against
 		// itself would always agree and prove nothing.
 		if cfg.HorizonCheckURL != "" {
 			poster.HorizonCheck = horizon.NewClient(cfg.HorizonCheckURL)
-			log.Info("supply cross-check enabled", "check_horizon", cfg.HorizonCheckURL)
+			posterLog.Info("supply cross-check enabled", "check_horizon", cfg.HorizonCheckURL)
 		} else {
-			log.Info("supply cross-check disabled (HORIZON_CHECK_URL not set)")
+			posterLog.Info("supply cross-check disabled (HORIZON_CHECK_URL not set)")
 		}
-		log.Info("supply posting enabled", "poster", signer.Address())
-		go every(ctx, cfg.PostInterval, log.With("job", "poster"), poster.Run)
+		posterLog.Info("supply posting enabled", "poster", signer.Address())
+		go every(ctx, cfg.PostInterval, posterLog, poster.Run)
 
 	} else {
-		log.Info("supply posting disabled (SUPPLY_POSTER_SECRET not set)")
+		loggers.worker.Info("supply posting disabled (SUPPLY_POSTER_SECRET not set)")
 	}
 
 	srv := &http.Server{
@@ -174,7 +186,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 				ReporterRegistryID: cfg.ReporterRegistryID,
 			},
 			CORS: cfg.CORSOrigins,
-			Log:  log.With("component", "api"),
+			Log:  loggers.api.With("component", "api"),
 			Now:  time.Now,
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
@@ -185,7 +197,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
-	log.Info("listening", "addr", srv.Addr)
+	loggers.api.Info("listening", "addr", srv.Addr)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -236,17 +248,66 @@ func runHealthcheck() int {
 	return 1
 }
 
-func newLogger(level string) *slog.Logger {
-	var l slog.Level
-	switch strings.ToLower(level) {
-	case "debug":
-		l = slog.LevelDebug
-	case "warn":
-		l = slog.LevelWarn
-	case "error":
-		l = slog.LevelError
-	default:
-		l = slog.LevelInfo
+type componentLoggers struct {
+	base        *slog.Logger
+	api         *slog.Logger
+	worker      *slog.Logger
+	ingest      *slog.Logger
+	baseLevel   *slog.LevelVar
+	apiLevel    *slog.LevelVar
+	workerLevel *slog.LevelVar
+	ingestLevel *slog.LevelVar
+}
+
+func newComponentLoggers(out io.Writer, levels config.LogLevels) *componentLoggers {
+	c := &componentLoggers{
+		baseLevel:   new(slog.LevelVar),
+		apiLevel:    new(slog.LevelVar),
+		workerLevel: new(slog.LevelVar),
+		ingestLevel: new(slog.LevelVar),
 	}
-	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: l}))
+	c.base = slog.New(slog.NewJSONHandler(out, &slog.HandlerOptions{Level: c.baseLevel}))
+	c.api = slog.New(slog.NewJSONHandler(out, &slog.HandlerOptions{Level: c.apiLevel}))
+	c.worker = slog.New(slog.NewJSONHandler(out, &slog.HandlerOptions{Level: c.workerLevel}))
+	c.ingest = slog.New(slog.NewJSONHandler(out, &slog.HandlerOptions{Level: c.ingestLevel}))
+	c.apply(levels)
+	return c
+}
+
+func (c *componentLoggers) apply(levels config.LogLevels) {
+	c.baseLevel.Set(config.ParseLogLevel(levels.Default))
+	c.apiLevel.Set(config.ParseLogLevel(levels.API))
+	c.workerLevel.Set(config.ParseLogLevel(levels.Worker))
+	c.ingestLevel.Set(config.ParseLogLevel(levels.Ingest))
+}
+
+func watchLogLevelReload(ctx context.Context, loggers *componentLoggers, reload func() config.LogLevels) func() {
+	sighup := make(chan os.Signal, 1)
+	signal.Notify(sighup, syscall.SIGHUP)
+	quit := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-quit:
+				return
+			case <-sighup:
+				levels := reload()
+				loggers.apply(levels)
+				loggers.base.Info("reloaded log levels",
+					"default", levels.Default,
+					"api", levels.API,
+					"worker", levels.Worker,
+					"ingest", levels.Ingest)
+			}
+		}
+	}()
+	return func() {
+		signal.Stop(sighup)
+		close(quit)
+		<-done
+	}
 }
