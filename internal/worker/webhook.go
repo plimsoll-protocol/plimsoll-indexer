@@ -30,19 +30,19 @@ const (
 
 // WebhookStore is the storage surface the notifier needs.
 type WebhookStore interface {
-	ListWebhooks(ctx context.Context) ([]coverage.Webhook, error)
+	ListCoverageWebhooks(ctx context.Context) ([]coverage.Webhook, error)
 	LatestSupply(ctx context.Context, sac string) (*coverage.Supply, error)
 	LatestReports(ctx context.Context, sac string) (map[uint32]coverage.Report, error)
-	SetWebhookAlerted(ctx context.Context, id int64, alerted bool) error
-	EnqueueWebhookDelivery(ctx context.Context, webhookID int64, payload []byte) error
-	DueWebhookDeliveries(ctx context.Context, limit, maxAttempts int) ([]coverage.WebhookDelivery, error)
-	RecordWebhookAttempt(ctx context.Context, id int64, status int, errMsg string, delivered bool, nextAt time.Time) error
+	SetCoverageWebhookAlerted(ctx context.Context, id int64, alerted bool) error
+	EnqueueCoverageWebhookDelivery(ctx context.Context, webhookID int64, payload []byte) error
+	DueCoverageWebhookDeliveries(ctx context.Context, limit, maxAttempts int) ([]coverage.WebhookDelivery, error)
+	RecordCoverageWebhookAttempt(ctx context.Context, id int64, status int, errMsg string, delivered bool, nextAt time.Time) error
 }
 
 // WebhookNotifier raises one alert when an asset's coverage falls below a
 // webhook's min_bps, and re-arms once coverage is back at or above it.
 //
-// Alerts are queued in webhook_deliveries and sent as JSON POSTs signed with
+// Alerts are queued in coverage_webhook_deliveries and sent as JSON POSTs signed with
 // HMAC-SHA256 under Secret. A delivery is retried with exponential backoff
 // until it succeeds or has been attempted webhookMaxAttempts times.
 type WebhookNotifier struct {
@@ -64,7 +64,7 @@ func (n *WebhookNotifier) Run(ctx context.Context) error {
 }
 
 func (n *WebhookNotifier) evaluate(ctx context.Context) error {
-	hooks, err := n.Store.ListWebhooks(ctx)
+	hooks, err := n.Store.ListCoverageWebhooks(ctx)
 	if err != nil {
 		return fmt.Errorf("list webhooks: %w", err)
 	}
@@ -85,7 +85,7 @@ func (n *WebhookNotifier) evaluate(ctx context.Context) error {
 		cov := coverage.Compute(supply, reports, h.MinTier)
 		if cov == nil || cov.Bps >= h.MinBps {
 			if h.Alerted {
-				if err := n.Store.SetWebhookAlerted(ctx, h.ID, false); err != nil {
+				if err := n.Store.SetCoverageWebhookAlerted(ctx, h.ID, false); err != nil {
 					errs = append(errs, fmt.Errorf("re-arm webhook %d: %w", h.ID, err))
 				}
 			}
@@ -99,11 +99,11 @@ func (n *WebhookNotifier) evaluate(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("webhook %d payload: %w", h.ID, err))
 			continue
 		}
-		if err := n.Store.EnqueueWebhookDelivery(ctx, h.ID, payload); err != nil {
+		if err := n.Store.EnqueueCoverageWebhookDelivery(ctx, h.ID, payload); err != nil {
 			errs = append(errs, fmt.Errorf("queue webhook %d: %w", h.ID, err))
 			continue
 		}
-		if err := n.Store.SetWebhookAlerted(ctx, h.ID, true); err != nil {
+		if err := n.Store.SetCoverageWebhookAlerted(ctx, h.ID, true); err != nil {
 			errs = append(errs, fmt.Errorf("mark webhook %d alerted: %w", h.ID, err))
 			continue
 		}
@@ -114,7 +114,7 @@ func (n *WebhookNotifier) evaluate(ctx context.Context) error {
 }
 
 func (n *WebhookNotifier) deliver(ctx context.Context) error {
-	due, err := n.Store.DueWebhookDeliveries(ctx, webhookBatchSize, webhookMaxAttempts)
+	due, err := n.Store.DueCoverageWebhookDeliveries(ctx, webhookBatchSize, webhookMaxAttempts)
 	if err != nil {
 		return fmt.Errorf("list due webhook deliveries: %w", err)
 	}
@@ -122,7 +122,7 @@ func (n *WebhookNotifier) deliver(ctx context.Context) error {
 	for _, d := range due {
 		status, errMsg, ok := n.post(ctx, d)
 		nextAt := n.now().Add(n.backoff(d.Attempts + 1))
-		if err := n.Store.RecordWebhookAttempt(ctx, d.ID, status, errMsg, ok, nextAt); err != nil {
+		if err := n.Store.RecordCoverageWebhookAttempt(ctx, d.ID, status, errMsg, ok, nextAt); err != nil {
 			errs = append(errs, fmt.Errorf("record webhook delivery %d: %w", d.ID, err))
 			continue
 		}

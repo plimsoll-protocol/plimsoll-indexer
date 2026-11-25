@@ -8,20 +8,44 @@ import (
 	"time"
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
-	"github.com/plimsoll-protocol/plimsoll-indexer/internal/horizon"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/stellartoml"
-	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
 )
+
+type tomlHorizon interface {
+	HomeDomain(context.Context, string) (string, error)
+}
+
+type tomlFetcher interface {
+	FetchSnapshot(context.Context, string, string, string) (stellartoml.Info, string, error)
+}
+
+type tomlStore interface {
+	ListAssets(context.Context) ([]coverage.Asset, error)
+	SaveToml(context.Context, string, []byte, string, time.Time) error
+	SaveIssuerTomlSnapshot(context.Context, string, string, string, time.Time) (string, bool, error)
+	RecordAttestation(context.Context, string, string, string, time.Time) error
+}
+
+type tomlChangeNotifier interface {
+	TOMLChanged(context.Context, string, string, string, string) error
+}
+
+// attestationFetcher downloads and hashes the document an issuer lists under
+// attestation_of_reserve.
+type attestationFetcher interface {
+	Fetch(context.Context, string) (string, error)
+}
 
 // TomlSync records what each issuer's stellar.toml says about its asset,
 // including the SEP-1 attestation_of_reserve link.
 type TomlSync struct {
-	Horizon *horizon.Client
-	Fetcher *stellartoml.Fetcher
-	Store   *store.Store
+	Horizon  tomlHorizon
+	Fetcher  tomlFetcher
+	Store    tomlStore
+	Webhooks tomlChangeNotifier
 	// Attestation fetches and hashes the issuer's attestation_of_reserve
 	// document. Nil disables the check.
-	Attestation *stellartoml.DocumentFetcher
+	Attestation attestationFetcher
 	// MaxAge is how long a lookup result is kept before it is refreshed.
 	MaxAge time.Duration
 	Log    *slog.Logger
@@ -37,7 +61,30 @@ func (t *TomlSync) Run(ctx context.Context) error {
 		if a.TomlCheckedAt != nil && now.Sub(*a.TomlCheckedAt) < t.MaxAge {
 			continue
 		}
-		info, lookupErr := t.lookup(ctx, a.Code, a.Issuer)
+		info, hash, lookupErr := t.lookup(ctx, a.Code, a.Issuer)
+		if hash != "" {
+			oldHash, changed, err := t.Store.SaveIssuerTomlSnapshot(ctx, a.Issuer, info.HomeDomain, hash, now)
+			if err != nil {
+				return fmt.Errorf("save TOML hash for issuer %s: %w", a.Issuer, err)
+			}
+			if changed {
+				t.Log.Info("issuer stellar.toml changed",
+					"issuer", a.Issuer,
+					"home_domain", info.HomeDomain,
+					"old_hash", oldHash,
+					"new_hash", hash)
+				if t.Webhooks != nil {
+					if err := t.Webhooks.TOMLChanged(ctx, a.Issuer, info.HomeDomain, oldHash, hash); err != nil {
+						t.Log.Error("issuer stellar.toml change webhook delivery failed",
+							"issuer", a.Issuer,
+							"home_domain", info.HomeDomain,
+							"old_hash", oldHash,
+							"new_hash", hash,
+							"err", err)
+					}
+				}
+			}
+		}
 		var body []byte
 		msg := ""
 		if lookupErr != nil {
@@ -77,10 +124,10 @@ func (t *TomlSync) checkAttestation(ctx context.Context, a coverage.Asset, info 
 	}
 }
 
-func (t *TomlSync) lookup(ctx context.Context, code, issuer string) (stellartoml.Info, error) {
+func (t *TomlSync) lookup(ctx context.Context, code, issuer string) (stellartoml.Info, string, error) {
 	domain, err := t.Horizon.HomeDomain(ctx, issuer)
 	if err != nil {
-		return stellartoml.Info{}, err
+		return stellartoml.Info{}, "", err
 	}
-	return t.Fetcher.Fetch(ctx, domain, code, issuer)
+	return t.Fetcher.FetchSnapshot(ctx, domain, code, issuer)
 }

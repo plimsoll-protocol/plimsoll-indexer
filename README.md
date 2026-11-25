@@ -20,8 +20,8 @@ One Go binary with five jobs and an HTTP API:
 | **Supply poster** | For every listed asset, sums Horizon's per-bucket holdings (trustlines in every auth state, claimable balances, liquidity pools, contract balances) and calls `post_supply` on the coverage ledger with the total and the SHA-256 of the breakdown. Posts when supply changes, or every `REPOST_AFTER` so freshness checks keep passing. Whether a post is due is read from the coverage ledger itself, so a stalled event ingest cannot make it repost on every tick. |
 | **Event ingester** | Reads `asset_listed`, `supply_posted`, `reserve_posted`, `reporter_set` and `reporter_revoked` from Soroban RPC into Postgres, keeping history past RPC's ~7-day retention. |
 | **State reconciler** | Reads each listed asset's `get_supply` and `get_report` back from the coverage ledger and stores anything newer than ingestion has. RPC serves only about seven days of events, so a longer ingestion gap cannot be repaired from events; the contracts always hold the latest figure. Recovered rows are marked `"source": "chain"` and carry no `tx_hash`. Reading is simulation, so it needs no key and runs even on an instance that cannot sign. |
-| **stellar.toml sync** | Resolves each issuer's `home_domain`, reads its SEP-1 `stellar.toml`, and stores the matching `[[CURRENCIES]]` entry, including `attestation_of_reserve`. The linked attestation document is downloaded under the same size, time and SSRF limits as reserve documents, hashed, and kept as version history; the asset response exposes `toml.attestation_hash` and `toml.attestation_changed_at`. |
-| **Coverage webhooks** | Posts a signed alert to each registered integrator URL when an asset's coverage falls below the registration's `min_bps`, selecting reports of at least `min_tier`. One alert per crossing, re-armed when coverage recovers; failed deliveries are retried with exponential backoff, at most 5 attempts in total. |
+| **stellar.toml sync** | Resolves each issuer's `home_domain`, reads its SEP-1 `stellar.toml`, and stores the matching `[[CURRENCIES]]` entry, including `attestation_of_reserve`. Successful fetches are SHA-256 tracked per issuer; changes are logged and can be delivered to registered webhooks. The linked attestation document is downloaded under the same size, time and SSRF limits as reserve documents, hashed, and kept as version history; the asset response exposes `toml.attestation_hash` and `toml.attestation_changed_at`. |
+| **Coverage alerts** | Posts a signed alert to each registered integrator URL when an asset's coverage falls below the registration's `min_bps`, selecting reports of at least `min_tier`. One alert per crossing, re-armed when coverage recovers; failed deliveries are retried with exponential backoff, at most 5 attempts in total. |
 
 **Live API:** https://plimsoll-indexer.onrender.com/v1/assets  
 **Docs:** https://plimsoll-protocol.gitbook.io/plimsoll-protocol-docs/
@@ -67,19 +67,23 @@ The command fetches the asset's snapshot breakdown from the indexer, verifies th
 | `GET /v1/assets/{sac}/reports?limit=100` | Reserve report history |
 | `GET /v1/reporters` | Active registered reporters |
 | `GET /v1/breakdowns/{hash}` | Exact bytes of a supply breakdown |
-| `POST /v1/webhooks` | Register a coverage threshold (admin token required) |
-| `DELETE /v1/webhooks/{id}` | Remove a registration and its delivery log (admin token required) |
+| `POST /v1/webhooks`, `GET /v1/webhooks`, `DELETE /v1/webhooks/{id}` | Manage authenticated issuer TOML change subscriptions |
+| `POST /v1/coverage-webhooks` | Register a coverage threshold (admin token required) |
+| `DELETE /v1/coverage-webhooks/{id}` | Remove a registration and its delivery log (admin token required) |
+
+Webhook registration and signature verification are covered in the
+[webhook guide](docs/webhooks.md).
 
 Coverage in the API uses the same selection and rounding rules as the contract
 (`internal/coverage`), so the API and `coverage()` on-chain agree.
 
-### Webhooks
+### Coverage alerts
 
-Set `WEBHOOK_ADMIN_TOKEN` and `WEBHOOK_SIGNING_SECRET` to enable webhooks.
-Register one with:
+Set `WEBHOOK_ADMIN_TOKEN` and `WEBHOOK_SIGNING_SECRET` to enable coverage
+threshold alerts. Register one with:
 
 ```bash
-curl -X POST localhost:8080/v1/webhooks \
+curl -X POST localhost:8080/v1/coverage-webhooks \
   -H "Authorization: Bearer $WEBHOOK_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://integrator.example/plimsoll","sac":"C...","min_bps":9500,"min_tier":2}'
@@ -97,7 +101,7 @@ Verify the signature over the exact bytes received before trusting the body.
 The payload carries `event` (`coverage_dropped`), `webhook_id`, `sac`,
 `min_bps`, `min_tier`, `bps`, `tier`, `supply`, `reserves`,
 `supply_posted_at`, `report_as_of` and `sent_at`; amounts are decimal strings
-and timestamps are UTC. Deliveries are logged in `webhook_deliveries` and
+and timestamps are UTC. Deliveries are logged in `coverage_webhook_deliveries` and
 retried with exponential backoff (30s, 1m, 2m, 4m) until they succeed or five
 attempts have been made.
 

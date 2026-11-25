@@ -253,6 +253,85 @@ paths:
                       $ref: '#/components/schemas/Reporter'
                 required:
                   - reporters
+  /v1/webhooks:
+    post:
+      summary: Register an issuer TOML change webhook
+      operationId: createWebhook
+      security:
+        - WebhookAdminAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url:
+                  type: string
+                  format: uri
+                  example: "https://example.com/plimsoll-hook"
+              required: [url]
+      responses:
+        '201':
+          description: Webhook created; secret is shown only in this response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedWebhook'
+        '400':
+          description: Invalid URL or request body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing or invalid administrator token
+        '503':
+          description: Webhook management is not configured
+    get:
+      summary: List registered webhooks without their secrets
+      operationId: listWebhooks
+      security:
+        - WebhookAdminAuth: []
+      responses:
+        '200':
+          description: Registered webhook destinations
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  webhooks:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Webhook'
+                required: [webhooks]
+        '401':
+          description: Missing or invalid administrator token
+        '503':
+          description: Webhook management is not configured
+  /v1/webhooks/{id}:
+    delete:
+      summary: Delete a registered webhook
+      operationId: deleteWebhook
+      security:
+        - WebhookAdminAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        '204':
+          description: Webhook deleted
+        '400':
+          description: Invalid webhook ID
+        '401':
+          description: Missing or invalid administrator token
+        '404':
+          description: Webhook not found
   /v1/breakdowns/{hash}:
     get:
       summary: Get raw supply breakdown by hash
@@ -284,7 +363,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-  /v1/webhooks:
+  /v1/coverage-webhooks:
     post:
       summary: Register a coverage-threshold webhook
       description: >-
@@ -296,22 +375,22 @@ paths:
         One alert is sent per crossing, re-armed when coverage recovers;
         failed deliveries are retried with exponential backoff, at most five
         attempts in total.
-      operationId: createWebhook
+      operationId: createCoverageWebhook
       security:
-        - adminToken: []
+        - WebhookAdminAuth: []
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/WebhookRequest'
+              $ref: '#/components/schemas/CoverageWebhookRequest'
       responses:
         '201':
           description: Webhook registered
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Webhook'
+                $ref: '#/components/schemas/CoverageWebhook'
         '400':
           description: Invalid body or thresholds
           content:
@@ -330,13 +409,13 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-  /v1/webhooks/{id}:
+  /v1/coverage-webhooks/{id}:
     delete:
       summary: Remove a webhook registration
       description: Requires `Authorization: Bearer <WEBHOOK_ADMIN_TOKEN>`.
-      operationId: deleteWebhook
+      operationId: deleteCoverageWebhook
       security:
-        - adminToken: []
+        - WebhookAdminAuth: []
       parameters:
         - name: id
           in: path
@@ -372,7 +451,7 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
 components:
   securitySchemes:
-    adminToken:
+    WebhookAdminAuth:
       type: http
       scheme: bearer
   schemas:
@@ -597,7 +676,7 @@ components:
         - address
         - name
         - updated_at
-    WebhookRequest:
+    CoverageWebhookRequest:
       type: object
       properties:
         url:
@@ -622,6 +701,27 @@ components:
         - min_bps
         - min_tier
     Webhook:
+      type: object
+      properties:
+        id:
+          type: integer
+        url:
+          type: string
+          format: uri
+        created_at:
+          type: string
+          format: date-time
+      required: [id, url, created_at]
+    CreatedWebhook:
+      allOf:
+        - $ref: '#/components/schemas/Webhook'
+        - type: object
+          properties:
+            secret:
+              type: string
+              description: Returned once; store it securely.
+          required: [secret]
+    CoverageWebhook:
       type: object
       properties:
         id:

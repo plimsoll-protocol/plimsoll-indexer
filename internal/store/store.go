@@ -25,6 +25,14 @@ type Store struct {
 	pool *pgxpool.Pool
 }
 
+type Webhook struct {
+	ID               int64
+	URL              string
+	SecretHash       string
+	SecretCiphertext []byte
+	CreatedAt        time.Time
+}
+
 // Open connects to the database and brings its schema up to date by applying
 // any pending migrations (see migrate.go).
 func Open(ctx context.Context, url string) (*Store, error) {
@@ -342,6 +350,79 @@ func (s *Store) SaveToml(ctx context.Context, sac string, info []byte, lookupErr
 		UPDATE assets SET toml = COALESCE($2::jsonb, toml), toml_error = NULLIF($3, ''), toml_checked_at = $4
 		WHERE sac = $1`, sac, infoArg, lookupErr, at)
 	return err
+}
+
+// SaveIssuerTomlSnapshot records a new content hash only when it differs from
+// the issuer's latest successful stellar.toml fetch.
+func (s *Store) SaveIssuerTomlSnapshot(ctx context.Context, issuer, domain, hash string, at time.Time) (string, bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", false, fmt.Errorf("begin issuer TOML snapshot: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, issuer); err != nil {
+		return "", false, fmt.Errorf("lock issuer TOML snapshot: %w", err)
+	}
+	var oldHash string
+	err = tx.QueryRow(ctx, `
+		SELECT sha256_hash FROM issuer_toml_snapshots
+		WHERE issuer = $1 ORDER BY id DESC LIMIT 1`, issuer).Scan(&oldHash)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return "", false, fmt.Errorf("read previous issuer TOML hash: %w", err)
+	}
+	changed := err == nil && oldHash != hash
+	if err == pgx.ErrNoRows || changed {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO issuer_toml_snapshots (issuer, home_domain, sha256_hash, checked_at)
+			VALUES ($1, $2, $3, $4)`, issuer, domain, hash, at); err != nil {
+			return "", false, fmt.Errorf("insert issuer TOML snapshot: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", false, fmt.Errorf("commit issuer TOML snapshot: %w", err)
+	}
+	return oldHash, changed, nil
+}
+
+func (s *Store) CreateWebhook(ctx context.Context, url, secretHash string, ciphertext []byte) (Webhook, error) {
+	var w Webhook
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO webhooks (url, secret_hash, secret_ciphertext)
+		VALUES ($1, $2, $3)
+		RETURNING id, url, secret_hash, secret_ciphertext, created_at`,
+		url, secretHash, ciphertext,
+	).Scan(&w.ID, &w.URL, &w.SecretHash, &w.SecretCiphertext, &w.CreatedAt)
+	if err != nil {
+		return Webhook{}, fmt.Errorf("create webhook: %w", err)
+	}
+	return w, nil
+}
+
+func (s *Store) ListWebhooks(ctx context.Context) ([]Webhook, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, url, secret_hash, secret_ciphertext, created_at
+		FROM webhooks ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("list webhooks: %w", err)
+	}
+	defer rows.Close()
+	var out []Webhook
+	for rows.Next() {
+		var w Webhook
+		if err := rows.Scan(&w.ID, &w.URL, &w.SecretHash, &w.SecretCiphertext, &w.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan webhook: %w", err)
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteWebhook(ctx context.Context, id int64) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM webhooks WHERE id = $1`, id)
+	if err != nil {
+		return false, fmt.Errorf("delete webhook: %w", err)
+	}
+	return tag.RowsAffected() != 0, nil
 }
 
 func mustBig(s string) *big.Int {

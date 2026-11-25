@@ -54,7 +54,7 @@ func (f *fakeWebhookStore) clock() time.Time {
 	return f.now
 }
 
-func (f *fakeWebhookStore) ListWebhooks(context.Context) ([]coverage.Webhook, error) {
+func (f *fakeWebhookStore) ListCoverageWebhooks(context.Context) ([]coverage.Webhook, error) {
 	return f.hooks, nil
 }
 
@@ -69,7 +69,7 @@ func (f *fakeWebhookStore) LatestReports(_ context.Context, sac string) (map[uin
 	return map[uint32]coverage.Report{}, nil
 }
 
-func (f *fakeWebhookStore) SetWebhookAlerted(_ context.Context, id int64, alerted bool) error {
+func (f *fakeWebhookStore) SetCoverageWebhookAlerted(_ context.Context, id int64, alerted bool) error {
 	for i := range f.hooks {
 		if f.hooks[i].ID == id {
 			f.hooks[i].Alerted = alerted
@@ -78,7 +78,7 @@ func (f *fakeWebhookStore) SetWebhookAlerted(_ context.Context, id int64, alerte
 	return nil
 }
 
-func (f *fakeWebhookStore) EnqueueWebhookDelivery(_ context.Context, webhookID int64, payload []byte) error {
+func (f *fakeWebhookStore) EnqueueCoverageWebhookDelivery(_ context.Context, webhookID int64, payload []byte) error {
 	f.nextID++
 	f.deliveries = append(f.deliveries, &fakeDelivery{
 		id: f.nextID, webhookID: webhookID, payload: payload, nextAt: f.clock(),
@@ -86,7 +86,7 @@ func (f *fakeWebhookStore) EnqueueWebhookDelivery(_ context.Context, webhookID i
 	return nil
 }
 
-func (f *fakeWebhookStore) DueWebhookDeliveries(_ context.Context, limit, maxAttempts int) ([]coverage.WebhookDelivery, error) {
+func (f *fakeWebhookStore) DueCoverageWebhookDeliveries(_ context.Context, limit, maxAttempts int) ([]coverage.WebhookDelivery, error) {
 	var out []coverage.WebhookDelivery
 	for _, d := range f.deliveries {
 		if d.delivered || d.attempts >= maxAttempts || d.nextAt.After(f.clock()) {
@@ -108,7 +108,7 @@ func (f *fakeWebhookStore) DueWebhookDeliveries(_ context.Context, limit, maxAtt
 	return out, nil
 }
 
-func (f *fakeWebhookStore) RecordWebhookAttempt(_ context.Context, id int64, status int, _ string, delivered bool, nextAt time.Time) error {
+func (f *fakeWebhookStore) RecordCoverageWebhookAttempt(_ context.Context, id int64, status int, _ string, delivered bool, nextAt time.Time) error {
 	for _, d := range f.deliveries {
 		if d.id == id {
 			d.attempts++

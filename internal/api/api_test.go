@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/webhook"
 )
 
 var now = time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
@@ -90,13 +92,13 @@ func (f *fake) Breakdown(_ context.Context, h string) ([]byte, error) {
 	}
 	return nil, store.ErrNotFound
 }
-func (f *fake) CreateWebhook(_ context.Context, w coverage.Webhook) (coverage.Webhook, error) {
+func (f *fake) CreateCoverageWebhook(_ context.Context, w coverage.Webhook) (coverage.Webhook, error) {
 	w.ID = int64(len(f.created) + 1)
 	w.CreatedAt = now
 	f.created = append(f.created, w)
 	return w, nil
 }
-func (f *fake) DeleteWebhook(_ context.Context, id int64) error {
+func (f *fake) DeleteCoverageWebhook(_ context.Context, id int64) error {
 	for _, w := range f.created {
 		if w.ID == id {
 			f.deleted = append(f.deleted, id)
@@ -120,7 +122,38 @@ func (f *fake) Progress(context.Context, string) (store.Progress, error) {
 	}, nil
 }
 
+type webhookManagerFake struct {
+	webhooks []store.Webhook
+}
+
+func (f *webhookManagerFake) CreateWebhook(_ context.Context, url, hash string, ciphertext []byte) (store.Webhook, error) {
+	item := store.Webhook{
+		ID: int64(len(f.webhooks) + 1), URL: url, SecretHash: hash,
+		SecretCiphertext: ciphertext, CreatedAt: now,
+	}
+	f.webhooks = append(f.webhooks, item)
+	return item, nil
+}
+
+func (f *webhookManagerFake) ListWebhooks(context.Context) ([]store.Webhook, error) {
+	return f.webhooks, nil
+}
+
+func (f *webhookManagerFake) DeleteWebhook(_ context.Context, id int64) (bool, error) {
+	for i, item := range f.webhooks {
+		if item.ID == id {
+			f.webhooks = append(f.webhooks[:i], f.webhooks[i+1:]...)
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func server() *httptest.Server {
+	return serverWithWebhooks(nil, nil, "")
+}
+
+func newFake() *fake {
 	f := &fake{
 		assets: []coverage.Asset{{SAC: sac, Code: "PUSD", Issuer: "GISS"}},
 		supply: map[string]*coverage.Supply{
@@ -132,18 +165,39 @@ func server() *httptest.Server {
 				AsOf: now.Add(-2 * time.Hour), Reporter: "GISS", DocURI: "https://x",
 			}},
 		},
-		bodies: map[string][]byte{"abc": []byte(`{"total":"1"}`)},
+		bodies: map[string][]byte{breakdownHash: []byte(`{"total":"1"}`)},
 		attestation: map[string]store.Attestation{
 			sac: {Hash: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", ChangedAt: &now},
 		},
 	}
+	return f
+}
+
+// coverageServer enables the coverage alert administration endpoints, which
+// need the admin token and the shared signing secret.
+func coverageServer(token string) *httptest.Server {
+	f := newFake()
 	s := &Server{
-		Store:      f,
-		CORS:       []string{"*"},
-		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Now:        func() time.Time { return now },
-		Webhooks:   f,
-		AdminToken: "test-admin",
+		Store:                f,
+		CoverageWebhooks:     f,
+		WebhookAdminToken:    token,
+		WebhookSigningSecret: "test-signing-secret",
+		Log:                  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:                  func() time.Time { return now },
+	}
+	return httptest.NewServer(s.Handler())
+}
+
+func serverWithWebhooks(manager WebhookManager, codec *webhook.SecretCodec, token string) *httptest.Server {
+	f := newFake()
+	s := &Server{
+		Store:             f,
+		WebhookStore:      manager,
+		WebhookCodec:      codec,
+		WebhookAdminToken: token,
+		CORS:              []string{"*"},
+		Log:               slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:               func() time.Time { return now },
 	}
 	return httptest.NewServer(s.Handler())
 }
@@ -326,18 +380,18 @@ func adminRequest(t *testing.T, srv *httptest.Server, method, path, token, body 
 }
 
 func TestWebhookAdminEndpoints(t *testing.T) {
-	srv := server()
+	srv := coverageServer("test-admin")
 	defer srv.Close()
 
 	valid := `{"url":"https://integrator.example/hook","sac":"CSAC","min_bps":9500,"min_tier":2}`
-	if got, _ := adminRequest(t, srv, http.MethodPost, "/v1/webhooks", "", valid); got != http.StatusUnauthorized {
+	if got, _ := adminRequest(t, srv, http.MethodPost, "/v1/coverage-webhooks", "", valid); got != http.StatusUnauthorized {
 		t.Fatalf("no token: status %d, want 401", got)
 	}
-	if got, _ := adminRequest(t, srv, http.MethodPost, "/v1/webhooks", "wrong", valid); got != http.StatusUnauthorized {
+	if got, _ := adminRequest(t, srv, http.MethodPost, "/v1/coverage-webhooks", "wrong", valid); got != http.StatusUnauthorized {
 		t.Fatalf("wrong token: status %d, want 401", got)
 	}
 
-	status, body := adminRequest(t, srv, http.MethodPost, "/v1/webhooks", "test-admin", valid)
+	status, body := adminRequest(t, srv, http.MethodPost, "/v1/coverage-webhooks", "test-admin", valid)
 	if status != http.StatusCreated {
 		t.Fatalf("create: status %d (%v), want 201", status, body)
 	}
@@ -356,18 +410,18 @@ func TestWebhookAdminEndpoints(t *testing.T) {
 		"bad tier":     `{"url":"https://integrator.example/hook","sac":"CSAC","min_bps":9500,"min_tier":4}`,
 		"not json":     `nope`,
 	} {
-		if got, _ := adminRequest(t, srv, http.MethodPost, "/v1/webhooks", "test-admin", payload); got != http.StatusBadRequest {
+		if got, _ := adminRequest(t, srv, http.MethodPost, "/v1/coverage-webhooks", "test-admin", payload); got != http.StatusBadRequest {
 			t.Errorf("%s: status %d, want 400", name, got)
 		}
 	}
 
-	if got, _ := adminRequest(t, srv, http.MethodDelete, "/v1/webhooks/1", "test-admin", ""); got != http.StatusNoContent {
+	if got, _ := adminRequest(t, srv, http.MethodDelete, "/v1/coverage-webhooks/1", "test-admin", ""); got != http.StatusNoContent {
 		t.Fatalf("delete: status %d, want 204", got)
 	}
-	if got, _ := adminRequest(t, srv, http.MethodDelete, "/v1/webhooks/99", "test-admin", ""); got != http.StatusNotFound {
+	if got, _ := adminRequest(t, srv, http.MethodDelete, "/v1/coverage-webhooks/99", "test-admin", ""); got != http.StatusNotFound {
 		t.Fatalf("delete unknown: status %d, want 404", got)
 	}
-	if got, _ := adminRequest(t, srv, http.MethodDelete, "/v1/webhooks/abc", "test-admin", ""); got != http.StatusBadRequest {
+	if got, _ := adminRequest(t, srv, http.MethodDelete, "/v1/coverage-webhooks/abc", "test-admin", ""); got != http.StatusBadRequest {
 		t.Fatalf("delete non-numeric: status %d, want 400", got)
 	}
 }
@@ -380,7 +434,7 @@ func TestWebhookAdminDisabled(t *testing.T) {
 	}
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
-	status, body := adminRequest(t, srv, http.MethodPost, "/v1/webhooks", "anything", `{}`)
+	status, body := adminRequest(t, srv, http.MethodPost, "/v1/coverage-webhooks", "anything", `{}`)
 	if status != http.StatusServiceUnavailable {
 		t.Fatalf("disabled administration: status %d (%v), want 503", status, body)
 	}
@@ -418,5 +472,75 @@ func TestOpenAPISpec(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "openapi: 3.1.0") {
 		t.Fatalf("expected openapi 3.1.0 spec, got: %s", string(body))
+	}
+}
+
+func TestWebhookSecretReturnedOnlyAtCreation(t *testing.T) {
+	manager := &webhookManagerFake{}
+	codec, err := webhook.NewSecretCodec(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := serverWithWebhooks(manager, codec, "admin-token")
+	defer srv.Close()
+
+	request := func(method, path, body string, authorized bool) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(method, srv.URL+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if authorized {
+			req.Header.Set("Authorization", "Bearer admin-token")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	unauthorized := request(http.MethodPost, "/v1/webhooks", `{"url":"https://receiver.example/hook"}`, false)
+	unauthorized.Body.Close()
+	if unauthorized.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized create status = %d, want 401", unauthorized.StatusCode)
+	}
+
+	created := request(http.MethodPost, "/v1/webhooks", `{"url":"https://receiver.example/hook"}`, true)
+	defer created.Body.Close()
+	if created.StatusCode != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201", created.StatusCode)
+	}
+	var response struct {
+		ID     int64  `json:"id"`
+		Secret string `json:"secret"`
+	}
+	if err := json.NewDecoder(created.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Secret == "" || len(manager.webhooks) != 1 {
+		t.Fatalf("creation response %q, stored webhooks %d", response.Secret, len(manager.webhooks))
+	}
+	stored := manager.webhooks[0]
+	if stored.SecretHash != webhook.SecretHash(response.Secret) {
+		t.Fatal("stored secret hash does not match the one-time returned secret")
+	}
+	decrypted, err := codec.Decrypt(stored.SecretCiphertext)
+	if err != nil || decrypted != response.Secret {
+		t.Fatalf("stored signing secret = %q, %v", decrypted, err)
+	}
+
+	list := request(http.MethodGet, "/v1/webhooks", "", true)
+	defer list.Body.Close()
+	listBody, err := io.ReadAll(list.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if list.StatusCode != http.StatusOK || strings.Contains(string(listBody), response.Secret) ||
+		strings.Contains(string(listBody), "secret_hash") || strings.Contains(string(listBody), "secret_ciphertext") {
+		t.Fatalf("list response disclosed secret or failed: status=%d body=%s", list.StatusCode, listBody)
 	}
 }

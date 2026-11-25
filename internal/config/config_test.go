@@ -24,12 +24,38 @@ func TestKeepAwakeURL(t *testing.T) {
 
 func setBase(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"NETWORK", "STELLAR_RPC_URL", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE"} {
+	for _, k := range []string{"NETWORK", "STELLAR_RPC_URL", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE", "WEBHOOK_ADMIN_TOKEN", "WEBHOOK_ENCRYPTION_KEY", "WEBHOOK_SIGNING_SECRET"} {
 		t.Setenv(k, "")
 	}
 	t.Setenv("DATABASE_URL", "postgres://x")
 	t.Setenv("COVERAGE_LEDGER_ID", "C1")
 	t.Setenv("REPORTER_REGISTRY_ID", "C2")
+}
+
+func TestWebhookConfigurationMustBeComplete(t *testing.T) {
+	setBase(t)
+	t.Setenv("WEBHOOK_ADMIN_TOKEN", "admin")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "neither WEBHOOK_ENCRYPTION_KEY nor WEBHOOK_SIGNING_SECRET") {
+		t.Fatalf("want an unusable admin token error, got %v", err)
+	}
+
+	setBase(t)
+	t.Setenv("WEBHOOK_ENCRYPTION_KEY", "not-base64")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "must be configured together") {
+		t.Fatalf("want paired webhook configuration error, got %v", err)
+	}
+
+	setBase(t)
+	t.Setenv("WEBHOOK_ADMIN_TOKEN", "admin")
+	t.Setenv("WEBHOOK_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if _, err := Load(); err != nil {
+		t.Fatalf("valid webhook configuration: %v", err)
+	}
+
+	t.Setenv("WEBHOOK_ENCRYPTION_KEY", "short")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "32-byte key") {
+		t.Fatalf("want invalid key error, got %v", err)
+	}
 }
 
 func TestNetworkPresets(t *testing.T) {
@@ -210,7 +236,7 @@ func TestWebhookConfig(t *testing.T) {
 	setBase(t)
 	t.Setenv("WEBHOOK_ADMIN_TOKEN", "token")
 	t.Setenv("WEBHOOK_SIGNING_SECRET", "")
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "WEBHOOK_SIGNING_SECRET must be set together") {
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "neither WEBHOOK_ENCRYPTION_KEY nor WEBHOOK_SIGNING_SECRET") {
 		t.Fatalf("want a half-configured webhook error, got %v", err)
 	}
 
@@ -228,6 +254,11 @@ func TestWebhookConfig(t *testing.T) {
 	}
 	if got.WebhookAdminToken != "token" || got.WebhookSigningSecret != "secret" {
 		t.Errorf("webhook config: %+v", got)
+	}
+	// A signing secret alone is a complete coverage-alert setup: it does not
+	// need the encryption key that TOML change subscriptions use.
+	if got.WebhookEncryptionKey != "" {
+		t.Errorf("WebhookEncryptionKey = %q, want empty", got.WebhookEncryptionKey)
 	}
 	if got.WebhookInterval.String() != "1m0s" {
 		t.Errorf("WebhookInterval = %v, want 1m0s", got.WebhookInterval)

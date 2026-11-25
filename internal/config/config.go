@@ -2,6 +2,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -57,21 +58,26 @@ type Config struct {
 	ReporterRegistryID string
 	StartLedger        uint32
 	PosterSecret       string
-	IngestInterval     time.Duration
-	PostInterval       time.Duration
+	// WebhookAdminToken protects webhook administration. It is shared by
+	// issuer TOML change subscriptions and coverage alerts.
+	WebhookAdminToken string
+	// WebhookEncryptionKey encrypts the per-subscription secrets of issuer
+	// TOML change webhooks at rest; WebhookSigningSecret keys the HMAC-SHA256
+	// signature on coverage alert deliveries. Each enables its own feature and
+	// needs WebhookAdminToken.
+	WebhookEncryptionKey string
+	WebhookSigningSecret string
+	WebhookInterval      time.Duration
+	IngestInterval       time.Duration
+	PostInterval         time.Duration
 	// ReconcileInterval is how often contract state is read back to repair
 	// what event ingestion missed. Each pass is a handful of simulations per
 	// asset, so it can be infrequent.
 	ReconcileInterval time.Duration
 	RepostAfter       time.Duration
 	TomlInterval      time.Duration
-	// WebhookAdminToken protects POST/DELETE /v1/webhooks; WebhookSigningSecret
-	// is the HMAC-SHA256 key for delivery payloads. Set both or neither.
-	WebhookAdminToken    string
-	WebhookSigningSecret string
-	WebhookInterval      time.Duration
-	CORSOrigins          []string
-	LogLevel             string
+	CORSOrigins       []string
+	LogLevel          string
 	// KeepAwakeURL is requested every KeepAwakeInterval so a host that sleeps
 	// idle services (Render's free tier) keeps this one, and its poster, up.
 	KeepAwakeURL      string
@@ -113,6 +119,7 @@ func Load() (Config, error) {
 		ReporterRegistryID:   os.Getenv("REPORTER_REGISTRY_ID"),
 		PosterSecret:         os.Getenv("SUPPLY_POSTER_SECRET"),
 		WebhookAdminToken:    os.Getenv("WEBHOOK_ADMIN_TOKEN"),
+		WebhookEncryptionKey: os.Getenv("WEBHOOK_ENCRYPTION_KEY"),
 		WebhookSigningSecret: os.Getenv("WEBHOOK_SIGNING_SECRET"),
 		LogLevel:             envOr("LOG_LEVEL", "info"),
 		KeepAwakeURL:         keepAwakeURL(os.Getenv("KEEP_AWAKE_URL"), os.Getenv("RENDER_EXTERNAL_URL")),
@@ -130,10 +137,22 @@ func Load() (Config, error) {
 	if c.ReporterRegistryID == "" {
 		errs = append(errs, errors.New("REPORTER_REGISTRY_ID is required"))
 	}
-	// Signing with an empty key is worthless and an admin token alone cannot
-	// deliver anything, so refuse a half-configured pair.
-	if (c.WebhookAdminToken == "") != (c.WebhookSigningSecret == "") {
-		errs = append(errs, errors.New("WEBHOOK_ADMIN_TOKEN and WEBHOOK_SIGNING_SECRET must be set together"))
+	// A key without the admin token could never be used, and a token with no
+	// key registers nothing, so refuse both half-configurations.
+	if c.WebhookEncryptionKey != "" && c.WebhookAdminToken == "" {
+		errs = append(errs, errors.New("WEBHOOK_ADMIN_TOKEN and WEBHOOK_ENCRYPTION_KEY must be configured together"))
+	}
+	if c.WebhookSigningSecret != "" && c.WebhookAdminToken == "" {
+		errs = append(errs, errors.New("WEBHOOK_ADMIN_TOKEN and WEBHOOK_SIGNING_SECRET must be configured together"))
+	}
+	if c.WebhookAdminToken != "" && c.WebhookEncryptionKey == "" && c.WebhookSigningSecret == "" {
+		errs = append(errs, errors.New("WEBHOOK_ADMIN_TOKEN is set but neither WEBHOOK_ENCRYPTION_KEY nor WEBHOOK_SIGNING_SECRET is configured"))
+	}
+	if c.WebhookEncryptionKey != "" {
+		key, err := base64.StdEncoding.DecodeString(c.WebhookEncryptionKey)
+		if err != nil || len(key) != 32 {
+			errs = append(errs, errors.New("WEBHOOK_ENCRYPTION_KEY must be base64-encoded 32-byte key"))
+		}
 	}
 
 	start, err := strconv.ParseUint(envOr("START_LEDGER", "0"), 10, 32)
