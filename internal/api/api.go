@@ -80,7 +80,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/webhooks", s.createWebhook)
 	mux.HandleFunc("GET /v1/webhooks", s.listWebhooks)
 	mux.HandleFunc("DELETE /v1/webhooks/{id}", s.deleteWebhook)
-	return s.cors(mux)
+	return s.compress(s.cors(mux))
+}
+
+func (s *Server) compress(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cw := &compressionWriter{
+			ResponseWriter: w,
+			encoding:       acceptedEncoding(strings.Join(r.Header.Values("Accept-Encoding"), ",")),
+			logger:         s.Log,
+			method:         r.Method,
+		}
+		next.ServeHTTP(cw, r)
+		if err := cw.finish(); err != nil && s.Log != nil {
+			s.Log.Error("write compressed API response", "err", err)
+		}
+	})
 }
 
 // ---- JSON shapes ----------------------------------------------------------
