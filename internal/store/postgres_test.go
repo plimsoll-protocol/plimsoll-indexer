@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
 )
 
@@ -324,5 +325,49 @@ func TestEventIDMigrationRepairsLegacyTables(t *testing.T) {
 	}
 	if constraints != 2 {
 		t.Fatalf("created %d event ID constraints, want 2", constraints)
+	}
+}
+
+func TestVaultPersistence(t *testing.T) {
+	s, _ := openStore(t)
+	ctx := context.Background()
+
+	if _, err := s.GetVault(ctx, "CSAC"); err != ErrNotFound {
+		t.Fatalf("missing vault err = %v, want ErrNotFound", err)
+	}
+
+	at := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+	want := coverage.Vault{
+		SAC:            "CSAC",
+		VaultAddress:   "CVAULT1",
+		ReserveBalance: big.NewInt(1_500_0000000),
+		ThresholdBps:   10000,
+		UpdatedAt:      at,
+	}
+	if err := s.SaveVault(ctx, want); err != nil {
+		t.Fatalf("save vault: %v", err)
+	}
+	got, err := s.GetVault(ctx, "CSAC")
+	if err != nil {
+		t.Fatalf("get vault: %v", err)
+	}
+	if got.SAC != want.SAC || got.VaultAddress != want.VaultAddress ||
+		got.ReserveBalance.Cmp(want.ReserveBalance) != 0 ||
+		got.ThresholdBps != want.ThresholdBps || !got.UpdatedAt.Equal(want.UpdatedAt) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+
+	want.ReserveBalance = big.NewInt(2_500_0000000)
+	want.ThresholdBps = 10500
+	want.UpdatedAt = at.Add(time.Hour)
+	if err := s.SaveVault(ctx, want); err != nil {
+		t.Fatalf("update vault: %v", err)
+	}
+	got, err = s.GetVault(ctx, "CSAC")
+	if err != nil {
+		t.Fatalf("get updated vault: %v", err)
+	}
+	if got.ReserveBalance.Cmp(want.ReserveBalance) != 0 || got.ThresholdBps != want.ThresholdBps {
+		t.Fatalf("updated vault = %+v, want %+v", got, want)
 	}
 }

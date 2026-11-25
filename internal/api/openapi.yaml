@@ -235,6 +235,37 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  /v1/assets/{sac}/vault:
+    get:
+      summary: Get indexed vault metadata for an asset
+      operationId: getAssetVault
+      parameters:
+        - name: sac
+          in: path
+          required: true
+          description: Stellar Asset Contract (SAC) address
+          schema:
+            type: string
+            pattern: '^C[A-Z2-7]{55}$'
+      responses:
+        '200':
+          description: Vault metadata for the asset
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Vault'
+        '400':
+          description: sac is not a contract strkey
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: No vault indexed for the asset
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/reporters:
     get:
       summary: List registered reporters and their roles
@@ -608,3 +639,28 @@ components:
           example: "asset not listed"
       required:
         - error
+    Vault:
+      type: object
+      properties:
+        sac:
+          type: string
+          example: "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
+        vault_address:
+          type: string
+          example: "CC3SUECAJSAC4PBV4QLUII7X5Y4WNVL5YGTBAQ4CHCAH6R3QLRYJUZHQ"
+        reserve_balance:
+          type: string
+          example: "10000000000"
+        threshold_bps:
+          type: integer
+          example: 10000
+        updated_at:
+          type: string
+          format: date-time
+          example: "2026-10-05T12:00:00Z"
+      required:
+        - sac
+        - vault_address
+        - reserve_balance
+        - threshold_bps
+        - updated_at

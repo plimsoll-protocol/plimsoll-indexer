@@ -628,3 +628,52 @@ func (s *Store) SaveDocCheck(ctx context.Context, eventID, result string) error 
 		eventID, result)
 	return err
 }
+
+// ---- vaults -----------------------------------------------------------------
+
+// GetVault returns the indexed vault metadata for sac, or ErrNotFound if no
+// vault has been indexed for that asset.
+func (s *Store) GetVault(ctx context.Context, sac string) (coverage.Vault, error) {
+	var v coverage.Vault
+	var balance string
+	var threshold int64
+	err := s.pool.QueryRow(ctx, `
+		SELECT sac, vault_address, reserve_balance::text, threshold_bps, updated_at
+		FROM vaults WHERE sac = $1`, sac,
+	).Scan(&v.SAC, &v.VaultAddress, &balance, &threshold, &v.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return v, ErrNotFound
+	}
+	if err != nil {
+		return v, fmt.Errorf("get vault: %w", err)
+	}
+	v.ReserveBalance = mustBig(balance)
+	v.ThresholdBps = uint32(threshold)
+	v.UpdatedAt = v.UpdatedAt.UTC()
+	return v, nil
+}
+
+// SaveVault inserts or updates indexed vault metadata for an asset.
+func (s *Store) SaveVault(ctx context.Context, v coverage.Vault) error {
+	balance := "0"
+	if v.ReserveBalance != nil {
+		balance = v.ReserveBalance.String()
+	}
+	updatedAt := v.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = time.Now().UTC()
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO vaults (sac, vault_address, reserve_balance, threshold_bps, updated_at)
+		VALUES ($1, $2, $3::numeric, $4, $5)
+		ON CONFLICT (sac) DO UPDATE
+		SET vault_address = EXCLUDED.vault_address,
+		    reserve_balance = EXCLUDED.reserve_balance,
+		    threshold_bps = EXCLUDED.threshold_bps,
+		    updated_at = EXCLUDED.updated_at`,
+		v.SAC, v.VaultAddress, balance, int64(v.ThresholdBps), updatedAt.UTC())
+	if err != nil {
+		return fmt.Errorf("save vault: %w", err)
+	}
+	return nil
+}

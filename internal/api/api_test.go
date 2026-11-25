@@ -44,6 +44,7 @@ type fake struct {
 	supply  map[string]*coverage.Supply
 	reports map[string]map[uint32]coverage.Report
 	bodies  map[string][]byte
+	vaults  map[string]coverage.Vault
 }
 
 func (f *fake) Ping(context.Context) error { return nil }
@@ -96,6 +97,12 @@ func (f *fake) Progress(context.Context, string) (store.Progress, error) {
 		EventLedger:   40,
 		EventAt:       now.Add(-90 * time.Second),
 	}, nil
+}
+func (f *fake) GetVault(_ context.Context, s string) (coverage.Vault, error) {
+	if v, ok := f.vaults[s]; ok {
+		return v, nil
+	}
+	return coverage.Vault{}, store.ErrNotFound
 }
 
 type webhookManagerFake struct {
@@ -393,5 +400,48 @@ func TestWebhookSecretReturnedOnlyAtCreation(t *testing.T) {
 	if list.StatusCode != http.StatusOK || strings.Contains(string(listBody), response.Secret) ||
 		strings.Contains(string(listBody), "secret_hash") || strings.Contains(string(listBody), "secret_ciphertext") {
 		t.Fatalf("list response disclosed secret or failed: status=%d body=%s", list.StatusCode, listBody)
+	}
+}
+
+func TestGetAssetVault(t *testing.T) {
+	const vaultAddr = "CC3SUECAJSAC4PBV4QLUII7X5Y4WNVL5YGTBAQ4CHCAH6R3QLRYJUZHQ"
+	f := &fake{
+		assets: []coverage.Asset{{SAC: sac, Code: "PUSD", Issuer: "GISS"}},
+		vaults: map[string]coverage.Vault{
+			sac: {
+				SAC:            sac,
+				VaultAddress:   vaultAddr,
+				ReserveBalance: big.NewInt(5_000_0000000),
+				ThresholdBps:   10000,
+				UpdatedAt:      now,
+			},
+		},
+	}
+	s := &Server{
+		Store: f,
+		CORS:  []string{"*"},
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:   func() time.Time { return now },
+	}
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	get(t, srv, "/v1/assets/not-a-sac/vault", http.StatusBadRequest)
+	get(t, srv, "/v1/assets/"+unlistedSAC(t)+"/vault", http.StatusNotFound)
+
+	body := get(t, srv, "/v1/assets/"+sac+"/vault", http.StatusOK)
+	if body["sac"] != sac || body["vault_address"] != vaultAddr ||
+		body["reserve_balance"] != "50000000000" || body["threshold_bps"].(float64) != 10000 {
+		t.Fatalf("unexpected vault response: %+v", body)
+	}
+
+	resp, err := http.Get(srv.URL + "/openapi.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(spec), "/v1/assets/{sac}/vault:") {
+		t.Fatal("openapi spec missing /v1/assets/{sac}/vault path")
 	}
 }

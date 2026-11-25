@@ -38,6 +38,7 @@ type Reader interface {
 	Reporters(ctx context.Context) ([]coverage.Reporter, error)
 	Breakdown(ctx context.Context, hash string) ([]byte, error)
 	Progress(ctx context.Context, name string) (store.Progress, error)
+	GetVault(ctx context.Context, sac string) (coverage.Vault, error)
 }
 
 // NetworkInfo is served at /v1/network so clients can discover contract ids.
@@ -75,6 +76,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/assets/{sac}", s.getAsset)
 	mux.HandleFunc("GET /v1/assets/{sac}/supply", s.supplyHistory)
 	mux.HandleFunc("GET /v1/assets/{sac}/reports", s.reportHistory)
+	mux.HandleFunc("GET /v1/assets/{sac}/vault", s.getAssetVault)
 	mux.HandleFunc("GET /v1/reporters", s.reporters)
 	mux.HandleFunc("GET /v1/breakdowns/{hash}", s.breakdown)
 	mux.HandleFunc("POST /v1/webhooks", s.createWebhook)
@@ -123,6 +125,11 @@ type assetJSON struct {
 type reporterJSON struct {
 	Role string `json:"role"`
 	coverage.Reporter
+}
+
+type vaultJSON struct {
+	ReserveBalance string `json:"reserve_balance"`
+	coverage.Vault
 }
 
 type webhookJSON struct {
@@ -331,6 +338,28 @@ func (s *Server) reportHistory(w http.ResponseWriter, r *http.Request) {
 		out = append(out, toReport(rep))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"reports": out})
+}
+
+func (s *Server) getAssetVault(w http.ResponseWriter, r *http.Request) {
+	sac, ok := parseSAC(w, r)
+	if !ok {
+		return
+	}
+	v, err := s.Store.GetVault(r.Context(), sac)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "vault not found")
+		return
+	}
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	balance := "0"
+	if v.ReserveBalance != nil {
+		balance = v.ReserveBalance.String()
+	}
+	v.UpdatedAt = v.UpdatedAt.UTC()
+	writeJSON(w, http.StatusOK, vaultJSON{ReserveBalance: balance, Vault: v})
 }
 
 func (s *Server) reporters(w http.ResponseWriter, r *http.Request) {
