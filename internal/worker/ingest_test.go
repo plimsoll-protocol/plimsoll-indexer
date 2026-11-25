@@ -94,6 +94,7 @@ func supplyPostedPage(t *testing.T) []protocol.EventInfo {
 	if err := json.Unmarshal([]byte(body), &page); err != nil {
 		t.Fatal(err)
 	}
+	//lint:ignore SA1019 regression test explicitly verifies the legacy InSuccessfulContractCall field stays false
 	if page[0].InSuccessfulContractCall {
 		t.Fatal("fixture must leave inSuccessfulContractCall false")
 	}
@@ -196,7 +197,7 @@ func newIngester(rpc *fakeRPC, db *fakeStore) *Ingester {
 }
 
 // The exact refusal testnet RPC returns for a cursor that has aged out.
-var retentionErr = errors.New("[-32600] startLedger must be within the ledger range: 5347200 - 5468159")
+var errRetention = errors.New("[-32600] startLedger must be within the ledger range: 5347200 - 5468159")
 
 func TestRunRestartsWhenCursorFellOutOfRetention(t *testing.T) {
 	page := supplyPostedPage(t)
@@ -204,7 +205,7 @@ func TestRunRestartsWhenCursorFellOutOfRetention(t *testing.T) {
 	rpc := &fakeRPC{
 		latest: 5468159,
 		oldest: 5347200,
-		errs:   map[string]error{stale: retentionErr},
+		errs:   map[string]error{stale: errRetention},
 		pages: map[string]protocol.GetEventsResponse{
 			"": {Events: page, Cursor: "0023421401557905408-0000000000"},
 		},
@@ -230,7 +231,7 @@ func TestRunGivesUpWhenRestartIsAlsoRefused(t *testing.T) {
 	rpc := &fakeRPC{
 		latest: 5468159,
 		oldest: 5347200,
-		errs:   map[string]error{stale: retentionErr, "": retentionErr},
+		errs:   map[string]error{stale: errRetention, "": errRetention},
 	}
 	db := &fakeStore{progress: store.Progress{Cursor: stale}}
 
