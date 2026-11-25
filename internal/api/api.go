@@ -39,6 +39,7 @@ type Reader interface {
 	Breakdown(ctx context.Context, hash string) ([]byte, error)
 	Progress(ctx context.Context, name string) (store.Progress, error)
 	GetVault(ctx context.Context, sac string) (coverage.Vault, error)
+	LatestIssuerToml(ctx context.Context, issuer string) (coverage.IssuerTomlSnapshot, error)
 }
 
 // NetworkInfo is served at /v1/network so clients can discover contract ids.
@@ -77,6 +78,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/assets/{sac}/supply", s.supplyHistory)
 	mux.HandleFunc("GET /v1/assets/{sac}/reports", s.reportHistory)
 	mux.HandleFunc("GET /v1/assets/{sac}/vault", s.getAssetVault)
+	mux.HandleFunc("GET /v1/issuers/{issuer}/toml", s.getIssuerToml)
 	mux.HandleFunc("GET /v1/reporters", s.reporters)
 	mux.HandleFunc("GET /v1/breakdowns/{hash}", s.breakdown)
 	mux.HandleFunc("POST /v1/webhooks", s.createWebhook)
@@ -360,6 +362,26 @@ func (s *Server) getAssetVault(w http.ResponseWriter, r *http.Request) {
 	}
 	v.UpdatedAt = v.UpdatedAt.UTC()
 	writeJSON(w, http.StatusOK, vaultJSON{ReserveBalance: balance, Vault: v})
+}
+
+func (s *Server) getIssuerToml(w http.ResponseWriter, r *http.Request) {
+	issuer := r.PathValue("issuer")
+	if !strkey.IsValidEd25519PublicKey(issuer) {
+		writeError(w, http.StatusBadRequest, "issuer must be a Stellar account public key")
+		return
+	}
+	snap, err := s.Store.LatestIssuerToml(r.Context(), issuer)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "issuer toml not found")
+		return
+	}
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	snap.FetchedAt = snap.FetchedAt.UTC()
+	w.Header().Set("Last-Modified", snap.FetchedAt.Format(http.TimeFormat))
+	writeJSON(w, http.StatusOK, snap)
 }
 
 func (s *Server) reporters(w http.ResponseWriter, r *http.Request) {

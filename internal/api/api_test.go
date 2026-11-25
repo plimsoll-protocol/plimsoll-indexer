@@ -40,11 +40,12 @@ func unlistedSAC(t *testing.T) string {
 }
 
 type fake struct {
-	assets  []coverage.Asset
-	supply  map[string]*coverage.Supply
-	reports map[string]map[uint32]coverage.Report
-	bodies  map[string][]byte
-	vaults  map[string]coverage.Vault
+	assets        []coverage.Asset
+	supply        map[string]*coverage.Supply
+	reports       map[string]map[uint32]coverage.Report
+	bodies        map[string][]byte
+	vaults        map[string]coverage.Vault
+	tomlSnapshots map[string]coverage.IssuerTomlSnapshot
 }
 
 func (f *fake) Ping(context.Context) error { return nil }
@@ -103,6 +104,12 @@ func (f *fake) GetVault(_ context.Context, s string) (coverage.Vault, error) {
 		return v, nil
 	}
 	return coverage.Vault{}, store.ErrNotFound
+}
+func (f *fake) LatestIssuerToml(_ context.Context, issuer string) (coverage.IssuerTomlSnapshot, error) {
+	if snap, ok := f.tomlSnapshots[issuer]; ok {
+		return snap, nil
+	}
+	return coverage.IssuerTomlSnapshot{}, store.ErrNotFound
 }
 
 type webhookManagerFake struct {
@@ -443,5 +450,71 @@ func TestGetAssetVault(t *testing.T) {
 	resp.Body.Close()
 	if !strings.Contains(string(spec), "/v1/assets/{sac}/vault:") {
 		t.Fatal("openapi spec missing /v1/assets/{sac}/vault path")
+	}
+}
+
+func TestGetIssuerToml(t *testing.T) {
+	const issuerAddr = "GBIE3ANCRVCBWETUZXWYKRMP27LQVJHX757XXAQUT3LYHVTNFPPPXEY4"
+	const otherIssuer = "GCCMGQ3UGITN2HUUSQKTDMBFZ34QQTKMODR56NT26JMPH2MHVYWZMXNE"
+	const rawToml = "VERSION = \"2.7.0\"\n"
+	fetchedAt := time.Date(2026, 11, 24, 15, 0, 0, 0, time.UTC)
+
+	f := &fake{
+		tomlSnapshots: map[string]coverage.IssuerTomlSnapshot{
+			issuerAddr: {
+				Issuer:     issuerAddr,
+				HomeDomain: "example.money",
+				SHA256Hash: strings.Repeat("b", 64),
+				Content:    rawToml,
+				FetchedAt:  fetchedAt,
+			},
+		},
+	}
+	s := &Server{
+		Store: f,
+		CORS:  []string{"*"},
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:   func() time.Time { return now },
+	}
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	get(t, srv, "/v1/issuers/not-an-issuer/toml", http.StatusBadRequest)
+	get(t, srv, "/v1/issuers/"+otherIssuer+"/toml", http.StatusNotFound)
+
+	resp, err := http.Get(srv.URL + "/v1/issuers/" + issuerAddr + "/toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	lastModHeader := resp.Header.Get("Last-Modified")
+	parsedLastMod, err := http.ParseTime(lastModHeader)
+	if err != nil {
+		t.Fatalf("parse Last-Modified %q: %v", lastModHeader, err)
+	}
+	if !parsedLastMod.Equal(fetchedAt) {
+		t.Fatalf("Last-Modified = %v, want %v", parsedLastMod, fetchedAt)
+	}
+	var got coverage.IssuerTomlSnapshot
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Issuer != issuerAddr || got.HomeDomain != "example.money" ||
+		got.SHA256Hash != strings.Repeat("b", 64) || got.Content != rawToml ||
+		!got.FetchedAt.Equal(fetchedAt) {
+		t.Fatalf("unexpected issuer toml response: %+v", got)
+	}
+
+	specResp, err := http.Get(srv.URL + "/openapi.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, _ := io.ReadAll(specResp.Body)
+	specResp.Body.Close()
+	if !strings.Contains(string(spec), "/v1/issuers/{issuer}/toml:") {
+		t.Fatal("openapi spec missing /v1/issuers/{issuer}/toml path")
 	}
 }

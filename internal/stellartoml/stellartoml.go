@@ -42,6 +42,14 @@ type Info struct {
 	Currency   *Currency `json:"currency,omitempty"`
 }
 
+// Snapshot holds the parsed stellar.toml info together with the raw response
+// content and its SHA-256 hex digest.
+type Snapshot struct {
+	Info    Info
+	Hash    string
+	Content string
+}
+
 type document struct {
 	Documentation struct {
 		OrgName string `toml:"ORG_NAME"`
@@ -83,32 +91,42 @@ func (f *Fetcher) Fetch(ctx context.Context, domain, code, issuer string) (Info,
 // FetchSnapshot fetches and parses a stellar.toml, returning its SHA-256 over
 // the exact response bytes. The hash is returned even if TOML parsing fails.
 func (f *Fetcher) FetchSnapshot(ctx context.Context, domain, code, issuer string) (Info, string, error) {
-	info := Info{HomeDomain: domain}
+	snap, err := f.FetchRawSnapshot(ctx, domain, code, issuer)
+	return snap.Info, snap.Hash, err
+}
+
+// FetchRawSnapshot fetches and parses a stellar.toml, returning the parsed
+// Info, exact raw body, and its SHA-256 hex digest. Hash and Content are
+// populated even if TOML parsing fails.
+func (f *Fetcher) FetchRawSnapshot(ctx context.Context, domain, code, issuer string) (Snapshot, error) {
+	snap := Snapshot{Info: Info{HomeDomain: domain}}
 	if domain == "" {
-		return info, "", errors.New("issuer has no home_domain")
+		return snap, errors.New("issuer has no home_domain")
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.URLFor(domain), nil)
 	if err != nil {
-		return info, "", err
+		return snap, err
 	}
 	resp, err := f.HTTP.Do(req)
 	if err != nil {
-		return info, "", fmt.Errorf("fetch stellar.toml: %w", err)
+		return snap, fmt.Errorf("fetch stellar.toml: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return info, "", fmt.Errorf("fetch stellar.toml: status %d", resp.StatusCode)
+		return snap, fmt.Errorf("fetch stellar.toml: status %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTomlBytes+1))
 	if err != nil {
-		return info, "", fmt.Errorf("read stellar.toml: %w", err)
+		return snap, fmt.Errorf("read stellar.toml: %w", err)
 	}
 	if len(body) > maxTomlBytes {
-		return info, "", errors.New("stellar.toml exceeds 100KB")
+		return snap, errors.New("stellar.toml exceeds 100KB")
 	}
 	hash := sha256.Sum256(body)
-	info, err = Parse(domain, body, code, issuer)
-	return info, hex.EncodeToString(hash[:]), err
+	snap.Hash = hex.EncodeToString(hash[:])
+	snap.Content = string(body)
+	snap.Info, err = Parse(domain, body, code, issuer)
+	return snap, err
 }
 
 // Parse extracts Info from a stellar.toml body.
