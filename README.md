@@ -71,6 +71,12 @@ The command fetches the asset's snapshot breakdown from the indexer, verifies th
 | `POST /v1/coverage-webhooks` | Register a coverage threshold (admin token required) |
 | `DELETE /v1/coverage-webhooks/{id}` | Remove a registration and its delivery log (admin token required) |
 
+Every `4xx` and `5xx` response has the same body:
+`{"code":"asset_not_listed","message":"…"}`, with an optional `details` object.
+`code` is machine-readable and stable, so clients should match on it instead of
+on `message`. See `ErrorResponse` in
+[`internal/api/openapi.yaml`](internal/api/openapi.yaml).
+
 Webhook registration and signature verification are covered in the
 [webhook guide](docs/webhooks.md).
 

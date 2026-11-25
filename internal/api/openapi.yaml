@@ -35,17 +35,11 @@ paths:
                   - status
                   - ingested_to_ledger
         '503':
-          description: Storage/database is unavailable
+          description: Storage is unreachable or the ingest cursor cannot be read
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  status:
-                    type: string
-                    example: "db_unavailable"
-                required:
-                  - status
+                $ref: '#/components/schemas/ErrorResponse'
   /openapi.yaml:
     get:
       summary: Get OpenAPI 3.1 specification
@@ -286,8 +280,16 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '401':
           description: Missing or invalid administrator token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '503':
           description: Webhook management is not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
     get:
       summary: List registered webhooks without their secrets
       operationId: listWebhooks
@@ -308,8 +310,16 @@ paths:
                 required: [webhooks]
         '401':
           description: Missing or invalid administrator token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '503':
           description: Webhook management is not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/webhooks/{id}:
     delete:
       summary: Delete a registered webhook
@@ -328,10 +338,22 @@ paths:
           description: Webhook deleted
         '400':
           description: Invalid webhook ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '401':
           description: Missing or invalid administrator token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: Webhook not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/breakdowns/{hash}:
     get:
       summary: Get raw supply breakdown by hash
@@ -748,9 +770,36 @@ components:
         - created_at
     ErrorResponse:
       type: object
+      description: |
+        Body of every 4xx and 5xx response, including the 404 and 405 the
+        router writes for an unknown path or method.
       properties:
-        error:
+        code:
           type: string
-          example: "asset not listed"
+          description: |
+            Machine-readable error identifier. Match on this value, not on
+            `message`. Handlers use: not_found, invalid_sac,
+            asset_not_listed, invalid_breakdown_hash, breakdown_not_found,
+            invalid_min_tier, invalid_limit, invalid_body,
+            invalid_webhook_url, invalid_webhook_id, webhook_not_found,
+            webhooks_not_configured, unauthorized, internal_error,
+            db_unavailable and progress_unavailable. The router uses
+            not_found, method_not_allowed and internal_error.
+          example: asset_not_listed
+        message:
+          type: string
+          description: Human-readable explanation for logs and debugging.
+          example: asset not listed
+        details:
+          type: object
+          additionalProperties: true
+          description: |
+            Optional context identifying what was rejected, such as the
+            offending query parameter and its value. Omitted when there is
+            nothing to add.
+          example:
+            parameter: min_tier
+            value: "9"
       required:
-        - error
+        - code
+        - message

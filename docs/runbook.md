@@ -83,8 +83,14 @@ version each database is at. Stop with `SIGINT` or
  "last_event_at":"...","last_event_age_seconds":0}
 ```
 
-- `503 {"status":"db_unavailable"}`: Postgres is unreachable.
-- `503 {"status":"progress_unavailable"}`: the ingest cursor cannot be read.
+- `503 {"code":"db_unavailable","message":"database is unavailable"}`: Postgres is unreachable.
+- `503 {"code":"progress_unavailable","message":"ingest progress is unavailable"}`: the ingest cursor cannot be read.
+
+Every `4xx` and `5xx` response, including the `404` and `405` the router writes
+for an unknown path or method, has the same body:
+`{"code":"…","message":"…"}` plus an optional `details` object. `code` is
+machine-readable and stable; clients should match it instead of `message`. The
+schema is `ErrorResponse` in `internal/api/openapi.yaml`.
 - `ingested_to_ledger` advances on every scan, even when nothing is stored, so
   it is **not** evidence that ingestion works. Alert on `last_event_age_seconds`
   instead. The keep-alive workflow fails when it exceeds 28800 (8 hours), which
