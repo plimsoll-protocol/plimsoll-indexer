@@ -9,18 +9,23 @@ Set both values in the indexer's environment:
 
 ```bash
 WEBHOOK_ADMIN_TOKEN=<long-random-admin-token>
+WEBHOOK_API_KEYS=<owner-key-1>,<owner-key-2>
 WEBHOOK_ENCRYPTION_KEY=$(openssl rand -base64 32)
 ```
 
-Keep both values private. The encryption key must remain stable: it is used to
-decrypt signing secrets at delivery time. Losing or rotating it makes existing
-webhook secrets unusable. The database stores a SHA-256 hash and an
-AES-256-GCM-encrypted copy of each secret; it never stores the plaintext.
+`WEBHOOK_API_KEYS` is an optional comma-separated list of owner API keys. The
+administrator token can also create and delete webhooks it owns, and is required
+to list all destinations. Each API key can delete only webhooks registered with
+that same key. Keep all tokens private. The encryption key must remain stable:
+it is used to decrypt signing secrets at delivery time. Losing or rotating it
+makes existing webhook secrets unusable. The database stores SHA-256 hashes of
+owner API keys and signing secrets, plus an AES-256-GCM-encrypted copy of each
+signing secret; it never stores either key in plaintext.
 
 ## Register a destination
 
-Webhook management requires the administrator bearer token. Register a
-destination over HTTPS:
+Register a destination over HTTPS with the administrator token or one of the
+configured owner API keys:
 
 ```bash
 curl -X POST https://indexer.example/v1/webhooks \
@@ -31,8 +36,10 @@ curl -X POST https://indexer.example/v1/webhooks \
 
 The `201` response includes the generated `secret` once. Save it securely;
 later list requests omit it. Use `GET /v1/webhooks` to list destinations and
-`DELETE /v1/webhooks/{id}` to remove one. The indexer only accepts HTTPS
-destinations and disables HTTP redirects.
+`DELETE /v1/webhooks/{id}` with the same API key to remove one. A valid key that
+does not own the webhook receives `403`; missing, unknown, and already-deleted
+IDs receive `404`. The indexer only accepts HTTPS destinations and disables
+HTTP redirects.
 
 ## Verify a delivery
 

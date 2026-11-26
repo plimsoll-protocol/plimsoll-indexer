@@ -14,6 +14,10 @@ cp .env.example .env && set -a && . ./.env && set +a
 go run ./cmd/plimsoll-indexer
 ```
 
+Use `.env.local` for machine-specific overrides; it is gitignored and loaded
+automatically by the indexer. Set `GO_ENV=production` to ignore it (as
+deployments do).
+
 ## End-to-end test
 
 `internal/e2e` runs the standalone network preset and the event ingester

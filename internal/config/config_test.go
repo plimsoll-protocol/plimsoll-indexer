@@ -1,9 +1,46 @@
 package config
 
 import (
+	"os"
+	"regexp"
+	"sort"
 	"strings"
 	"testing"
 )
+
+func TestEnvExampleDocumentsLoadVariables(t *testing.T) {
+	configSource, err := os.ReadFile("config.go")
+	if err != nil {
+		t.Fatalf("read config.go: %v", err)
+	}
+	envExample, err := os.ReadFile("../../.env.example")
+	if err != nil {
+		t.Fatalf("read .env.example: %v", err)
+	}
+
+	codeNames := regexp.MustCompile(`"([A-Z][A-Z0-9_]*)"`)
+	documentedNames := regexp.MustCompile(`(?m)^([A-Z][A-Z0-9_]*)=`)
+
+	documented := make(map[string]bool)
+	for _, match := range documentedNames.FindAllSubmatch(envExample, -1) {
+		documented[string(match[1])] = true
+	}
+
+	var missing []string
+	seen := make(map[string]bool)
+	for _, match := range codeNames.FindAllSubmatch(configSource, -1) {
+		name := string(match[1])
+		if !seen[name] && !documented[name] {
+			missing = append(missing, name)
+		}
+		seen[name] = true
+	}
+	sort.Strings(missing)
+
+	if len(missing) > 0 {
+		t.Errorf("variables read by config.Load are missing from .env.example: %s", strings.Join(missing, ", "))
+	}
+}
 
 func TestKeepAwakeURL(t *testing.T) {
 	cases := []struct {
@@ -24,7 +61,7 @@ func TestKeepAwakeURL(t *testing.T) {
 
 func setBase(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"NETWORK", "STELLAR_RPC_URL", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE", "WEBHOOK_ADMIN_TOKEN", "WEBHOOK_ENCRYPTION_KEY"} {
+	for _, k := range []string{"NETWORK", "STELLAR_RPC_URL", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE", "WEBHOOK_ADMIN_TOKEN", "WEBHOOK_API_KEYS", "WEBHOOK_ENCRYPTION_KEY"} {
 		t.Setenv(k, "")
 	}
 	t.Setenv("DATABASE_URL", "postgres://x")
@@ -55,6 +92,33 @@ func TestWebhookConfigurationMustBeComplete(t *testing.T) {
 	t.Setenv("WEBHOOK_ENCRYPTION_KEY", "short")
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "32-byte key") {
 		t.Fatalf("want invalid key error, got %v", err)
+	}
+}
+
+func TestWebhookAPIKeys(t *testing.T) {
+	setBase(t)
+	t.Setenv("WEBHOOK_ADMIN_TOKEN", "admin")
+	t.Setenv("WEBHOOK_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	t.Setenv("WEBHOOK_API_KEYS", " client-one ,client-two")
+	got, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.WebhookAPIKeys) != 2 || got.WebhookAPIKeys[0] != "client-one" || got.WebhookAPIKeys[1] != "client-two" {
+		t.Fatalf("WebhookAPIKeys = %q", got.WebhookAPIKeys)
+	}
+
+	for _, raw := range []string{"client-one,,client-two", "same,same", "admin"} {
+		t.Setenv("WEBHOOK_API_KEYS", raw)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "WEBHOOK_API_KEYS") {
+			t.Errorf("WEBHOOK_API_KEYS=%q: want validation error, got %v", raw, err)
+		}
+	}
+
+	setBase(t)
+	t.Setenv("WEBHOOK_API_KEYS", "client-one")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "requires WEBHOOK_ADMIN_TOKEN") {
+		t.Fatalf("API keys without webhook management config: %v", err)
 	}
 }
 
@@ -156,6 +220,30 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if got.KeepAwakeInterval.String() != "10m0s" {
 		t.Errorf("KeepAwakeInterval = %v, want 10m0s", got.KeepAwakeInterval)
+	}
+	if got.IngestWorkers != 2 {
+		t.Errorf("IngestWorkers = %d, want 2", got.IngestWorkers)
+	}
+}
+
+func TestLoadIngestWorkers(t *testing.T) {
+	for _, value := range []string{"0", "-1", "many"} {
+		t.Run(value, func(t *testing.T) {
+			setBase(t)
+			t.Setenv("INGEST_WORKERS", value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "INGEST_WORKERS") {
+				t.Fatalf("want INGEST_WORKERS validation error, got %v", err)
+			}
+		})
+	}
+	setBase(t)
+	t.Setenv("INGEST_WORKERS", "1")
+	got, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.IngestWorkers != 1 {
+		t.Errorf("IngestWorkers = %d, want 1", got.IngestWorkers)
 	}
 }
 

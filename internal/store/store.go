@@ -6,17 +6,21 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/crypto/bcrypt"
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
 )
 
 var ErrNotFound = errors.New("not found")
+var ErrForbidden = errors.New("forbidden")
 
 // ErrLockNotAcquired is returned by TryPostLock when another poster instance
 // already holds the advisory lock.
@@ -31,6 +35,7 @@ type Webhook struct {
 	URL              string
 	SecretHash       string
 	SecretCiphertext []byte
+	OwnerKeyHash     string
 	CreatedAt        time.Time
 }
 
@@ -63,6 +68,14 @@ func (s *Store) Close() { s.pool.Close() }
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
 // ---- ingest cursor --------------------------------------------------------
+
+// LegacyIngestCursorName is the pre-streaming cursor retained for upgrades.
+const LegacyIngestCursorName = "plimsoll-events"
+
+// ContractIngestCursorName returns the checkpoint name for one event stream.
+func ContractIngestCursorName(contractID string) string {
+	return LegacyIngestCursorName + ":" + contractID
+}
 
 // Progress is how far ingestion has reached.
 type Progress struct {
@@ -200,6 +213,32 @@ func scanAsset(row pgx.Row) (coverage.Asset, error) {
 
 func (s *Store) ListAssets(ctx context.Context) ([]coverage.Asset, error) {
 	rows, err := s.pool.Query(ctx, `SELECT `+assetCols+` FROM assets ORDER BY code, issuer`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []coverage.Asset
+	for rows.Next() {
+		a, err := scanAsset(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// ListAssetsPage returns rows ordered by (code, issuer). The API requests
+// one extra row to determine whether another page exists.
+func (s *Store) ListAssetsPage(ctx context.Context, limit int, afterCode, afterIssuer string) ([]coverage.Asset, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+assetCols+`
+		FROM assets
+		WHERE ($1 = '' AND $2 = '')
+		   OR code > $1
+		   OR (code = $1 AND issuer > $2)
+		ORDER BY code, issuer
+		LIMIT $3`, afterCode, afterIssuer, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -476,14 +515,14 @@ func (s *Store) SaveIssuerTomlSnapshot(ctx context.Context, issuer, domain, hash
 	return oldHash, changed, nil
 }
 
-func (s *Store) CreateWebhook(ctx context.Context, url, secretHash string, ciphertext []byte) (Webhook, error) {
+func (s *Store) CreateWebhook(ctx context.Context, url, secretHash string, ciphertext []byte, ownerKeyHash string) (Webhook, error) {
 	var w Webhook
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO webhooks (url, secret_hash, secret_ciphertext)
-		VALUES ($1, $2, $3)
-		RETURNING id, url, secret_hash, secret_ciphertext, created_at`,
-		url, secretHash, ciphertext,
-	).Scan(&w.ID, &w.URL, &w.SecretHash, &w.SecretCiphertext, &w.CreatedAt)
+		INSERT INTO webhooks (url, secret_hash, secret_ciphertext, owner_key_hash)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id, url, secret_hash, secret_ciphertext, owner_key_hash, created_at`,
+		url, secretHash, ciphertext, ownerKeyHash,
+	).Scan(&w.ID, &w.URL, &w.SecretHash, &w.SecretCiphertext, &w.OwnerKeyHash, &w.CreatedAt)
 	if err != nil {
 		return Webhook{}, fmt.Errorf("create webhook: %w", err)
 	}
@@ -509,12 +548,71 @@ func (s *Store) ListWebhooks(ctx context.Context) ([]Webhook, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) DeleteWebhook(ctx context.Context, id int64) (bool, error) {
-	tag, err := s.pool.Exec(ctx, `DELETE FROM webhooks WHERE id = $1`, id)
+func (s *Store) DeleteWebhook(ctx context.Context, id int64, ownerKeyHash string, allowLegacyAdmin bool) error {
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return false, fmt.Errorf("delete webhook: %w", err)
+		return fmt.Errorf("begin delete webhook: %w", err)
 	}
-	return tag.RowsAffected() != 0, nil
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var storedOwner string
+	err = tx.QueryRow(ctx, `SELECT owner_key_hash FROM webhooks WHERE id = $1 FOR UPDATE`, id).Scan(&storedOwner)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("read webhook owner: %w", err)
+	}
+	// Rows created before owner tracking have no key hash and are admin-only.
+	if storedOwner != ownerKeyHash && !(storedOwner == "" && allowLegacyAdmin) {
+		return ErrForbidden
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM webhooks WHERE id = $1`, id); err != nil {
+		return fmt.Errorf("delete webhook: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit delete webhook: %w", err)
+	}
+	return nil
+}
+
+// CreateAPIKey stores a bcrypt hash and returns the selector used to locate it.
+func (s *Store) CreateAPIKey(ctx context.Context, keyHash string) (int64, error) {
+	var id int64
+	err := s.pool.QueryRow(ctx,
+		`INSERT INTO api_keys (key_hash) VALUES ($1) RETURNING id`, keyHash,
+	).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("create API key: %w", err)
+	}
+	return id, nil
+}
+
+// ValidateAPIKey checks the secret portion of an id.secret API key.
+func (s *Store) ValidateAPIKey(ctx context.Context, key string) (bool, error) {
+	id, secret, ok := strings.Cut(key, ".")
+	if !ok || id == "" || secret == "" || strings.Contains(secret, ".") || len(secret) > 72 {
+		return false, nil
+	}
+	var keyID int64
+	keyID, err := strconv.ParseInt(id, 10, 64)
+	if err != nil || keyID < 1 {
+		return false, nil
+	}
+	var hash string
+	if err := s.pool.QueryRow(ctx, `SELECT key_hash FROM api_keys WHERE id = $1`, keyID).Scan(&hash); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read API key: %w", err)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(secret)); err != nil {
+		if errors.Is(err, bcrypt.ErrMismatchedHashAndPassword) {
+			return false, nil
+		}
+		return false, fmt.Errorf("compare API key: %w", err)
+	}
+	return true, nil
 }
 
 func mustBig(s string) *big.Int {

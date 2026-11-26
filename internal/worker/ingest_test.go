@@ -10,7 +10,9 @@ import (
 	"math/big"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 	"github.com/stellar/go-stellar-sdk/xdr"
@@ -260,5 +262,113 @@ func TestRunReportsUnrelatedRPCErrors(t *testing.T) {
 	}
 	if len(db.applied) != 0 {
 		t.Error("nothing should be stored when the page failed")
+	}
+}
+
+type concurrentRPC struct {
+	pages   map[string]protocol.EventInfo
+	mu      sync.Mutex
+	seen    map[string]int
+	arrived chan struct{}
+	once    sync.Once
+}
+
+func (r *concurrentRPC) GetEvents(ctx context.Context, req protocol.GetEventsRequest) (protocol.GetEventsResponse, error) {
+	contractID := req.Filters[0].ContractIDs[0]
+	if req.Pagination.Limit == 1 {
+		return protocol.GetEventsResponse{OldestLedger: 1}, nil
+	}
+
+	r.mu.Lock()
+	r.seen[contractID]++
+	total := len(r.seen)
+	r.mu.Unlock()
+	if total == 2 {
+		r.once.Do(func() { close(r.arrived) })
+	}
+	select {
+	case <-r.arrived:
+	case <-ctx.Done():
+		return protocol.GetEventsResponse{}, ctx.Err()
+	case <-time.After(2 * time.Second):
+		return protocol.GetEventsResponse{}, errors.New("contract streams were not concurrent")
+	}
+	event := r.pages[contractID]
+	return protocol.GetEventsResponse{
+		Events:       []protocol.EventInfo{event},
+		Cursor:       "cursor-" + contractID,
+		LatestLedger: 100,
+	}, nil
+}
+
+func (r *concurrentRPC) GetLatestLedger(context.Context) (protocol.GetLatestLedgerResponse, error) {
+	return protocol.GetLatestLedgerResponse{Sequence: 100}, nil
+}
+
+type eventTrackingStore struct {
+	mu       sync.Mutex
+	names    map[string]bool
+	eventIDs map[string]int
+}
+
+func (s *eventTrackingStore) Progress(context.Context, string) (store.Progress, error) {
+	return store.Progress{}, nil
+}
+
+func (s *eventTrackingStore) ApplyEvents(_ context.Context, name, _ string, _ uint32, events []any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.names[name] = true
+	for _, event := range events {
+		supply, ok := event.(soroban.SupplyPosted)
+		if !ok {
+			return fmt.Errorf("unexpected decoded event %T", event)
+		}
+		s.eventIDs[supply.ID]++
+	}
+	return nil
+}
+
+func TestIngesterRunsContractStreamsConcurrentlyWithoutDuplicates(t *testing.T) {
+	page := supplyPostedPage(t)
+	ledgerEvent, registryEvent := page[0], page[0]
+	ledgerEvent.ID = "ledger-event"
+	registryEvent.ID = "registry-event"
+	rpc := &concurrentRPC{
+		pages: map[string]protocol.EventInfo{
+			"ledger-contract":   ledgerEvent,
+			"registry-contract": registryEvent,
+		},
+		seen:    make(map[string]int),
+		arrived: make(chan struct{}),
+	}
+	db := &eventTrackingStore{
+		names:    make(map[string]bool),
+		eventIDs: make(map[string]int),
+	}
+	in := &Ingester{
+		RPC:         rpc,
+		Store:       db,
+		ContractIDs: []string{"ledger-contract", "registry-contract"},
+		StartLedger: 10,
+		Workers:     2,
+		Log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := in.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	for _, id := range []string{"ledger-contract", "registry-contract"} {
+		if rpc.seen[id] != 1 {
+			t.Errorf("%s stream requested %d pages, want 1", id, rpc.seen[id])
+		}
+		if !db.names[store.ContractIngestCursorName(id)] {
+			t.Errorf("missing checkpoint for %s", id)
+		}
+	}
+	if len(db.eventIDs) != 2 || db.eventIDs["ledger-event"] != 1 || db.eventIDs["registry-event"] != 1 {
+		t.Errorf("stored event IDs = %v, want each stream's event exactly once", db.eventIDs)
 	}
 }
