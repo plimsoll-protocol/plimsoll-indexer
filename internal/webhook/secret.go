@@ -73,6 +73,15 @@ func SecretHash(secret string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// KeyID derives the stable identifier an endpoint is stored under from the API
+// key (bearer token) that registered it. Only this fingerprint is stored, so a
+// database dump cannot be replayed as an API key. One key therefore lists and
+// deletes only its own endpoints.
+func KeyID(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
 func VerifySecretHash(secret, expected string) bool {
 	got := SecretHash(secret)
 	return len(got) == len(expected) && subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1

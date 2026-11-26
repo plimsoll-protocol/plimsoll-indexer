@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"math/big"
@@ -194,28 +195,100 @@ func TestIssuerTomlSnapshotsDetectChanges(t *testing.T) {
 func TestWebhookPersistence(t *testing.T) {
 	s, _ := openStore(t)
 	ctx := context.Background()
+	const key = "key-one"
 	ciphertext := []byte{1, 2, 3, 4}
-	created, err := s.CreateWebhook(ctx, "https://receiver.example/hook", "sha256-hash", ciphertext)
+	created, err := s.CreateWebhook(ctx, key, "https://receiver.example/hook", "sha256-hash", ciphertext)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if created.ID < 1 || created.SecretHash != "sha256-hash" || !bytes.Equal(created.SecretCiphertext, ciphertext) {
+	if created.ID < 1 || created.APIKey != key || created.SecretHash != "sha256-hash" ||
+		!bytes.Equal(created.SecretCiphertext, ciphertext) {
 		t.Fatalf("created webhook = %+v", created)
 	}
 
-	list, err := s.ListWebhooks(ctx)
+	list, err := s.ListWebhooksForKey(ctx, key)
 	if err != nil || len(list) != 1 || list[0].ID != created.ID ||
 		list[0].URL != created.URL || list[0].SecretHash != created.SecretHash ||
 		!bytes.Equal(list[0].SecretCiphertext, ciphertext) {
 		t.Fatalf("listed webhooks = %+v, %v", list, err)
 	}
-	deleted, err := s.DeleteWebhook(ctx, created.ID)
+	// Another key sees only its own endpoints.
+	if other, err := s.ListWebhooksForKey(ctx, "key-two"); err != nil || len(other) != 0 {
+		t.Fatalf("another key listed %+v, %v", other, err)
+	}
+	// The dispatcher still sees every endpoint.
+	if all, err := s.ListWebhooks(ctx); err != nil || len(all) != 1 {
+		t.Fatalf("all webhooks = %+v, %v", all, err)
+	}
+
+	deleted, err := s.DeleteWebhook(ctx, "key-two", created.ID)
+	if err != nil || deleted {
+		t.Fatalf("another key deleted the endpoint: deleted=%v err=%v", deleted, err)
+	}
+	deleted, err = s.DeleteWebhook(ctx, key, created.ID)
 	if err != nil || !deleted {
 		t.Fatalf("delete webhook: deleted=%v err=%v", deleted, err)
 	}
-	deleted, err = s.DeleteWebhook(ctx, created.ID)
+	deleted, err = s.DeleteWebhook(ctx, key, created.ID)
 	if err != nil || deleted {
 		t.Fatalf("delete missing webhook: deleted=%v err=%v", deleted, err)
+	}
+}
+
+func TestWebhookLimitAndDeliveryTracking(t *testing.T) {
+	s, _ := openStore(t)
+	ctx := context.Background()
+	const key = "key-limit"
+	ciphertext := []byte{1, 2, 3, 4}
+
+	var first Webhook
+	for i := range MaxWebhooksPerKey {
+		created, err := s.CreateWebhook(ctx, key, fmt.Sprintf("https://receiver.example/%d", i), "hash", ciphertext)
+		if err != nil {
+			t.Fatalf("create endpoint %d: %v", i, err)
+		}
+		if i == 0 {
+			first = created
+		}
+	}
+	_, err := s.CreateWebhook(ctx, key, "https://receiver.example/over-limit", "hash", ciphertext)
+	if !errors.Is(err, ErrWebhookLimit) {
+		t.Fatalf("over-limit create error = %v, want ErrWebhookLimit", err)
+	}
+	// The limit is per key, so another key can still register.
+	if _, err := s.CreateWebhook(ctx, "key-other", "https://receiver.example/other", "hash", ciphertext); err != nil {
+		t.Fatalf("another key could not register: %v", err)
+	}
+
+	at := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	if err := s.RecordWebhookDelivery(ctx, first.ID, at, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordWebhookDelivery(ctx, first.ID, at.Add(time.Minute), "webhook returned status 500"); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := s.ListWebhooksForKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got *Webhook
+	for i := range list {
+		if list[i].ID == first.ID {
+			got = &list[i]
+		}
+	}
+	if got == nil {
+		t.Fatalf("endpoint %d missing from %+v", first.ID, list)
+	}
+	if got.Deliveries != 2 || got.Failures != 1 {
+		t.Errorf("deliveries=%d failures=%d, want 2 and 1", got.Deliveries, got.Failures)
+	}
+	if got.LastDeliveryStatus != "failed" || got.LastDeliveryError != "webhook returned status 500" {
+		t.Errorf("last delivery = %q %q", got.LastDeliveryStatus, got.LastDeliveryError)
+	}
+	if got.LastDeliveryAt == nil || !got.LastDeliveryAt.Equal(at.Add(time.Minute)) {
+		t.Errorf("last delivery at = %v, want %v", got.LastDeliveryAt, at.Add(time.Minute))
 	}
 }
 

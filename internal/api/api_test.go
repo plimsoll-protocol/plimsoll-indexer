@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/big"
@@ -103,22 +104,31 @@ type webhookManagerFake struct {
 	webhooks []store.Webhook
 }
 
-func (f *webhookManagerFake) CreateWebhook(_ context.Context, url, hash string, ciphertext []byte) (store.Webhook, error) {
+func (f *webhookManagerFake) CreateWebhook(_ context.Context, apiKey, url, hash string, ciphertext []byte) (store.Webhook, error) {
+	if len(f.webhooks) >= store.MaxWebhooksPerKey {
+		return store.Webhook{}, store.ErrWebhookLimit
+	}
 	item := store.Webhook{
-		ID: int64(len(f.webhooks) + 1), URL: url, SecretHash: hash,
+		ID: int64(len(f.webhooks) + 1), APIKey: apiKey, URL: url, SecretHash: hash,
 		SecretCiphertext: ciphertext, CreatedAt: now,
 	}
 	f.webhooks = append(f.webhooks, item)
 	return item, nil
 }
 
-func (f *webhookManagerFake) ListWebhooks(context.Context) ([]store.Webhook, error) {
-	return f.webhooks, nil
+func (f *webhookManagerFake) ListWebhooks(_ context.Context, apiKey string) ([]store.Webhook, error) {
+	var out []store.Webhook
+	for _, item := range f.webhooks {
+		if item.APIKey == apiKey || item.APIKey == "" {
+			out = append(out, item)
+		}
+	}
+	return out, nil
 }
 
-func (f *webhookManagerFake) DeleteWebhook(_ context.Context, id int64) (bool, error) {
+func (f *webhookManagerFake) DeleteWebhook(_ context.Context, apiKey string, id int64) (bool, error) {
 	for i, item := range f.webhooks {
-		if item.ID == id {
+		if item.ID == id && (item.APIKey == apiKey || item.APIKey == "") {
 			f.webhooks = append(f.webhooks[:i], f.webhooks[i+1:]...)
 			return true, nil
 		}
@@ -434,6 +444,53 @@ func TestOpenAPISpec(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "operationId: headAsset") {
 		t.Error("expected the spec to document the HEAD asset operation")
+	}
+}
+
+// One key may register several endpoints, up to the documented limit. The
+// limit is enforced by the manager; the API maps it to a stable error code.
+func TestWebhookEndpointLimit(t *testing.T) {
+	manager := &webhookManagerFake{}
+	codec, err := webhook.NewSecretCodec(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := serverWithWebhooks(manager, codec, "admin-token")
+	defer srv.Close()
+
+	create := func(url string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/webhooks", strings.NewReader(`{"url":"`+url+`"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer admin-token")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	for i := range store.MaxWebhooksPerKey {
+		resp := create(fmt.Sprintf("https://receiver.example/hook/%d", i))
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("create %d: status %d, want 201", i, resp.StatusCode)
+		}
+	}
+	resp := create("https://receiver.example/hook/over-limit")
+	defer resp.Body.Close()
+	var body errorBody
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusUnprocessableEntity || body.Code != codeWebhookLimitReached {
+		t.Fatalf("over-limit create = %d %+v, want 422 %q", resp.StatusCode, body, codeWebhookLimitReached)
+	}
+	if body.Details["limit"] != float64(store.MaxWebhooksPerKey) {
+		t.Errorf("details = %+v, want the limit", body.Details)
 	}
 }
 

@@ -17,12 +17,24 @@ import (
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
 )
 
-type testSubscriptionStore struct {
-	webhooks []store.Webhook
+type recordedDelivery struct {
+	id      int64
+	at      time.Time
+	failure string
 }
 
-func (s testSubscriptionStore) ListWebhooks(context.Context) ([]store.Webhook, error) {
+type testSubscriptionStore struct {
+	webhooks   []store.Webhook
+	deliveries []recordedDelivery
+}
+
+func (s *testSubscriptionStore) ListWebhooks(context.Context) ([]store.Webhook, error) {
 	return s.webhooks, nil
+}
+
+func (s *testSubscriptionStore) RecordWebhookDelivery(_ context.Context, id int64, at time.Time, failure string) error {
+	s.deliveries = append(s.deliveries, recordedDelivery{id: id, at: at, failure: failure})
+	return nil
 }
 
 func testCodec(t *testing.T) *SecretCodec {
@@ -50,9 +62,10 @@ func TestDispatcherSignatureMatchesDocumentedReference(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dispatcher := NewDispatcher(testSubscriptionStore{webhooks: []store.Webhook{{
+	subs := &testSubscriptionStore{webhooks: []store.Webhook{{
 		ID: 1, URL: server.URL, SecretHash: SecretHash(secret), SecretCiphertext: ciphertext,
-	}}}, codec)
+	}}}
+	dispatcher := NewDispatcher(subs, codec)
 	dispatcher.Client = &http.Client{Timeout: time.Second}
 	dispatcher.Now = func() time.Time { return time.Date(2026, 11, 24, 15, 0, 0, 0, time.UTC) }
 
@@ -78,6 +91,66 @@ func TestDispatcherSignatureMatchesDocumentedReference(t *testing.T) {
 	}
 	if payload.Event != "issuer_toml_changed" || payload.OldHash != "old-hash" || payload.NewHash != "new-hash" {
 		t.Fatalf("payload = %+v", payload)
+	}
+	if len(subs.deliveries) != 1 || subs.deliveries[0].id != 1 || subs.deliveries[0].failure != "" {
+		t.Fatalf("recorded deliveries = %+v, want one success for endpoint 1", subs.deliveries)
+	}
+}
+
+// Every registered endpoint receives the same event, and each delivery is
+// recorded against its own endpoint so one failing receiver does not hide the
+// others.
+func TestDispatcherFansOutAndTracksEachEndpoint(t *testing.T) {
+	const secret = "receiver-secret"
+	delivered := 0
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		delivered++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ok.Close()
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer bad.Close()
+
+	codec := testCodec(t)
+	ciphertext, err := codec.Encrypt(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subs := &testSubscriptionStore{webhooks: []store.Webhook{
+		{ID: 1, URL: ok.URL, SecretHash: SecretHash(secret), SecretCiphertext: ciphertext},
+		{ID: 2, URL: bad.URL, SecretHash: SecretHash(secret), SecretCiphertext: ciphertext},
+	}}
+	dispatcher := NewDispatcher(subs, codec)
+	dispatcher.Client = &http.Client{Timeout: time.Second}
+
+	err = dispatcher.TOMLChanged(context.Background(), "GISSUER", "issuer.example", "old", "new")
+	if err == nil || !strings.Contains(err.Error(), "deliver webhook 2") {
+		t.Fatalf("want the failing endpoint reported, got %v", err)
+	}
+	if delivered != 1 {
+		t.Errorf("the healthy endpoint received %d deliveries, want 1", delivered)
+	}
+	if len(subs.deliveries) != 2 {
+		t.Fatalf("recorded %d deliveries, want 2", len(subs.deliveries))
+	}
+	if subs.deliveries[0].id != 1 || subs.deliveries[0].failure != "" {
+		t.Errorf("endpoint 1 delivery = %+v, want a success", subs.deliveries[0])
+	}
+	if subs.deliveries[1].id != 2 || !strings.Contains(subs.deliveries[1].failure, "status 500") {
+		t.Errorf("endpoint 2 delivery = %+v, want the status failure", subs.deliveries[1])
+	}
+}
+
+func TestKeyIDIsStableAndDoesNotContainTheToken(t *testing.T) {
+	const token = "admin-token-value"
+	id := KeyID(token)
+	if id == "" || id == token || strings.Contains(id, token) {
+		t.Fatalf("KeyID(%q) = %q, want an opaque fingerprint", token, id)
+	}
+	if KeyID(token) != id || KeyID("another-token") == id {
+		t.Error("KeyID must be stable for one token and different for another")
 	}
 }
 

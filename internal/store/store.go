@@ -21,16 +21,35 @@ var ErrNotFound = errors.New("not found")
 // already holds the advisory lock.
 var ErrLockNotAcquired = errors.New("poster lock already held by another instance")
 
+// MaxWebhooksPerKey is how many webhook endpoints one API key may register.
+const MaxWebhooksPerKey = 10
+
+// ErrWebhookLimit is returned by CreateWebhook when the key already holds
+// MaxWebhooksPerKey endpoints.
+var ErrWebhookLimit = errors.New("webhook endpoint limit reached")
+
 type Store struct {
 	pool *pgxpool.Pool
 }
 
 type Webhook struct {
-	ID               int64
+	ID int64
+
+	// APIKey is the fingerprint of the key that registered this endpoint, not
+	// the key itself. It is empty for endpoints registered before endpoints
+	// were keyed; those stay visible to (and deletable by) every key.
+	APIKey           string
 	URL              string
 	SecretHash       string
 	SecretCiphertext []byte
 	CreatedAt        time.Time
+
+	// Delivery tracking, written after every attempt by the dispatcher.
+	LastDeliveryAt     *time.Time
+	LastDeliveryStatus string
+	LastDeliveryError  string
+	Deliveries         int64
+	Failures           int64
 }
 
 // Open connects to the database and brings its schema up to date by applying
@@ -166,17 +185,21 @@ func applyEvent(ctx context.Context, tx pgx.Tx, ev any) error {
 			e.ID, e.SAC, int16(e.Tier), e.Amount.String(), e.AsOf, e.Reporter, e.DocHash, e.DocURI,
 			int64(e.Ledger), e.ClosedAt, e.TxHash)
 	case soroban.ReporterSet:
+		// The ledger check keeps a replayed historical event from overwriting
+		// a newer registration or revocation. Normal ingestion is ordered, so
+		// it always passes.
 		_, err = tx.Exec(ctx, `
 			INSERT INTO reporters (address, role, name, active, updated_ledger, updated_at)
 			VALUES ($1, $2, $3, true, $4, $5)
 			ON CONFLICT (address) DO UPDATE
 			SET role = EXCLUDED.role, name = EXCLUDED.name, active = true,
-			    updated_ledger = EXCLUDED.updated_ledger, updated_at = EXCLUDED.updated_at`,
+			    updated_ledger = EXCLUDED.updated_ledger, updated_at = EXCLUDED.updated_at
+			WHERE reporters.updated_ledger <= EXCLUDED.updated_ledger`,
 			e.Reporter, int16(e.Role), e.Name, int64(e.Ledger), e.ClosedAt)
 	case soroban.ReporterRevoked:
 		_, err = tx.Exec(ctx, `
 			UPDATE reporters SET active = false, updated_ledger = $2, updated_at = $3
-			WHERE address = $1`,
+			WHERE address = $1 AND updated_ledger <= $2`,
 			e.Reporter, int64(e.Ledger), e.ClosedAt)
 	}
 	if err != nil {
@@ -404,32 +427,75 @@ func (s *Store) SaveIssuerTomlSnapshot(ctx context.Context, issuer, domain, hash
 	return oldHash, changed, nil
 }
 
-func (s *Store) CreateWebhook(ctx context.Context, url, secretHash string, ciphertext []byte) (Webhook, error) {
+const webhookCols = `id, api_key, url, secret_hash, secret_ciphertext, created_at,
+	last_delivery_at, COALESCE(last_delivery_status, ''), COALESCE(last_delivery_error, ''),
+	deliveries, failures`
+
+func scanWebhook(row pgx.Row) (Webhook, error) {
 	var w Webhook
-	err := s.pool.QueryRow(ctx, `
-		INSERT INTO webhooks (url, secret_hash, secret_ciphertext)
-		VALUES ($1, $2, $3)
-		RETURNING id, url, secret_hash, secret_ciphertext, created_at`,
-		url, secretHash, ciphertext,
-	).Scan(&w.ID, &w.URL, &w.SecretHash, &w.SecretCiphertext, &w.CreatedAt)
+	err := row.Scan(&w.ID, &w.APIKey, &w.URL, &w.SecretHash, &w.SecretCiphertext, &w.CreatedAt,
+		&w.LastDeliveryAt, &w.LastDeliveryStatus, &w.LastDeliveryError, &w.Deliveries, &w.Failures)
+	return w, err
+}
+
+// CreateWebhook registers one endpoint for apiKey. It fails with
+// ErrWebhookLimit once the key holds MaxWebhooksPerKey endpoints.
+func (s *Store) CreateWebhook(ctx context.Context, apiKey, url, secretHash string, ciphertext []byte) (Webhook, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Webhook{}, fmt.Errorf("begin create webhook: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// Serialise registrations for this key, so two concurrent requests cannot
+	// both see room below the limit and both insert.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "webhook:"+apiKey); err != nil {
+		return Webhook{}, fmt.Errorf("lock webhook registrations: %w", err)
+	}
+	var count int
+	if err := tx.QueryRow(ctx,
+		`SELECT count(*) FROM webhooks WHERE api_key = $1 OR api_key = ''`, apiKey).Scan(&count); err != nil {
+		return Webhook{}, fmt.Errorf("count webhooks: %w", err)
+	}
+	if count >= MaxWebhooksPerKey {
+		return Webhook{}, ErrWebhookLimit
+	}
+	w, err := scanWebhook(tx.QueryRow(ctx, `
+		INSERT INTO webhooks (api_key, url, secret_hash, secret_ciphertext)
+		VALUES ($1, $2, $3, $4)
+		RETURNING `+webhookCols,
+		apiKey, url, secretHash, ciphertext))
 	if err != nil {
 		return Webhook{}, fmt.Errorf("create webhook: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Webhook{}, fmt.Errorf("commit webhook: %w", err)
 	}
 	return w, nil
 }
 
+// ListWebhooks returns every endpoint, for the dispatcher: events fan out to
+// all of them regardless of the key that registered them.
 func (s *Store) ListWebhooks(ctx context.Context) ([]Webhook, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT id, url, secret_hash, secret_ciphertext, created_at
-		FROM webhooks ORDER BY id`)
+	return s.queryWebhooks(ctx, `SELECT `+webhookCols+` FROM webhooks ORDER BY id`)
+}
+
+// ListWebhooksForKey returns the endpoints the key may manage. Endpoints from
+// before endpoints were keyed (empty APIKey) are included for compatibility.
+func (s *Store) ListWebhooksForKey(ctx context.Context, apiKey string) ([]Webhook, error) {
+	return s.queryWebhooks(ctx,
+		`SELECT `+webhookCols+` FROM webhooks WHERE api_key = $1 OR api_key = '' ORDER BY id`, apiKey)
+}
+
+func (s *Store) queryWebhooks(ctx context.Context, sql string, args ...any) ([]Webhook, error) {
+	rows, err := s.pool.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list webhooks: %w", err)
 	}
 	defer rows.Close()
 	var out []Webhook
 	for rows.Next() {
-		var w Webhook
-		if err := rows.Scan(&w.ID, &w.URL, &w.SecretHash, &w.SecretCiphertext, &w.CreatedAt); err != nil {
+		w, err := scanWebhook(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan webhook: %w", err)
 		}
 		out = append(out, w)
@@ -437,12 +503,108 @@ func (s *Store) ListWebhooks(ctx context.Context) ([]Webhook, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) DeleteWebhook(ctx context.Context, id int64) (bool, error) {
-	tag, err := s.pool.Exec(ctx, `DELETE FROM webhooks WHERE id = $1`, id)
+// DeleteWebhook removes one of the key's endpoints. A key cannot delete
+// another key's endpoint.
+func (s *Store) DeleteWebhook(ctx context.Context, apiKey string, id int64) (bool, error) {
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM webhooks WHERE id = $1 AND (api_key = $2 OR api_key = '')`, id, apiKey)
 	if err != nil {
 		return false, fmt.Errorf("delete webhook: %w", err)
 	}
 	return tag.RowsAffected() != 0, nil
+}
+
+// RecordWebhookDelivery records one delivery attempt against its endpoint.
+// failure is empty for a successful delivery and the error text otherwise.
+func (s *Store) RecordWebhookDelivery(ctx context.Context, id int64, at time.Time, failure string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE webhooks SET
+		    deliveries = deliveries + 1,
+		    failures = failures + CASE WHEN $3 = '' THEN 0 ELSE 1 END,
+		    last_delivery_at = $2,
+		    last_delivery_status = CASE WHEN $3 = '' THEN 'delivered' ELSE 'failed' END,
+		    last_delivery_error = NULLIF($3, '')
+		WHERE id = $1`, id, at, failure)
+	if err != nil {
+		return fmt.Errorf("record webhook delivery: %w", err)
+	}
+	return nil
+}
+
+// ---- replay ---------------------------------------------------------------
+
+// ReplaySummary counts the events a replay processed, by type.
+//
+// Rows are keyed by event id, so the counts are what the replay handled, not
+// how many rows changed: running the same range twice reports the same numbers
+// and leaves the same state.
+type ReplaySummary struct {
+	Assets    int
+	Supplies  int
+	Reports   int
+	Reporters int
+	Revoked   int
+}
+
+// Total is the number of events in the summary.
+func (s ReplaySummary) Total() int {
+	return s.Assets + s.Supplies + s.Reports + s.Reporters + s.Revoked
+}
+
+// Add accumulates another summary.
+func (s *ReplaySummary) Add(other ReplaySummary) {
+	s.Assets += other.Assets
+	s.Supplies += other.Supplies
+	s.Reports += other.Reports
+	s.Reporters += other.Reporters
+	s.Revoked += other.Revoked
+}
+
+// SummarizeReplay counts the events a replay would apply, without touching the
+// database. It is what a dry run reports.
+func SummarizeReplay(events []any) ReplaySummary {
+	var summary ReplaySummary
+	for _, ev := range events {
+		switch ev.(type) {
+		case soroban.AssetListed:
+			summary.Assets++
+		case soroban.SupplyPosted:
+			summary.Supplies++
+		case soroban.ReservePosted:
+			summary.Reports++
+		case soroban.ReporterSet:
+			summary.Reporters++
+		case soroban.ReporterRevoked:
+			summary.Revoked++
+		}
+	}
+	return summary
+}
+
+// ApplyReplayEvents upserts decoded events in one transaction without moving
+// the ingest cursor, so a replay can run beside the normal ingest loop. Rows
+// are keyed by event id and reporter changes are only applied when they are
+// not older than what is stored, so replaying the same range twice produces
+// the same state and cannot overwrite newer data with older.
+func (s *Store) ApplyReplayEvents(ctx context.Context, events []any) (ReplaySummary, error) {
+	summary := SummarizeReplay(events)
+	if len(events) == 0 {
+		return summary, nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return summary, fmt.Errorf("begin replay: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, ev := range events {
+		if err := applyEvent(ctx, tx, ev); err != nil {
+			return summary, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return summary, fmt.Errorf("commit replay: %w", err)
+	}
+	return summary, nil
 }
 
 func mustBig(s string) *big.Int {

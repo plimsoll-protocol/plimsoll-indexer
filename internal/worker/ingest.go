@@ -3,6 +3,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -15,7 +16,12 @@ import (
 
 const (
 	cursorName = "plimsoll-events"
-	pageLimit  = 200
+
+	// reporterCursorName is the cursor of the registry watcher. It is separate
+	// from cursorName so the tight reporter loop and the main ingest loop do
+	// not move each other's position.
+	reporterCursorName = "reporters"
+	pageLimit          = 200
 )
 
 // eventSource is the RPC surface ingestion needs.
@@ -35,6 +41,9 @@ type Ingester struct {
 	RPC         eventSource
 	Store       eventStore
 	ContractIDs []string
+	// RegistryID is the reporter registry contract. RunReporters watches it
+	// alone, on its own cursor, so registrations are indexed promptly.
+	RegistryID  string
 	StartLedger uint32
 	Log         *slog.Logger
 }
@@ -102,6 +111,91 @@ func (in *Ingester) Run(ctx context.Context) error {
 			return nil
 		}
 	}
+}
+
+// RunReporters indexes reporter_set and reporter_revoked events from the
+// registry contract on their own cursor.
+//
+// The main ingest loop already stores these events, but only on
+// INGEST_INTERVAL (10s by default), which is two ledgers. A registration is
+// metadata, not history, so waiting for the periodic reconcile (15m) or even
+// another two ledgers is avoidable: this loop runs on REPORTER_INTERVAL (5s by
+// default, about one ledger), which puts a new reporter at /v1/reporters
+// within one ledger of registration. Writing the same event twice is
+// harmless: rows are keyed by event id and reporter changes are ordered by
+// ledger.
+func (in *Ingester) RunReporters(ctx context.Context) error {
+	if in.RegistryID == "" {
+		return errors.New("reporter registry id is not configured")
+	}
+	progress, err := in.Store.Progress(ctx, reporterCursorName)
+	if err != nil {
+		return fmt.Errorf("read reporter progress: %w", err)
+	}
+	cursor := progress.Cursor
+	recovered := false
+	for {
+		req := protocol.GetEventsRequest{
+			Filters: []protocol.EventFilter{{
+				EventType:   protocol.EventTypeSet{protocol.EventTypeContract: nil},
+				ContractIDs: []string{in.RegistryID},
+			}},
+			Pagination: &protocol.PaginationOptions{Limit: pageLimit},
+		}
+		if cursor != "" {
+			c, err := protocol.ParseCursor(cursor)
+			if err != nil {
+				return fmt.Errorf("parse reporter cursor %q: %w", cursor, err)
+			}
+			req.Pagination.Cursor = &c
+		} else {
+			start, err := in.startLedger(ctx)
+			if err != nil {
+				return err
+			}
+			req.StartLedger = start
+		}
+
+		resp, err := in.RPC.GetEvents(ctx, req)
+		if err != nil {
+			if cursor != "" && !recovered && outsideRetention(err) {
+				in.Log.Warn("reporter cursor is older than RPC retention; restarting from the oldest ledger RPC serves",
+					"cursor", cursor, "error", err)
+				cursor, recovered = "", true
+				continue
+			}
+			return fmt.Errorf("getEvents for reporters: %w", err)
+		}
+		decoded, err := decodePage(resp.Events)
+		if err != nil {
+			return err
+		}
+		events := reporterEvents(decoded)
+		if err := in.Store.ApplyEvents(ctx, reporterCursorName, resp.Cursor, resp.LatestLedger, events); err != nil {
+			return fmt.Errorf("apply reporter events: %w", err)
+		}
+		if len(events) > 0 {
+			in.Log.Info("indexed reporter events", "count", len(events), "latest_ledger", resp.LatestLedger)
+		}
+		cursor = resp.Cursor
+		if len(resp.Events) < pageLimit {
+			return nil
+		}
+	}
+}
+
+// reporterEvents keeps only the registry events the reporters table is built
+// from, so another event type on the same contract cannot move this cursor's
+// work along.
+func reporterEvents(events []any) []any {
+	out := make([]any, 0, len(events))
+	for _, ev := range events {
+		switch ev.(type) {
+		case soroban.ReporterSet, soroban.ReporterRevoked:
+			out = append(out, ev)
+		}
+	}
+	return out
 }
 
 // outsideRetention reports whether RPC refused the request because the ledger

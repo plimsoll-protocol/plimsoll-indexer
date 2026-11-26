@@ -21,6 +21,7 @@ import (
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/changelog"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/config"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/horizon"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/netclient"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/stellartoml"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
@@ -34,6 +35,9 @@ func main() {
 	}
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
 		os.Exit(runHealthcheck())
+	}
+	if len(os.Args) > 1 && os.Args[1] == "replay" {
+		os.Exit(runReplayCommand(os.Args[2:]))
 	}
 
 	cfg, err := config.Load()
@@ -58,9 +62,10 @@ func run(cfg config.Config, log *slog.Logger) error {
 	}
 	defer db.Close()
 
-	rpc := rpcclient.NewClient(cfg.RPCURL, &http.Client{Timeout: 30 * time.Second})
+	rpc := rpcclient.NewClient(cfg.RPCURL, netclient.New(30*time.Second, cfg.HTTPKeepAlive))
 	defer rpc.Close()
 	hz := horizon.NewClient(cfg.HorizonURL)
+	hz.HTTP = netclient.New(20*time.Second, cfg.HTTPKeepAlive)
 
 	var webhookCodec *webhook.SecretCodec
 	var webhookDispatcher *webhook.Dispatcher
@@ -76,6 +81,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 		RPC:         rpc,
 		Store:       db,
 		ContractIDs: []string{cfg.CoverageLedgerID, cfg.ReporterRegistryID},
+		RegistryID:  cfg.ReporterRegistryID,
 		StartLedger: cfg.StartLedger,
 		Log:         log.With("job", "ingest"),
 	}
@@ -84,6 +90,24 @@ func run(cfg config.Config, log *slog.Logger) error {
 		log.Error("initial ingest failed", "err", err)
 	}
 	go every(ctx, cfg.IngestInterval, log.With("job", "ingest"), ingester.Run)
+
+	// Reporter registrations get their own cursor and a shorter interval, so a
+	// new reporter reaches /v1/reporters within about one ledger instead of
+	// waiting for the next reconcile pass. It runs once here, like the main
+	// ingester, so a registration made while the process was down is indexed
+	// before the API starts answering.
+	reporterIngester := &worker.Ingester{
+		RPC:         rpc,
+		Store:       db,
+		ContractIDs: []string{cfg.ReporterRegistryID},
+		RegistryID:  cfg.ReporterRegistryID,
+		StartLedger: cfg.StartLedger,
+		Log:         log.With("job", "reporters"),
+	}
+	if err := reporterIngester.RunReporters(ctx); err != nil {
+		log.Error("initial reporter ingest failed", "err", err)
+	}
+	go every(ctx, cfg.ReporterInterval, log.With("job", "reporters"), reporterIngester.RunReporters)
 
 	// Repairs what an ingestion gap lost by reading contract state back.
 	// Reading is simulation, so this needs no key and runs even on an instance
@@ -148,7 +172,9 @@ func run(cfg config.Config, log *slog.Logger) error {
 		// Left nil when no second Horizon is configured: comparing hz against
 		// itself would always agree and prove nothing.
 		if cfg.HorizonCheckURL != "" {
-			poster.HorizonCheck = horizon.NewClient(cfg.HorizonCheckURL)
+			check := horizon.NewClient(cfg.HorizonCheckURL)
+			check.HTTP = netclient.New(20*time.Second, cfg.HTTPKeepAlive)
+			poster.HorizonCheck = check
 			log.Info("supply cross-check enabled", "check_horizon", cfg.HorizonCheckURL)
 		} else {
 			log.Info("supply cross-check disabled (HORIZON_CHECK_URL not set)")

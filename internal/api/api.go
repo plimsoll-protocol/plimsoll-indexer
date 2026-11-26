@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -65,10 +66,13 @@ type Server struct {
 	Changelog []changelog.Entry
 }
 
+// WebhookManager manages the endpoints of one API key. apiKey is the
+// fingerprint of the bearer token that made the request, so a key can only
+// list and delete its own endpoints.
 type WebhookManager interface {
-	CreateWebhook(context.Context, string, string, []byte) (store.Webhook, error)
-	ListWebhooks(context.Context) ([]store.Webhook, error)
-	DeleteWebhook(context.Context, int64) (bool, error)
+	CreateWebhook(ctx context.Context, apiKey, url, secretHash string, ciphertext []byte) (store.Webhook, error)
+	ListWebhooks(ctx context.Context, apiKey string) ([]store.Webhook, error)
+	DeleteWebhook(ctx context.Context, apiKey string, id int64) (bool, error)
 }
 
 func (s *Server) Handler() http.Handler {
@@ -133,9 +137,20 @@ type reporterJSON struct {
 }
 
 type webhookJSON struct {
-	ID        int64     `json:"id"`
-	URL       string    `json:"url"`
-	CreatedAt time.Time `json:"created_at"`
+	ID        int64        `json:"id"`
+	URL       string       `json:"url"`
+	CreatedAt time.Time    `json:"created_at"`
+	Delivery  deliveryJSON `json:"delivery"`
+}
+
+// deliveryJSON is the per-endpoint delivery state. Events fan out to every
+// endpoint, so each one succeeds or fails on its own.
+type deliveryJSON struct {
+	Deliveries int64      `json:"deliveries"`
+	Failures   int64      `json:"failures"`
+	LastAt     *time.Time `json:"last_at"`
+	LastStatus string     `json:"last_status,omitempty"`
+	LastError  string     `json:"last_error,omitempty"`
 }
 
 type createdWebhookJSON struct {
@@ -152,6 +167,21 @@ func toSupply(sp *coverage.Supply) *supplyJSON {
 
 func toReport(r coverage.Report) *reportJSON {
 	return &reportJSON{Tier: coverage.TierName(r.Tier), Amount: r.Amount.String(), Report: r}
+}
+
+func toWebhookJSON(w store.Webhook) webhookJSON {
+	return webhookJSON{
+		ID:        w.ID,
+		URL:       w.URL,
+		CreatedAt: w.CreatedAt,
+		Delivery: deliveryJSON{
+			Deliveries: w.Deliveries,
+			Failures:   w.Failures,
+			LastAt:     w.LastDeliveryAt,
+			LastStatus: w.LastDeliveryStatus,
+			LastError:  w.LastDeliveryError,
+		},
+	}
 }
 
 func (s *Server) toCoverage(r *coverage.Result) *coverageJSON {
@@ -403,7 +433,11 @@ func (s *Server) breakdown(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) createWebhook(w http.ResponseWriter, r *http.Request) {
-	if !s.webhookConfigured(w) || !s.authorizeWebhookAdmin(w, r) {
+	if !s.webhookConfigured(w) {
+		return
+	}
+	apiKey, ok := s.authorizeWebhookAdmin(w, r)
+	if !ok {
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 4097))
@@ -439,35 +473,49 @@ func (s *Server) createWebhook(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	created, err := s.WebhookStore.CreateWebhook(r.Context(), input.URL, webhook.SecretHash(secret), ciphertext)
+	created, err := s.WebhookStore.CreateWebhook(r.Context(), apiKey, input.URL, webhook.SecretHash(secret), ciphertext)
+	if errors.Is(err, store.ErrWebhookLimit) {
+		writeErrorDetails(w, http.StatusUnprocessableEntity, codeWebhookLimitReached,
+			fmt.Sprintf("an API key may register at most %d webhook endpoints", store.MaxWebhooksPerKey),
+			map[string]any{"limit": store.MaxWebhooksPerKey})
+		return
+	}
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, createdWebhookJSON{
-		webhookJSON: webhookJSON{ID: created.ID, URL: created.URL, CreatedAt: created.CreatedAt},
+		webhookJSON: toWebhookJSON(created),
 		Secret:      secret,
 	})
 }
 
 func (s *Server) listWebhooks(w http.ResponseWriter, r *http.Request) {
-	if !s.webhookConfigured(w) || !s.authorizeWebhookAdmin(w, r) {
+	if !s.webhookConfigured(w) {
 		return
 	}
-	webhooks, err := s.WebhookStore.ListWebhooks(r.Context())
+	apiKey, ok := s.authorizeWebhookAdmin(w, r)
+	if !ok {
+		return
+	}
+	webhooks, err := s.WebhookStore.ListWebhooks(r.Context(), apiKey)
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
 	out := make([]webhookJSON, 0, len(webhooks))
 	for _, item := range webhooks {
-		out = append(out, webhookJSON{ID: item.ID, URL: item.URL, CreatedAt: item.CreatedAt})
+		out = append(out, toWebhookJSON(item))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"webhooks": out})
 }
 
 func (s *Server) deleteWebhook(w http.ResponseWriter, r *http.Request) {
-	if !s.webhookConfigured(w) || !s.authorizeWebhookAdmin(w, r) {
+	if !s.webhookConfigured(w) {
+		return
+	}
+	apiKey, ok := s.authorizeWebhookAdmin(w, r)
+	if !ok {
 		return
 	}
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
@@ -476,7 +524,7 @@ func (s *Server) deleteWebhook(w http.ResponseWriter, r *http.Request) {
 			"webhook id must be a positive integer", map[string]any{"id": r.PathValue("id")})
 		return
 	}
-	deleted, err := s.WebhookStore.DeleteWebhook(r.Context(), id)
+	deleted, err := s.WebhookStore.DeleteWebhook(r.Context(), apiKey, id)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -496,14 +544,16 @@ func (s *Server) webhookConfigured(w http.ResponseWriter) bool {
 	return true
 }
 
-func (s *Server) authorizeWebhookAdmin(w http.ResponseWriter, r *http.Request) bool {
+// authorizeWebhookAdmin checks the bearer token and returns the key
+// fingerprint the request's endpoints are stored under.
+func (s *Server) authorizeWebhookAdmin(w http.ResponseWriter, r *http.Request) (string, bool) {
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if token == r.Header.Get("Authorization") || len(token) != len(s.WebhookAdminToken) ||
 		subtle.ConstantTimeCompare([]byte(token), []byte(s.WebhookAdminToken)) != 1 {
 		writeError(w, http.StatusUnauthorized, codeUnauthorized, "unauthorized")
-		return false
+		return "", false
 	}
-	return true
+	return webhook.KeyID(token), true
 }
 
 // ---- helpers --------------------------------------------------------------
@@ -629,6 +679,7 @@ const (
 	codeInvalidWebhookURL     = "invalid_webhook_url"
 	codeInvalidWebhookID      = "invalid_webhook_id"
 	codeWebhookNotFound       = "webhook_not_found"
+	codeWebhookLimitReached   = "webhook_limit_reached"
 	codeWebhooksNotConfigured = "webhooks_not_configured"
 	codeUnauthorized          = "unauthorized"
 	codeInternal              = "internal_error"

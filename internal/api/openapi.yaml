@@ -295,8 +295,13 @@ paths:
                   - changelog
   /v1/webhooks:
     post:
-      summary: Register an issuer TOML change webhook
+      summary: Register an issuer TOML change webhook endpoint
       operationId: createWebhook
+      description: >-
+        Registers one HTTPS endpoint for the authenticated API key. A key may
+        register up to 10 endpoints; every event is delivered to all of them.
+        The signing secret is shown only in this response. Endpoints created
+        before endpoints were keyed remain visible to every key.
       security:
         - WebhookAdminAuth: []
       requestBody:
@@ -330,6 +335,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: The key already has 10 registered endpoints
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '503':
           description: Webhook management is not configured
           content:
@@ -337,7 +348,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
     get:
-      summary: List registered webhooks without their secrets
+      summary: List the authenticated key's webhooks and their delivery state
       operationId: listWebhooks
       security:
         - WebhookAdminAuth: []
@@ -691,7 +702,34 @@ components:
         created_at:
           type: string
           format: date-time
-      required: [id, url, created_at]
+        delivery:
+          $ref: '#/components/schemas/WebhookDelivery'
+      required: [id, url, created_at, delivery]
+    WebhookDelivery:
+      type: object
+      description: Delivery state for one endpoint. Events fan out to every endpoint, so each succeeds or fails on its own.
+      properties:
+        deliveries:
+          type: integer
+          description: Total delivery attempts recorded for this endpoint.
+          example: 12
+        failures:
+          type: integer
+          description: Attempts that did not receive a 2xx response.
+          example: 1
+        last_at:
+          type: [string, "null"]
+          format: date-time
+          example: "2026-11-26T09:00:00Z"
+        last_status:
+          type: string
+          enum: [delivered, failed]
+          example: failed
+        last_error:
+          type: string
+          description: Why the last attempt failed; omitted after a success.
+          example: webhook returned status 500
+      required: [deliveries, failures, last_at]
     CreatedWebhook:
       allOf:
         - $ref: '#/components/schemas/Webhook'
@@ -715,8 +753,8 @@ components:
             asset_not_listed, invalid_breakdown_hash, breakdown_not_found,
             invalid_min_tier, invalid_limit, invalid_body,
             invalid_webhook_url, invalid_webhook_id, webhook_not_found,
-            webhooks_not_configured, unauthorized, internal_error,
-            db_unavailable and progress_unavailable. The router uses
+            webhook_limit_reached, webhooks_not_configured, unauthorized,
+            internal_error, db_unavailable and progress_unavailable. The router uses
             not_found, method_not_allowed and internal_error.
           example: asset_not_listed
         message:

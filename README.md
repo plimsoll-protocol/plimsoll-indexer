@@ -13,12 +13,13 @@
 # Plimsoll indexer
 
 The off-chain half of [Plimsoll](https://github.com/plimsoll-protocol/plimsoll-contracts).
-One Go binary with four jobs and an HTTP API:
+One Go binary with five jobs and an HTTP API:
 
 | Job | What it does |
 | --- | --- |
 | **Supply poster** | For every listed asset, sums Horizon's per-bucket holdings (trustlines in every auth state, claimable balances, liquidity pools, contract balances) and calls `post_supply` on the coverage ledger with the total and the SHA-256 of the breakdown. Posts when supply changes, or every `REPOST_AFTER` so freshness checks keep passing. Whether a post is due is read from the coverage ledger itself, so a stalled event ingest cannot make it repost on every tick. |
 | **Event ingester** | Reads `asset_listed`, `supply_posted`, `reserve_posted`, `reporter_set` and `reporter_revoked` from Soroban RPC into Postgres, keeping history past RPC's ~7-day retention. |
+| **Reporter watcher** | Reads `reporter_set` and `reporter_revoked` from the registry contract on its own cursor every `REPORTER_INTERVAL` (5s, about one ledger), so a new registration appears at `/v1/reporters` immediately instead of waiting for the next ingest or reconcile pass. |
 | **State reconciler** | Reads each listed asset's `get_supply` and `get_report` back from the coverage ledger and stores anything newer than ingestion has. RPC serves only about seven days of events, so a longer ingestion gap cannot be repaired from events; the contracts always hold the latest figure. Recovered rows are marked `"source": "chain"` and carry no `tx_hash`. Reading is simulation, so it needs no key and runs even on an instance that cannot sign. |
 | **stellar.toml sync** | Resolves each issuer's `home_domain`, reads its SEP-1 `stellar.toml`, and stores the matching `[[CURRENCIES]]` entry, including `attestation_of_reserve`. Successful fetches are SHA-256 tracked per issuer; changes are logged and can be delivered to registered webhooks. |
 
@@ -54,6 +55,19 @@ go run ./cmd/plimsoll-indexer verify --sac <SAC_ADDRESS> [--indexer http://local
 
 The command fetches the asset's snapshot breakdown from the indexer, verifies the snapshot on-chain via Soroban RPC simulation (`get_supply`), checks its SHA-256 hash integrity, recomputes balances directly from Horizon, prints a formatted diff table, and exits `0` on match or `1` on mismatch. Network discovery is fetched automatically from `/v1/network`.
 
+### Replaying a ledger range
+
+Re-ingest a range without deleting anything. Rows are keyed by event id, so the
+command is idempotent and leaves the ingest cursor where it was; run it beside
+a live indexer.
+
+```bash
+go run ./cmd/plimsoll-indexer replay --from 5034380 --to 5035000 [--dry-run]
+```
+
+`--dry-run` logs what the range contains without writing to the database, and
+needs no database connection at all. Progress is logged every 1 000 ledgers.
+
 ## API
 
 | Method and path | Returns |
@@ -68,7 +82,7 @@ The command fetches the asset's snapshot breakdown from the indexer, verifies th
 | `GET /v1/reporters` | Active registered reporters |
 | `GET /v1/changelog` | Breaking API changes per released version, newest first |
 | `GET /v1/breakdowns/{hash}` | Exact bytes of a supply breakdown |
-| `POST /v1/webhooks`, `GET /v1/webhooks`, `DELETE /v1/webhooks/{id}` | Manage authenticated issuer TOML change subscriptions |
+| `POST /v1/webhooks`, `GET /v1/webhooks`, `DELETE /v1/webhooks/{id}` | Manage authenticated issuer TOML change subscriptions. One API key may register up to 10 endpoints; every event fans out to all of them, and `GET /v1/webhooks` reports delivery state per endpoint. |
 
 Every `4xx` and `5xx` response has the same body:
 `{"code":"asset_not_listed","message":"…"}`, with an optional `details` object.
