@@ -118,6 +118,7 @@ Logs are JSON (`log/slog`). Key messages:
 | warn | `supply not cross-checked: horizons are at different ledgers` | Ledger skew after a retry. Posting continues. Frequent occurrences mean the two Horizons lag each other. |
 | warn | `ingest cursor is older than RPC retention...` | Ingestion was down longer than RPC's ~7 days. Events in the gap are gone from RPC; the reconciler repairs the latest state. |
 | warn | `start ledger is outside RPC retention` | `START_LEDGER` is too old and was clamped. |
+| warn | `rpc node is rate limiting; backing off` (`attempt`, `wait`) | The RPC node answered `429 Too Many Requests`. The request is retried after `Retry-After` when the node sends it, otherwise after a delay that doubles per attempt. Frequent entries mean the node's limit is too low for the ingest interval. |
 | warn | `recovered a supply snapshot / reserve report from contract state...` | The reconciler filled a gap. Rows are marked `"source": "chain"` with no `tx_hash`. |
 | info | `supply posting disabled (SUPPLY_POSTER_SECRET not set)` | Expected on read-only instances. |
 | info | `supply cross-check disabled (HORIZON_CHECK_URL not set)` | The poster signs on one Horizon's word. |
