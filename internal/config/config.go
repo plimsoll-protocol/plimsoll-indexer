@@ -64,6 +64,22 @@ type Config struct {
 	WebhookEncryptionKey string
 	SlackWebhookURL      string
 	DiscordWebhookURL    string
+	HorizonCheckURL    string
+	NetworkPassphrase  string
+	CoverageLedgerID   string
+	ReporterRegistryID string
+	StartLedger        uint32
+	PosterSecret       string
+	// WebhookAdminToken protects webhook administration. It is shared by
+	// issuer TOML change subscriptions and coverage alerts.
+	WebhookAdminToken string
+	// WebhookEncryptionKey encrypts the per-subscription secrets of issuer
+	// TOML change webhooks at rest; WebhookSigningSecret keys the HMAC-SHA256
+	// signature on coverage alert deliveries. Each enables its own feature and
+	// needs WebhookAdminToken.
+	WebhookEncryptionKey string
+	WebhookSigningSecret string
+	WebhookInterval      time.Duration
 	IngestInterval       time.Duration
 	PostInterval         time.Duration
 	// ReconcileInterval is how often contract state is read back to repair
@@ -123,6 +139,7 @@ func Load() (Config, error) {
 		WebhookEncryptionKey: os.Getenv("WEBHOOK_ENCRYPTION_KEY"),
 		SlackWebhookURL:      os.Getenv("SLACK_WEBHOOK_URL"),
 		DiscordWebhookURL:    os.Getenv("DISCORD_WEBHOOK_URL"),
+		WebhookSigningSecret: os.Getenv("WEBHOOK_SIGNING_SECRET"),
 		LogLevel:             envOr("LOG_LEVEL", "info"),
 		IngestWorkers:        2,
 		KeepAwakeURL:         keepAwakeURL(os.Getenv("KEEP_AWAKE_URL"), os.Getenv("RENDER_EXTERNAL_URL")),
@@ -148,11 +165,18 @@ func Load() (Config, error) {
 	if c.ReporterRegistryID == "" {
 		errs = append(errs, errors.New("REPORTER_REGISTRY_ID is required"))
 	}
-	if (c.WebhookAdminToken == "") != (c.WebhookEncryptionKey == "") {
+	// A key without the admin token could never be used, and a token with no
+	// key registers nothing, so refuse both half-configurations.
+	if c.WebhookEncryptionKey != "" && c.WebhookAdminToken == "" {
 		errs = append(errs, errors.New("WEBHOOK_ADMIN_TOKEN and WEBHOOK_ENCRYPTION_KEY must be configured together"))
 	}
 	if len(c.WebhookAPIKeys) > 0 && c.WebhookAdminToken == "" {
 		errs = append(errs, errors.New("WEBHOOK_API_KEYS requires WEBHOOK_ADMIN_TOKEN and WEBHOOK_ENCRYPTION_KEY"))
+	if c.WebhookSigningSecret != "" && c.WebhookAdminToken == "" {
+		errs = append(errs, errors.New("WEBHOOK_ADMIN_TOKEN and WEBHOOK_SIGNING_SECRET must be configured together"))
+	}
+	if c.WebhookAdminToken != "" && c.WebhookEncryptionKey == "" && c.WebhookSigningSecret == "" {
+		errs = append(errs, errors.New("WEBHOOK_ADMIN_TOKEN is set but neither WEBHOOK_ENCRYPTION_KEY nor WEBHOOK_SIGNING_SECRET is configured"))
 	}
 	if c.WebhookEncryptionKey != "" {
 		key, err := base64.StdEncoding.DecodeString(c.WebhookEncryptionKey)
@@ -184,6 +208,7 @@ func Load() (Config, error) {
 		{"RECONCILE_INTERVAL", "15m", &c.ReconcileInterval},
 		{"REPOST_AFTER", "6h", &c.RepostAfter},
 		{"TOML_INTERVAL", "6h", &c.TomlInterval},
+		{"WEBHOOK_INTERVAL", "1m", &c.WebhookInterval},
 		{"KEEP_AWAKE_INTERVAL", "10m", &c.KeepAwakeInterval},
 	}
 	for _, d := range durations {

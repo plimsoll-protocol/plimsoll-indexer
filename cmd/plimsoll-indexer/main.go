@@ -77,7 +77,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 
 	var webhookCodec *webhook.SecretCodec
 	var webhookDispatcher *webhook.Dispatcher
-	if cfg.WebhookAdminToken != "" {
+	if cfg.WebhookEncryptionKey != "" {
 		webhookCodec, err = webhook.NewSecretCodec(cfg.WebhookEncryptionKey)
 		if err != nil {
 			return err
@@ -114,15 +114,26 @@ func run(cfg config.Config, log *slog.Logger) error {
 	go every(ctx, cfg.ReconcileInterval, log.With("job", "reconcile"), reconciler.Run)
 
 	tomlSync := &worker.TomlSync{
-		Horizon:  hz,
-		Fetcher:  stellartoml.NewFetcher(),
-		Store:    db,
-		Webhooks: webhookDispatcher,
-		MaxAge:   cfg.TomlInterval,
-		Log:      log.With("job", "toml"),
+		Horizon:     hz,
+		Fetcher:     stellartoml.NewFetcher(),
+		Store:       db,
+		Webhooks:    webhookDispatcher,
+		Attestation: stellartoml.NewDocumentFetcher(),
+		MaxAge:      cfg.TomlInterval,
+		Log:         log.With("job", "toml"),
 	}
 	// Checks every minute; each asset is refreshed once per TOML_INTERVAL.
 	go every(ctx, time.Minute, log.With("job", "toml"), tomlSync.Run)
+
+	if cfg.WebhookSigningSecret != "" {
+		notifier := &worker.WebhookNotifier{
+			Store:  db,
+			Secret: cfg.WebhookSigningSecret,
+			Log:    log.With("job", "webhooks"),
+			Now:    time.Now,
+		}
+		go every(ctx, cfg.WebhookInterval, log.With("job", "webhooks"), notifier.Run)
+	}
 
 	if cfg.KeepAwakeURL != "" {
 		keepAwake := worker.NewKeepAwake(cfg.KeepAwakeURL)
@@ -196,10 +207,12 @@ func run(cfg config.Config, log *slog.Logger) error {
 				CoverageLedgerID:   cfg.CoverageLedgerID,
 				ReporterRegistryID: cfg.ReporterRegistryID,
 			},
-			CORS:      cfg.CORSOrigins,
-			Log:       log.With("component", "api"),
-			Now:       time.Now,
-			Changelog: changes,
+			CoverageWebhooks:     db,
+			WebhookSigningSecret: cfg.WebhookSigningSecret,
+			CORS:                 cfg.CORSOrigins,
+			Log:                  log.With("component", "api"),
+			Now:                  time.Now,
+			Changelog:            changes,
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second, // Bounds the time clients can spend sending request bodies.

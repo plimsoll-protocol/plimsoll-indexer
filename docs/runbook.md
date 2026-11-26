@@ -40,6 +40,10 @@ values are reported together at startup.
 | `WEBHOOK_ADMIN_TOKEN` | empty | Enables authenticated webhook management when set with `WEBHOOK_ENCRYPTION_KEY`. |
 | `WEBHOOK_API_KEYS` | empty | Optional comma-separated owner API keys; each can delete only its own webhooks. |
 | `WEBHOOK_ENCRYPTION_KEY` | empty | Base64-encoded 32-byte key (`openssl rand -base64 32`); keep stable to preserve webhook delivery. |
+
+| `WEBHOOK_ADMIN_TOKEN` | empty | Enables authenticated webhook management for both the issuer TOML subscriptions and the coverage alerts. |
+| `WEBHOOK_ENCRYPTION_KEY` | empty | Base64-encoded 32-byte key (`openssl rand -base64 32`) for TOML subscription secrets; keep stable to preserve webhook delivery. |
+| `WEBHOOK_SIGNING_SECRET` | empty | HMAC-SHA256 key for coverage alert deliveries; needs `WEBHOOK_ADMIN_TOKEN`. |
 | `PORT` | `8080` | |
 | `CORS_ORIGINS` | `*` | Comma separated. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. Logs are JSON on stdout. |

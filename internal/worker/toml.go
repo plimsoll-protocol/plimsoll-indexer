@@ -23,10 +23,17 @@ type tomlStore interface {
 	ListAssets(context.Context) ([]coverage.Asset, error)
 	SaveToml(context.Context, string, []byte, string, time.Time) error
 	SaveIssuerTomlSnapshot(context.Context, string, string, string, time.Time) (string, bool, error)
+	RecordAttestation(context.Context, string, string, string, time.Time) error
 }
 
 type tomlChangeNotifier interface {
 	TOMLChanged(context.Context, string, string, string, string) error
+}
+
+// attestationFetcher downloads and hashes the document an issuer lists under
+// attestation_of_reserve.
+type attestationFetcher interface {
+	Fetch(context.Context, string) (string, error)
 }
 
 // TomlSync records what each issuer's stellar.toml says about its asset,
@@ -36,6 +43,9 @@ type TomlSync struct {
 	Fetcher  tomlFetcher
 	Store    tomlStore
 	Webhooks tomlChangeNotifier
+	// Attestation fetches and hashes the issuer's attestation_of_reserve
+	// document. Nil disables the check.
+	Attestation attestationFetcher
 	// MaxAge is how long a lookup result is kept before it is refreshed.
 	MaxAge time.Duration
 	Log    *slog.Logger
@@ -89,9 +99,29 @@ func (t *TomlSync) Run(ctx context.Context) error {
 		}
 		if lookupErr != nil {
 			t.Log.Debug("stellar.toml lookup failed", "code", a.Code, "issuer", a.Issuer, "err", lookupErr)
+			continue
 		}
+		t.checkAttestation(ctx, a, info, now)
 	}
 	return nil
+}
+
+// checkAttestation records the hash of the document the issuer lists at
+// attestation_of_reserve. A fetch failure is logged and retried on the next
+// pass; it does not fail the sync or discard the stellar.toml that was read.
+func (t *TomlSync) checkAttestation(ctx context.Context, a coverage.Asset, info stellartoml.Info, now time.Time) {
+	if t.Attestation == nil || info.Currency == nil || info.Currency.AttestationOfReserve == "" {
+		return
+	}
+	uri := info.Currency.AttestationOfReserve
+	hash, err := t.Attestation.Fetch(ctx, uri)
+	if err != nil {
+		t.Log.Debug("attestation document fetch failed", "code", a.Code, "issuer", a.Issuer, "uri", uri, "err", err)
+		return
+	}
+	if err := t.Store.RecordAttestation(ctx, a.SAC, uri, hash, now); err != nil {
+		t.Log.Error("record attestation document", "code", a.Code, "sac", a.SAC, "err", err)
+	}
 }
 
 func (t *TomlSync) lookup(ctx context.Context, code, issuer string) (stellartoml.Info, string, error) {

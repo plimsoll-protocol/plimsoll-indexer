@@ -61,7 +61,7 @@ func TestKeepAwakeURL(t *testing.T) {
 
 func setBase(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"NETWORK", "STELLAR_RPC_URL", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE", "WEBHOOK_ADMIN_TOKEN", "WEBHOOK_API_KEYS", "WEBHOOK_ENCRYPTION_KEY"} {
+	for _, k := range []string{"NETWORK", "STELLAR_RPC_URL", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE", "WEBHOOK_ADMIN_TOKEN", "WEBHOOK_API_KEYS", "WEBHOOK_ENCRYPTION_KEY", "WEBHOOK_SIGNING_SECRET"} {
 		t.Setenv(k, "")
 	}
 	t.Setenv("DATABASE_URL", "postgres://x")
@@ -72,8 +72,8 @@ func setBase(t *testing.T) {
 func TestWebhookConfigurationMustBeComplete(t *testing.T) {
 	setBase(t)
 	t.Setenv("WEBHOOK_ADMIN_TOKEN", "admin")
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "must be configured together") {
-		t.Fatalf("want paired webhook configuration error, got %v", err)
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "neither WEBHOOK_ENCRYPTION_KEY nor WEBHOOK_SIGNING_SECRET") {
+		t.Fatalf("want an unusable admin token error, got %v", err)
 	}
 
 	setBase(t)
@@ -300,6 +300,7 @@ func TestLoadBadDurations(t *testing.T) {
 		"RECONCILE_INTERVAL",
 		"REPOST_AFTER",
 		"TOML_INTERVAL",
+		"WEBHOOK_INTERVAL",
 		"KEEP_AWAKE_INTERVAL",
 	}
 	for _, v := range durationVars {
@@ -314,6 +315,41 @@ func TestLoadBadDurations(t *testing.T) {
 				t.Errorf("error = %q, want it to mention %q", err.Error(), v)
 			}
 		})
+	}
+}
+
+// TestWebhookConfig checks that the admin token and signing secret are only
+// accepted together, and that the notifier interval has a default.
+func TestWebhookConfig(t *testing.T) {
+	setBase(t)
+	t.Setenv("WEBHOOK_ADMIN_TOKEN", "token")
+	t.Setenv("WEBHOOK_SIGNING_SECRET", "")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "neither WEBHOOK_ENCRYPTION_KEY nor WEBHOOK_SIGNING_SECRET") {
+		t.Fatalf("want a half-configured webhook error, got %v", err)
+	}
+
+	t.Setenv("WEBHOOK_ADMIN_TOKEN", "")
+	t.Setenv("WEBHOOK_SIGNING_SECRET", "secret")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "WEBHOOK_ADMIN_TOKEN and WEBHOOK_SIGNING_SECRET") {
+		t.Fatalf("want a half-configured webhook error, got %v", err)
+	}
+
+	t.Setenv("WEBHOOK_ADMIN_TOKEN", "token")
+	t.Setenv("WEBHOOK_SIGNING_SECRET", "secret")
+	got, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.WebhookAdminToken != "token" || got.WebhookSigningSecret != "secret" {
+		t.Errorf("webhook config: %+v", got)
+	}
+	// A signing secret alone is a complete coverage-alert setup: it does not
+	// need the encryption key that TOML change subscriptions use.
+	if got.WebhookEncryptionKey != "" {
+		t.Errorf("WebhookEncryptionKey = %q, want empty", got.WebhookEncryptionKey)
+	}
+	if got.WebhookInterval.String() != "1m0s" {
+		t.Errorf("WebhookInterval = %v, want 1m0s", got.WebhookInterval)
 	}
 }
 

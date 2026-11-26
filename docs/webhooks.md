@@ -79,3 +79,10 @@ An initial successful fetch establishes a baseline and does not produce a
 change event. A later successful fetch with a different hash is stored as a
 new issuer snapshot, logged as `issuer stellar.toml changed`, and delivered to
 each registered destination.
+## Coverage alerts
+
+This guide covers issuer TOML change subscriptions at `/v1/webhooks`. Coverage
+threshold alerts are a separate feature with their own routes
+(`/v1/coverage-webhooks`), table (`coverage_webhooks`) and shared signing secret
+(`WEBHOOK_SIGNING_SECRET`); see the "Coverage alerts" section of the
+[README](../README.md) for the request body, payload and signature header.

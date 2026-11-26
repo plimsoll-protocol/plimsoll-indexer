@@ -11,11 +11,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
 	"mime"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -44,8 +46,15 @@ type Reader interface {
 	ReportExportPage(ctx context.Context, sac string, from, to *time.Time, after *store.ReportExportCursor, limit int) ([]store.ReportExportRow, error)
 	Reporters(ctx context.Context) ([]coverage.Reporter, error)
 	Breakdown(ctx context.Context, hash string) ([]byte, error)
+	Attestation(ctx context.Context, sac string) (store.Attestation, error)
 	Progress(ctx context.Context, name string) (store.Progress, error)
 }
+
+// CoverageWebhookStore is what the API needs to manage coverage threshold
+// registrations.
+type CoverageWebhookStore interface {
+	CreateCoverageWebhook(ctx context.Context, w coverage.Webhook) (coverage.Webhook, error)
+	DeleteCoverageWebhook(ctx context.Context, id int64) error
 
 type assetPageReader interface {
 	ListAssetsPage(ctx context.Context, limit int, afterCode, afterIssuer string) ([]coverage.Asset, error)
@@ -67,15 +76,26 @@ type NetworkInfo struct {
 }
 
 type Server struct {
-	Store             Reader
+	Store   Reader
+	Network NetworkInfo
+	CORS    []string
+	Log     *slog.Logger
+	Now     func() time.Time
+
+	// WebhookStore, WebhookCodec and WebhookAdminToken manage issuer TOML
+	// change subscriptions at /v1/webhooks. All three must be set; otherwise
+	// those endpoints answer 503.
 	WebhookStore      WebhookManager
 	WebhookAdminToken string
 	WebhookAPIKeys    []string
 	WebhookCodec      *webhook.SecretCodec
-	Network           NetworkInfo
-	CORS              []string
-	Log               *slog.Logger
-	Now               func() time.Time
+	WebhookAdminToken string
+
+	// CoverageWebhooks and WebhookSigningSecret enable coverage threshold
+	// alerts at /v1/coverage-webhooks, administered with the same token.
+	CoverageWebhooks     CoverageWebhookStore
+	WebhookSigningSecret string
+
 	// Changelog is the breaking-change history served at /v1/changelog. It is
 	// loaded from the hand-maintained CHANGELOG.yaml at start-up.
 	Changelog []changelog.Entry
@@ -105,6 +125,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/webhooks", s.createWebhook)
 	mux.HandleFunc("GET /v1/webhooks", s.listWebhooks)
 	mux.HandleFunc("DELETE /v1/webhooks/{id}", s.deleteWebhook)
+	mux.HandleFunc("POST /v1/coverage-webhooks", s.createCoverageWebhook)
+	mux.HandleFunc("DELETE /v1/coverage-webhooks/{id}", s.deleteCoverageWebhook)
 	return s.cors(errorEnvelope(mux))
 }
 
@@ -428,28 +450,53 @@ func (s *Server) assemble(ctx context.Context, a coverage.Asset, minTier uint32)
 	if err != nil {
 		return assetJSON{}, err
 	}
-	return s.assembleWithData(a, supplies[a.SAC], reportsBySAC[a.SAC], minTier), nil
-}
-
-func (s *Server) assembleWithData(a coverage.Asset, sp *coverage.Supply, reports map[uint32]coverage.Report, minTier uint32) assetJSON {
+	att, attErr := s.Store.Attestation(ctx, a.SAC)
+	if attErr != nil && !errors.Is(attErr, store.ErrNotFound) {
+		return assetJSON{}, attErr
+	}
+	tomlBody, err := withAttestation(a.Toml, att, attErr == nil)
+	if err != nil {
+		return assetJSON{}, err
+	}
 	out := assetJSON{
-		Asset:         a,
-		Toml:          json.RawMessage("null"),
-		TomlCheckedAt: a.TomlCheckedAt,
-		Supply:        toSupply(sp),
-		Reports:       map[string]*reportJSON{},
-		Coverage:      s.toCoverage(coverage.Compute(sp, reports, minTier)),
-	}
-	if a.TomlError != "" {
-		out.TomlError = &a.TomlError
-	}
-	if len(a.Toml) > 0 {
-		out.Toml = a.Toml
+		Asset:    a,
+		Toml:     tomlBody,
+		Supply:   toSupply(sp),
+		Reports:  map[string]*reportJSON{},
+		Coverage: s.toCoverage(coverage.Compute(sp, reports, minTier)),
 	}
 	for tier, rep := range reports {
 		out.Reports[coverage.TierName(tier)] = toReport(rep)
 	}
 	return out
+}
+
+// withAttestation adds the issuer's attestation document fields to the stored
+// SEP-1 object. The object is re-encoded, so its key order is that of
+// encoding/json; nothing else about it changes.
+func withAttestation(raw []byte, att store.Attestation, found bool) (json.RawMessage, error) {
+	if !found && len(raw) == 0 {
+		return json.RawMessage("null"), nil
+	}
+	obj := map[string]json.RawMessage{}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return nil, fmt.Errorf("decode stored stellar.toml: %w", err)
+		}
+	}
+	if found {
+		hash, _ := json.Marshal(att.Hash)
+		obj["attestation_hash"] = hash
+		if att.ChangedAt != nil {
+			changed, _ := json.Marshal(att.ChangedAt.UTC().Format(time.RFC3339))
+			obj["attestation_changed_at"] = changed
+		}
+	}
+	body, err := json.Marshal(obj)
+	if err != nil {
+		return nil, fmt.Errorf("encode asset toml: %w", err)
+	}
+	return body, nil
 }
 
 func (s *Server) supplyHistory(w http.ResponseWriter, r *http.Request) {
@@ -645,6 +692,8 @@ func (s *Server) breakdown(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
+// ---- webhooks -------------------------------------------------------------
+
 func (s *Server) createWebhook(w http.ResponseWriter, r *http.Request) {
 	if !s.webhookConfigured(w) {
 		return
@@ -792,6 +841,102 @@ func sameToken(token, expected string) bool {
 func webhookAPIKeyHash(key string) string {
 	sum := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum[:])
+
+// ---- coverage webhooks ----------------------------------------------------
+
+// coverageWebhookRequest is the body of POST /v1/coverage-webhooks.
+type coverageWebhookRequest struct {
+	URL     string `json:"url"`
+	SAC     string `json:"sac"`
+	MinBps  uint32 `json:"min_bps"`
+	MinTier uint32 `json:"min_tier"`
+}
+
+func (s *Server) createCoverageWebhook(w http.ResponseWriter, r *http.Request) {
+	if !s.requireCoverageAdmin(w, r) {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req coverageWebhookRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, codeInvalidBody, "body must be a JSON object")
+		return
+	}
+	req.URL = strings.TrimSpace(req.URL)
+	if code, msg := validateCoverageWebhook(req); code != "" {
+		writeError(w, http.StatusBadRequest, code, msg)
+		return
+	}
+	wh, err := s.CoverageWebhooks.CreateCoverageWebhook(r.Context(), coverage.Webhook{
+		URL: req.URL, SAC: req.SAC, MinBps: req.MinBps, MinTier: req.MinTier,
+	})
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, wh)
+}
+
+func (s *Server) deleteCoverageWebhook(w http.ResponseWriter, r *http.Request) {
+	if !s.requireCoverageAdmin(w, r) {
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeErrorDetails(w, http.StatusBadRequest, codeInvalidWebhookID,
+			"webhook id must be a positive integer", map[string]any{"id": r.PathValue("id")})
+		return
+	}
+	err = s.CoverageWebhooks.DeleteCoverageWebhook(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, codeWebhookNotFound, "webhook not found")
+		return
+	}
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// requireCoverageAdmin checks the bearer token on coverage alert
+// administration requests. It writes the response itself and returns false
+// when the request is refused.
+func (s *Server) requireCoverageAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if s.WebhookAdminToken == "" || s.CoverageWebhooks == nil || s.WebhookSigningSecret == "" {
+		writeError(w, http.StatusServiceUnavailable, codeWebhooksNotConfigured, "coverage webhook administration is disabled")
+		return false
+	}
+	const prefix = "Bearer "
+	token := ""
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, prefix) {
+		token = strings.TrimSpace(auth[len(prefix):])
+	}
+	if subtle.ConstantTimeCompare([]byte(token), []byte(s.WebhookAdminToken)) != 1 {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeError(w, http.StatusUnauthorized, codeUnauthorized, "invalid admin token")
+		return false
+	}
+	return true
+}
+
+// validateCoverageWebhook returns an error code and message, both empty when
+// the request is valid.
+func validateCoverageWebhook(req coverageWebhookRequest) (code, msg string) {
+	u, err := url.Parse(req.URL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return codeInvalidWebhookURL, "url must be an absolute http or https URL"
+	}
+	if req.SAC == "" {
+		return codeInvalidSAC, "sac is required"
+	}
+	if req.MinBps < 1 || req.MinBps > 10_000 {
+		return codeInvalidBody, "min_bps must be between 1 and 10000"
+	}
+	if req.MinTier < 1 || req.MinTier > 3 {
+		return codeInvalidBody, "min_tier must be 1, 2 or 3"
+	}
+	return "", ""
 }
 
 // ---- helpers --------------------------------------------------------------
