@@ -60,11 +60,12 @@ The command fetches the asset's snapshot breakdown from the indexer, verifies th
 | --- | --- |
 | `GET /healthz` | `{status, ingested_to_ledger, last_event_ledger, last_event_at, last_event_age_seconds}` |
 | `GET /v1/network` | Contract ids, RPC and Horizon URLs |
-| `GET /v1/assets?min_tier=1` | Every asset with latest supply, latest report per tier, coverage and stellar.toml data |
+| `GET /v1/assets?limit=50&cursor=<opaque>&min_tier=1` | Paginated assets (default limit 50, maximum 200) with latest supply, latest report per tier, coverage and stellar.toml data. Responses include `next_cursor` while another page exists. |
 | `GET /v1/assets/{sac}?min_tier=1` | One asset, same shape |
 | `HEAD /v1/assets/{sac}` | Status only, no response body: `200` if the asset is listed, `404` if not |
 | `GET /v1/assets/{sac}/supply?limit=100` | Supply snapshot history. Each row carries `source`: `event` for a figure decoded from a contract event, with the `tx_hash` that produced it, or `chain` for one recovered from contract state after an ingestion gap, where `tx_hash` is empty. |
 | `GET /v1/assets/{sac}/reports?limit=100` | Reserve report history |
+| `GET /v1/assets/{sac}/coverage/now` | The `bps`, `tier`, `as_of` and `reporter` of the live report `coverage()` selects, without the asset document. `404` when no live report exists |
 | `GET /v1/reporters` | Active registered reporters |
 | `GET /v1/changelog` | Breaking API changes per released version, newest first |
 | `GET /v1/breakdowns/{hash}` | Exact bytes of a supply breakdown |
@@ -102,6 +103,10 @@ go run ./cmd/plimsoll-indexer
 curl localhost:8080/v1/assets
 ```
 
+To override any value locally, put it in `.env.local` in the repository root.
+The indexer loads that file automatically, after the shell has exported `.env`,
+and skips it entirely when `GO_ENV=production`.
+
 Leave `SUPPLY_POSTER_SECRET` empty to run read-only. To post supply, use the
 secret of an account registered in the reporter registry with the
 `SupplyPoster` role.
@@ -113,7 +118,9 @@ go test ./...
 ## Configuration
 
 Every variable is documented in [.env.example](.env.example). Required:
-`DATABASE_URL`, `COVERAGE_LEDGER_ID`, `REPORTER_REGISTRY_ID`.
+`DATABASE_URL`, `COVERAGE_LEDGER_ID`, `REPORTER_REGISTRY_ID`. A `.env.local`
+file in the working directory is applied over the environment (see
+[Quick start](#quick-start)); set `GO_ENV=production` to disable it.
 
 `NETWORK` selects a preset (`testnet`, the default, `mainnet` or `standalone`)
 that supplies defaults for `STELLAR_RPC_URL`, `HORIZON_URL` and
@@ -157,14 +164,10 @@ plimsoll-indexer healthcheck
 
 ## Deploying
 
-[render.yaml](render.yaml) defines a Render web service plus a Postgres
-database in the same region, connected over the internal URL. Set
-`SUPPLY_POSTER_SECRET` in the Render dashboard; it is never committed.
-
-On Render the indexer requests its own `/healthz` every 10 minutes
-(`KEEP_AWAKE_URL`, derived from `RENDER_EXTERNAL_URL`), so the free tier does
-not put it to sleep and supply posting keeps running. One always-on service
-uses about 744 of the free tier's 750 monthly instance hours.
+[Deployment guide](docs/deploy.md) covers Docker, required configuration,
+Postgres provisioning, Render and Railway setup, and safe secret management.
+The [Render blueprint](render.yaml) provisions a web service and Postgres
+database and can be launched with the one-click button in the guide.
 
 [.github/workflows/keepalive.yml](.github/workflows/keepalive.yml) watches the
 deployment from outside: it wakes the service, fails if nothing has been

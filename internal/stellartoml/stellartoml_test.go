@@ -52,6 +52,56 @@ func TestParseFindsMatchingCurrency(t *testing.T) {
 	}
 }
 
+// A stellar.toml can list usdc and USDC from the same issuer; they are different
+// assets. Matching case-insensitively could attach one's reserve attestation to
+// the other, and disagreed with the SDK's exact findCurrency.
+const casePair = `
+[[CURRENCIES]]
+code = "usdc"
+issuer = "GISSUER"
+name = "lowercase"
+attestation_of_reserve = "https://example.money/reserves/lower.pdf"
+
+[[CURRENCIES]]
+code = "USDC"
+issuer = "GISSUER"
+name = "uppercase"
+attestation_of_reserve = "https://example.money/reserves/upper.pdf"
+`
+
+func TestParseMatchesCurrencyCodeExactly(t *testing.T) {
+	for code, want := range map[string]string{
+		"USDC": "https://example.money/reserves/upper.pdf",
+		"usdc": "https://example.money/reserves/lower.pdf",
+	} {
+		info, err := Parse("example.money", []byte(casePair), code, "GISSUER")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Currency == nil {
+			t.Fatalf("%q: currency not found", code)
+		}
+		if got := info.Currency.AttestationOfReserve; got != want {
+			t.Errorf("%q: attestation %q, want %q", code, got, want)
+		}
+		if info.Currency.Code != code {
+			t.Errorf("matched entry %q for %q", info.Currency.Code, code)
+		}
+	}
+}
+
+func TestParseDoesNotMatchOtherCasing(t *testing.T) {
+	for _, code := range []string{"Usdc", "uSDC", "USDc"} {
+		info, err := Parse("example.money", []byte(casePair), code, "GISSUER")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Currency != nil {
+			t.Errorf("%q matched %q; asset codes are case-sensitive", code, info.Currency.Code)
+		}
+	}
+}
+
 func TestParseNoMatch(t *testing.T) {
 	info, err := Parse("example.money", []byte(sample), "USDX", "GSOMEONEELSE")
 	if err != nil {

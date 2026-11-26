@@ -35,6 +35,9 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
 		os.Exit(runHealthcheck())
 	}
+	if len(os.Args) > 1 && os.Args[1] == "keygen" {
+		os.Exit(runKeygenCommand(os.Args[2:]))
+	}
 
 	cfg, err := config.Load()
 	log := newLogger(cfg.LogLevel)
@@ -58,7 +61,14 @@ func run(cfg config.Config, log *slog.Logger) error {
 	}
 	defer db.Close()
 
-	rpc := rpcclient.NewClient(cfg.RPCURL, &http.Client{Timeout: 30 * time.Second})
+	// Every RPC call goes through the rate-limit transport, so a node that
+	// answers 429 backs the caller off, honouring Retry-After, instead of
+	// failing the tick and retrying on the next one.
+	rpcHTTP := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: soroban.NewRateLimitTransport(nil, log.With("component", "rpc")),
+	}
+	rpc := rpcclient.NewClient(cfg.RPCURL, rpcHTTP)
 	defer rpc.Close()
 	hz := horizon.NewClient(cfg.HorizonURL)
 
@@ -77,6 +87,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 		Store:       db,
 		ContractIDs: []string{cfg.CoverageLedgerID, cfg.ReporterRegistryID},
 		StartLedger: cfg.StartLedger,
+		Workers:     cfg.IngestWorkers,
 		Log:         log.With("job", "ingest"),
 	}
 	// Ingest once before the other jobs start, so they see the listed assets.
@@ -173,6 +184,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 			Store:             db,
 			WebhookStore:      db,
 			WebhookAdminToken: cfg.WebhookAdminToken,
+			WebhookAPIKeys:    cfg.WebhookAPIKeys,
 			WebhookCodec:      webhookCodec,
 			Network: api.NetworkInfo{
 				NetworkPassphrase:  cfg.NetworkPassphrase,

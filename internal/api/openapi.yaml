@@ -88,6 +88,21 @@ paths:
             type: integer
             enum: [1, 2, 3]
             default: 1
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of assets to return (1-200)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque cursor returned as next_cursor by a previous page
+          schema:
+            type: string
       responses:
         '200':
           description: List of tracked assets
@@ -100,6 +115,9 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/Asset'
+                  next_cursor:
+                    type: string
+                    description: Opaque cursor for the next page, present only when another page exists
                 required:
                   - assets
         '400':
@@ -265,6 +283,44 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  /v1/assets/{sac}/coverage/now:
+    get:
+      summary: Get the current coverage figure without the asset document
+      operationId: getCoverageNow
+      description: >-
+        Returns the bps, tier, as_of and reporter of the live reserve report the
+        coverage-ledger contract selects: the newest report per tier, ties going
+        to the stronger tier, with bps rounded by the contract's own rule. It is
+        the same figure as `coverage` on /v1/assets/{sac}, without the supply,
+        reports and history payload.
+      parameters:
+        - name: sac
+          in: path
+          required: true
+          description: Stellar Asset Contract (SAC) address
+          schema:
+            type: string
+            pattern: '^C[A-Z2-7]{55}$'
+            example: "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
+      responses:
+        '200':
+          description: Current coverage figure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CoverageNow'
+        '400':
+          description: sac is not a contract strkey
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Asset is not listed, or no live report exists to measure coverage
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/reporters:
     get:
       summary: List registered reporters and their roles
@@ -312,6 +368,7 @@ paths:
       operationId: createWebhook
       security:
         - WebhookAdminAuth: []
+        - WebhookOwnerAuth: []
       requestBody:
         required: true
         content:
@@ -338,7 +395,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '401':
-          description: Missing or invalid administrator token
+          description: Missing or invalid API key
           content:
             application/json:
               schema:
@@ -381,10 +438,11 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
   /v1/webhooks/{id}:
     delete:
-      summary: Delete a registered webhook
+      summary: Delete a webhook owned by the API key
       operationId: deleteWebhook
       security:
         - WebhookAdminAuth: []
+        - WebhookOwnerAuth: []
       parameters:
         - name: id
           in: path
@@ -402,13 +460,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '401':
-          description: Missing or invalid administrator token
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: The API key does not own this webhook
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
-          description: Webhook not found
+          description: Webhook not found or already deleted
           content:
             application/json:
               schema:
@@ -449,6 +513,11 @@ components:
     WebhookAdminAuth:
       type: http
       scheme: bearer
+      description: Configured administrator bearer token; required to list webhooks.
+    WebhookOwnerAuth:
+      type: http
+      scheme: bearer
+      description: One of the configured owner API keys; can create and delete its own webhooks.
   schemas:
     NetworkInfo:
       type: object
@@ -547,6 +616,32 @@ components:
         - doc_uri
         - tx_hash
         - doc_check
+    CoverageNow:
+      type: object
+      description: >-
+        The current coverage figure alone: which live report the contract
+        selects, and the bps that report gives against the latest supply.
+      properties:
+        bps:
+          type: [integer, "null"]
+          description: Current basis points, or null when nothing is owed (zero supply).
+          example: 10200
+        tier:
+          type: string
+          enum: [transcribed, issuer_signed, auditor_signed]
+          example: "issuer_signed"
+        as_of:
+          type: string
+          format: date-time
+          example: "2026-10-05T10:00:00Z"
+        reporter:
+          type: string
+          example: "GISS..."
+      required:
+        - bps
+        - tier
+        - as_of
+        - reporter
     Coverage:
       type: object
       properties:
@@ -738,8 +833,9 @@ components:
             Machine-readable error identifier. Match on this value, not on
             `message`. Handlers use: not_found, invalid_sac,
             asset_not_listed, invalid_breakdown_hash, breakdown_not_found,
-            invalid_min_tier, invalid_limit, invalid_body,
+            coverage_not_found, invalid_min_tier, invalid_limit, invalid_body,
             invalid_webhook_url, invalid_webhook_id, webhook_not_found,
+            webhook_forbidden,
             webhooks_not_configured, unauthorized, internal_error,
             db_unavailable and progress_unavailable. The router uses
             not_found, method_not_allowed and internal_error.
