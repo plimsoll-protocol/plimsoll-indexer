@@ -275,6 +275,45 @@ func TestApplyEventsIsIdempotentAcrossReconnect(t *testing.T) {
 	}
 }
 
+func TestDisputesByAssetAndStatus(t *testing.T) {
+	s, url := openStore(t)
+	ctx := context.Background()
+	at := time.Date(2026, 11, 25, 6, 0, 0, 0, time.UTC)
+	execSQL(t, url, `
+		INSERT INTO disputes
+		  (event_id, sac, report_as_of, reporter, disputer, status, resolution,
+		   hold_until_ledger, opened_ledger, opened_at, resolved_ledger, resolved_at, tx_hash)
+		VALUES
+		  ('dispute-open', 'CSAC', $1, 'GREPORTER', 'GWATCHER', 'open', '',
+		   200, 150, $2, NULL, NULL, 'tx-open'),
+		  ('dispute-resolved', 'CSAC', $3, 'GREPORTER', 'GWATCHER', 'resolved', 'upheld',
+		   190, 140, $4, 160, $5, 'tx-resolved'),
+		  ('dispute-other', 'COTHER', $1, 'GREPORTER', 'GWATCHER', 'open', '',
+		   200, 150, $2, NULL, NULL, 'tx-other')`,
+		at.Add(-6*time.Hour), at.Add(-3*time.Hour), at.Add(-9*time.Hour), at.Add(-4*time.Hour), at.Add(-time.Hour))
+
+	all, err := s.Disputes(ctx, "CSAC", "", 10, 0)
+	if err != nil || len(all) != 2 {
+		t.Fatalf("all disputes = %d, %v; want 2", len(all), err)
+	}
+	if all[0].Status != "open" || all[1].Status != "resolved" {
+		t.Fatalf("dispute order = %q, %q; want newest open first", all[0].Status, all[1].Status)
+	}
+	if all[1].Resolution != "upheld" || all[1].ResolvedLedger == nil || *all[1].ResolvedLedger != 160 || all[1].ResolvedAt == nil {
+		t.Fatalf("resolved dispute lost its outcome: %+v", all[1])
+	}
+
+	open, err := s.Disputes(ctx, "CSAC", "open", 10, 0)
+	if err != nil || len(open) != 1 || open[0].Status != "open" {
+		t.Fatalf("open disputes = %+v, %v; want one open", open, err)
+	}
+
+	page, err := s.Disputes(ctx, "CSAC", "", 1, 1)
+	if err != nil || len(page) != 1 || page[0].Status != "resolved" {
+		t.Fatalf("second page = %+v, %v; want the resolved dispute", page, err)
+	}
+}
+
 func TestEventIDMigrationRepairsLegacyTables(t *testing.T) {
 	url := newDatabase(t)
 	schema := strings.ReplaceAll(legacySchema(t),

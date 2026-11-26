@@ -28,6 +28,13 @@ import (
 //go:embed openapi.yaml
 var openAPISpec []byte
 
+// is_covered has no default arguments on chain, so the shortcut endpoint owns
+// its defaults: 100% backing, fresh within a day, at any report tier.
+const (
+	defaultCoveredMinBps uint32 = 10_000
+	defaultCoveredMaxAge        = 24 * time.Hour
+)
+
 // Reader is what the API needs from storage.
 type Reader interface {
 	Ping(ctx context.Context) error
@@ -38,6 +45,7 @@ type Reader interface {
 	LatestReports(ctx context.Context, sac string) (map[uint32]coverage.Report, error)
 	ReportHistory(ctx context.Context, sac string, limit int) ([]coverage.Report, error)
 	Reporters(ctx context.Context) ([]coverage.Reporter, error)
+	Disputes(ctx context.Context, sac, status string, limit, offset int) ([]coverage.Dispute, error)
 	Breakdown(ctx context.Context, hash string) ([]byte, error)
 	Progress(ctx context.Context, name string) (store.Progress, error)
 }
@@ -81,6 +89,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("HEAD /v1/assets/{sac}", s.headAsset)
 	mux.HandleFunc("GET /v1/assets/{sac}/supply", s.supplyHistory)
 	mux.HandleFunc("GET /v1/assets/{sac}/reports", s.reportHistory)
+	mux.HandleFunc("GET /v1/assets/{sac}/disputes", s.disputeHistory)
 	mux.HandleFunc("GET /v1/reporters", s.reporters)
 	mux.HandleFunc("GET /v1/changelog", s.changelog)
 	mux.HandleFunc("GET /v1/breakdowns/{hash}", s.breakdown)
@@ -242,6 +251,14 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getAsset(w http.ResponseWriter, r *http.Request) {
+	// Go 1.22+'s ServeMux rejects a literal GET /v1/assets/covered alongside
+	// HEAD /v1/assets/{sac}: the literal is more specific by path but less
+	// specific by method, so neither pattern wins. Dispatch the reserved name
+	// here instead of registering a conflicting literal route.
+	if r.PathValue("sac") == "covered" {
+		s.coveredAssets(w, r)
+		return
+	}
 	sac, ok := parseSAC(w, r)
 	if !ok {
 		return
@@ -288,14 +305,29 @@ func (s *Server) headAsset(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) assemble(ctx context.Context, a coverage.Asset, minTier uint32) (assetJSON, error) {
-	sp, err := s.Store.LatestSupply(ctx, a.SAC)
+	sp, reports, err := s.coverageInputs(ctx, a.SAC)
 	if err != nil {
 		return assetJSON{}, err
 	}
-	reports, err := s.Store.LatestReports(ctx, a.SAC)
+	return s.assembleFrom(a, minTier, sp, reports), nil
+}
+
+// coverageInputs loads the two facts every coverage answer needs. Keeping it
+// separate lets /v1/assets/covered compute coverage to filter an asset and then
+// build the same document without asking for them twice.
+func (s *Server) coverageInputs(ctx context.Context, sac string) (*coverage.Supply, map[uint32]coverage.Report, error) {
+	sp, err := s.Store.LatestSupply(ctx, sac)
 	if err != nil {
-		return assetJSON{}, err
+		return nil, nil, err
 	}
+	reports, err := s.Store.LatestReports(ctx, sac)
+	if err != nil {
+		return nil, nil, err
+	}
+	return sp, reports, nil
+}
+
+func (s *Server) assembleFrom(a coverage.Asset, minTier uint32, sp *coverage.Supply, reports map[uint32]coverage.Report) assetJSON {
 	out := assetJSON{
 		Asset:    a,
 		Toml:     json.RawMessage("null"),
@@ -309,7 +341,7 @@ func (s *Server) assemble(ctx context.Context, a coverage.Asset, minTier uint32)
 	for tier, rep := range reports {
 		out.Reports[coverage.TierName(tier)] = toReport(rep)
 	}
-	return out, nil
+	return out
 }
 
 func (s *Server) supplyHistory(w http.ResponseWriter, r *http.Request) {
@@ -371,6 +403,102 @@ func (s *Server) reporters(w http.ResponseWriter, r *http.Request) {
 		out = append(out, reporterJSON{Role: coverage.RoleName(rep.Role), Reporter: rep})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"reporters": out})
+}
+
+// coveredAssets lists only the assets whose current coverage passes the same
+// freshness and ratio checks as the contract's is_covered. The contract has no
+// defaults for min_bps and max_age, so this endpoint documents and applies its
+// own: 100% backing and 24 hours, the pair the Plimsoll app treats as covered.
+func (s *Server) coveredAssets(w http.ResponseWriter, r *http.Request) {
+	minTier, ok := parseTier(w, r)
+	if !ok {
+		return
+	}
+	minBps, ok := parseMinBps(w, r)
+	if !ok {
+		return
+	}
+	maxAge, ok := parseMaxAge(w, r)
+	if !ok {
+		return
+	}
+	limit, ok := parseLimit(w, r)
+	if !ok {
+		return
+	}
+	offset, ok := parseOffset(w, r)
+	if !ok {
+		return
+	}
+
+	assets, err := s.Store.ListAssets(r.Context())
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	matched := make([]assetJSON, 0, len(assets))
+	for _, a := range assets {
+		sp, reports, err := s.coverageInputs(r.Context(), a.SAC)
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		result := coverage.Compute(sp, reports, minTier)
+		if !result.Covered(s.Now(), minBps, maxAge) {
+			continue
+		}
+		matched = append(matched, s.assembleFrom(a, minTier, sp, reports))
+	}
+
+	page, next := pageOf(matched, limit, offset)
+	body := map[string]any{"assets": page}
+	if next != nil {
+		body["next_offset"] = *next
+	}
+	writeJSON(w, http.StatusOK, body)
+}
+
+// disputeHistory lists one asset's disputes, newest-opened first. It returns
+// 404 for an unlisted asset, like the supply and report histories, instead of
+// an empty list that looks the same as an asset with no disputes.
+func (s *Server) disputeHistory(w http.ResponseWriter, r *http.Request) {
+	sac, ok := parseSAC(w, r)
+	if !ok {
+		return
+	}
+	status, ok := parseDisputeStatus(w, r)
+	if !ok {
+		return
+	}
+	limit, ok := parseLimit(w, r)
+	if !ok {
+		return
+	}
+	offset, ok := parseOffset(w, r)
+	if !ok {
+		return
+	}
+	if !s.requireAsset(w, r, sac) {
+		return
+	}
+	list, err := s.Store.Disputes(r.Context(), sac, status, limit+1, offset)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	var next *int
+	if len(list) > limit {
+		list = list[:limit]
+		n := offset + limit
+		next = &n
+	}
+	out := make([]coverage.Dispute, 0, len(list))
+	out = append(out, list...)
+	body := map[string]any{"disputes": out}
+	if next != nil {
+		body["next_offset"] = *next
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (s *Server) changelog(w http.ResponseWriter, _ *http.Request) {
@@ -572,6 +700,76 @@ func parseLimit(w http.ResponseWriter, r *http.Request) (int, bool) {
 	return n, true
 }
 
+func parseOffset(w http.ResponseWriter, r *http.Request) (int, bool) {
+	v := r.URL.Query().Get("offset")
+	if v == "" {
+		return 0, true
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		writeErrorDetails(w, http.StatusBadRequest, codeInvalidOffset,
+			"offset must be a non-negative integer", map[string]any{"parameter": "offset", "value": v})
+		return 0, false
+	}
+	return n, true
+}
+
+func parseDisputeStatus(w http.ResponseWriter, r *http.Request) (string, bool) {
+	v := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("status")))
+	switch v {
+	case "", "open", "resolved":
+		return v, true
+	default:
+		writeErrorDetails(w, http.StatusBadRequest, codeInvalidStatus,
+			"status must be open or resolved", map[string]any{"parameter": "status", "value": v})
+		return "", false
+	}
+}
+
+func parseMinBps(w http.ResponseWriter, r *http.Request) (uint32, bool) {
+	v := r.URL.Query().Get("min_bps")
+	if v == "" {
+		return defaultCoveredMinBps, true
+	}
+	n, err := strconv.ParseUint(v, 10, 32)
+	if err != nil {
+		writeErrorDetails(w, http.StatusBadRequest, codeInvalidMinBps,
+			"min_bps must be an integer between 0 and 4294967295",
+			map[string]any{"parameter": "min_bps", "value": v})
+		return 0, false
+	}
+	return uint32(n), true
+}
+
+func parseMaxAge(w http.ResponseWriter, r *http.Request) (time.Duration, bool) {
+	v := r.URL.Query().Get("max_age")
+	if v == "" {
+		return defaultCoveredMaxAge, true
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		writeErrorDetails(w, http.StatusBadRequest, codeInvalidMaxAge,
+			"max_age must be a positive duration such as 24h",
+			map[string]any{"parameter": "max_age", "value": v})
+		return 0, false
+	}
+	return d, true
+}
+
+// pageOf applies offset and limit to an already-filtered list and reports the
+// offset of the next page, or nil when this is the last page.
+func pageOf[T any](list []T, limit, offset int) ([]T, *int) {
+	if offset >= len(list) {
+		return []T{}, nil
+	}
+	list = list[offset:]
+	if len(list) <= limit {
+		return list, nil
+	}
+	next := offset + limit
+	return list[:limit], &next
+}
+
 func (s *Server) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
@@ -625,6 +823,10 @@ const (
 	codeBreakdownNotFound     = "breakdown_not_found"
 	codeInvalidMinTier        = "invalid_min_tier"
 	codeInvalidLimit          = "invalid_limit"
+	codeInvalidOffset         = "invalid_offset"
+	codeInvalidStatus         = "invalid_status"
+	codeInvalidMinBps         = "invalid_min_bps"
+	codeInvalidMaxAge         = "invalid_max_age"
 	codeInvalidBody           = "invalid_body"
 	codeInvalidWebhookURL     = "invalid_webhook_url"
 	codeInvalidWebhookID      = "invalid_webhook_id"

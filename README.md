@@ -61,10 +61,12 @@ The command fetches the asset's snapshot breakdown from the indexer, verifies th
 | `GET /healthz` | `{status, ingested_to_ledger, last_event_ledger, last_event_at, last_event_age_seconds}` |
 | `GET /v1/network` | Contract ids, RPC and Horizon URLs |
 | `GET /v1/assets?min_tier=1` | Every asset with latest supply, latest report per tier, coverage and stellar.toml data |
+| `GET /v1/assets/covered?min_bps=10000&max_age=24h&min_tier=1` | Only assets that currently pass the contract's `is_covered` rule, with the same shape. `min_bps` and `max_age` default to 100% backing and 24 hours; `limit`/`offset` page the result. |
 | `GET /v1/assets/{sac}?min_tier=1` | One asset, same shape |
 | `HEAD /v1/assets/{sac}` | Status only, no response body: `200` if the asset is listed, `404` if not |
 | `GET /v1/assets/{sac}/supply?limit=100` | Supply snapshot history. Each row carries `source`: `event` for a figure decoded from a contract event, with the `tx_hash` that produced it, or `chain` for one recovered from contract state after an ingestion gap, where `tx_hash` is empty. |
 | `GET /v1/assets/{sac}/reports?limit=100` | Reserve report history |
+| `GET /v1/assets/{sac}/disputes?status=open&limit=100&offset=0` | Disputes opened against the asset's reserve reports, newest first; omit `status` for both open and resolved. The current contracts do not emit dispute events yet, so this is empty until a deployment does (plimsoll-contracts#91). |
 | `GET /v1/reporters` | Active registered reporters |
 | `GET /v1/changelog` | Breaking API changes per released version, newest first |
 | `GET /v1/breakdowns/{hash}` | Exact bytes of a supply breakdown |
@@ -118,6 +120,10 @@ Every variable is documented in [.env.example](.env.example). Required:
 `NETWORK` selects a preset (`testnet`, the default, `mainnet` or `standalone`)
 that supplies defaults for `STELLAR_RPC_URL`, `HORIZON_URL` and
 `STELLAR_NETWORK_PASSPHRASE`. Setting any of those three overrides the preset.
+`DECIMAL_CHECK_ENABLED` (default `true`) warns when a new supply snapshot
+differs from the previous on-chain one by more than six orders of magnitude,
+which usually means an asset's decimals were applied wrongly. The snapshot is
+still posted; set it to `false` to silence the warning.
 `mainnet` has no default RPC (SDF runs no public Soroban RPC for it), so
 `STELLAR_RPC_URL` is required there. `standalone` points at a local
 [stellar/quickstart](https://github.com/stellar/quickstart) on `localhost:8000`.

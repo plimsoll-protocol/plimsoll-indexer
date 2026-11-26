@@ -95,6 +95,82 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  /v1/assets/covered:
+    get:
+      summary: List only assets that are currently covered
+      description: >
+        A shortcut for dashboards: the same Asset documents as /v1/assets,
+        filtered with the contract's is_covered rule (fresh supply and report,
+        coverage at least min_bps, report tier at least min_tier).
+        is_covered has no defaults on chain, so this endpoint supplies its
+        own: min_bps=10000 (100% backing) and max_age=24h.
+      operationId: listCoveredAssets
+      parameters:
+        - name: min_tier
+          in: query
+          required: false
+          description: Minimum tier level (1=transcribed, 2=issuer_signed, 3=auditor_signed)
+          schema:
+            type: integer
+            enum: [1, 2, 3]
+            default: 1
+        - name: min_bps
+          in: query
+          required: false
+          description: Minimum coverage in basis points (10000 = 100%)
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 4294967295
+            default: 10000
+        - name: max_age
+          in: query
+          required: false
+          description: Maximum age of the supply snapshot and report, as a Go duration
+          schema:
+            type: string
+            example: "24h"
+            default: "24h"
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of assets to return (1-1000)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+        - name: offset
+          in: query
+          required: false
+          description: Number of matching assets to skip
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Covered assets
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  assets:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Asset'
+                  next_offset:
+                    type: integer
+                    description: Present when another page exists; pass it as offset.
+                required:
+                  - assets
+        '400':
+          description: Invalid query parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/assets/{sac}:
     get:
       summary: Get details, latest supply, reports, and coverage for a specific asset
@@ -242,6 +318,77 @@ paths:
                   - reports
         '400':
           description: Invalid limit parameter, or sac is not a contract strkey
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Asset not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/assets/{sac}/disputes:
+    get:
+      summary: List disputes for an asset
+      description: >
+        Returns disputes opened against the asset's reserve reports, newest
+        first. A dispute is keyed by the report's as_of timestamp and records
+        the reporter who signed the report and the watcher who challenged it.
+        The current contracts do not emit dispute events yet
+        (plimsoll-contracts#91); until a deployment does, the list is empty.
+      operationId: listAssetDisputes
+      parameters:
+        - name: sac
+          in: path
+          required: true
+          description: Stellar Asset Contract (SAC) address
+          schema:
+            type: string
+            pattern: '^C[A-Z2-7]{55}$'
+        - name: status
+          in: query
+          required: false
+          description: Restrict to open or resolved disputes; omit for both
+          schema:
+            type: string
+            enum: [open, resolved]
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of disputes to return (1-1000)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+        - name: offset
+          in: query
+          required: false
+          description: Number of disputes to skip
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Disputes for the asset
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  disputes:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Dispute'
+                  next_offset:
+                    type: integer
+                    description: Present when another page exists; pass it as offset.
+                required:
+                  - disputes
+        '400':
+          description: Invalid status, limit, offset, or sac
           content:
             application/json:
               schema:
@@ -680,6 +827,53 @@ components:
       required:
         - kind
         - detail
+    Dispute:
+      type: object
+      properties:
+        reporter:
+          type: string
+          description: Account that signed the disputed reserve report.
+          example: "GISS..."
+        disputer:
+          type: string
+          description: Watcher that opened the dispute.
+          example: "GWATCH..."
+        status:
+          type: string
+          enum: [open, resolved]
+        resolution:
+          type: string
+          description: Outcome recorded when the dispute was resolved; empty while open.
+          example: "upheld"
+        report_as_of:
+          type: string
+          format: date-time
+          description: as_of timestamp of the disputed report.
+        hold_until_ledger:
+          type: integer
+          description: First ledger at which the hold period has elapsed.
+        opened_ledger:
+          type: integer
+        opened_at:
+          type: string
+          format: date-time
+        resolved_ledger:
+          type: integer
+          description: Ledger the dispute was resolved in; absent while open.
+        resolved_at:
+          type: string
+          format: date-time
+          description: When the dispute was resolved; absent while open.
+        tx_hash:
+          type: string
+          description: Transaction that opened or last changed the dispute.
+      required:
+        - reporter
+        - disputer
+        - status
+        - report_as_of
+        - opened_ledger
+        - opened_at
     Webhook:
       type: object
       properties:
@@ -713,7 +907,8 @@ components:
             Machine-readable error identifier. Match on this value, not on
             `message`. Handlers use: not_found, invalid_sac,
             asset_not_listed, invalid_breakdown_hash, breakdown_not_found,
-            invalid_min_tier, invalid_limit, invalid_body,
+            invalid_min_tier, invalid_limit, invalid_offset, invalid_status,
+            invalid_min_bps, invalid_max_age, invalid_body,
             invalid_webhook_url, invalid_webhook_id, webhook_not_found,
             webhooks_not_configured, unauthorized, internal_error,
             db_unavailable and progress_unavailable. The router uses

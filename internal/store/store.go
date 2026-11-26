@@ -342,6 +342,44 @@ func (s *Store) Reporters(ctx context.Context) ([]coverage.Reporter, error) {
 	return out, rows.Err()
 }
 
+// Disputes returns one asset's disputes newest-opened first. An empty status
+// returns both open and resolved disputes. The caller asks for limit+1 rows to
+// learn whether another page exists.
+func (s *Store) Disputes(ctx context.Context, sac, status string, limit, offset int) ([]coverage.Dispute, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT sac, reporter, disputer, status, resolution, report_as_of,
+		       hold_until_ledger, opened_ledger, opened_at, resolved_ledger, resolved_at, tx_hash
+		FROM disputes
+		WHERE sac = $1 AND ($2 = '' OR status = $2)
+		ORDER BY opened_at DESC, id DESC
+		LIMIT $3 OFFSET $4`, sac, status, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []coverage.Dispute
+	for rows.Next() {
+		var d coverage.Dispute
+		var holdUntil, openedLedger int64
+		var resolvedLedger *int64
+		var resolvedAt *time.Time
+		if err := rows.Scan(&d.SAC, &d.Reporter, &d.Disputer, &d.Status, &d.Resolution,
+			&d.ReportAsOf, &holdUntil, &openedLedger, &d.OpenedAt,
+			&resolvedLedger, &resolvedAt, &d.TxHash); err != nil {
+			return nil, err
+		}
+		d.HoldUntilLedger = uint32(holdUntil)
+		d.OpenedLedger = uint32(openedLedger)
+		if resolvedLedger != nil {
+			ledger := uint32(*resolvedLedger)
+			d.ResolvedLedger = &ledger
+		}
+		d.ResolvedAt = resolvedAt
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 // ---- breakdowns and toml --------------------------------------------------
 
 func (s *Store) SaveBreakdown(ctx context.Context, hash, sac string, body []byte) error {

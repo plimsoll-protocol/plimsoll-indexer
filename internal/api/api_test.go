@@ -28,11 +28,12 @@ const sac = "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
 // breakdownHash is what a SHA-256 breakdown hash looks like: 64 hex characters.
 var breakdownHash = strings.Repeat("a", 64)
 
-// unlistedSAC is a well-formed contract strkey that fake holds no asset for.
-func unlistedSAC(t *testing.T) string {
+// contractAddress builds a well-formed contract strkey from a tag byte, so a
+// test can hold several distinct addresses.
+func contractAddress(t *testing.T, tag byte) string {
 	t.Helper()
 	raw := make([]byte, 32)
-	raw[0] = 0x01
+	raw[0] = tag
 	s, err := strkey.Encode(strkey.VersionByteContract, raw)
 	if err != nil {
 		t.Fatal(err)
@@ -40,11 +41,15 @@ func unlistedSAC(t *testing.T) string {
 	return s
 }
 
+// unlistedSAC is a well-formed contract strkey that fake holds no asset for.
+func unlistedSAC(t *testing.T) string { return contractAddress(t, 0x01) }
+
 type fake struct {
-	assets  []coverage.Asset
-	supply  map[string]*coverage.Supply
-	reports map[string]map[uint32]coverage.Report
-	bodies  map[string][]byte
+	assets   []coverage.Asset
+	supply   map[string]*coverage.Supply
+	reports  map[string]map[uint32]coverage.Report
+	bodies   map[string][]byte
+	disputes map[string][]coverage.Dispute
 }
 
 func (f *fake) Ping(context.Context) error { return nil }
@@ -83,6 +88,19 @@ func (f *fake) ReportHistory(_ context.Context, s string, _ int) ([]coverage.Rep
 }
 func (f *fake) Reporters(context.Context) ([]coverage.Reporter, error) {
 	return []coverage.Reporter{{Address: "GAUD", Role: coverage.RoleAuditor, Name: "Acme"}}, nil
+}
+func (f *fake) Disputes(_ context.Context, s, status string, _, offset int) ([]coverage.Dispute, error) {
+	var filtered []coverage.Dispute
+	for _, d := range f.disputes[s] {
+		if status != "" && d.Status != status {
+			continue
+		}
+		filtered = append(filtered, d)
+	}
+	if offset >= len(filtered) {
+		return nil, nil
+	}
+	return filtered[offset:], nil
 }
 func (f *fake) Breakdown(_ context.Context, h string) ([]byte, error) {
 	if b, ok := f.bodies[h]; ok {
@@ -128,6 +146,18 @@ func (f *webhookManagerFake) DeleteWebhook(_ context.Context, id int64) (bool, e
 
 func server() *httptest.Server {
 	return serverWithWebhooks(nil, nil, "")
+}
+
+// serverFor serves an arbitrary fake, so a test can set up more assets or
+// disputes than the default fixture.
+func serverFor(f *fake) *httptest.Server {
+	s := &Server{
+		Store: f,
+		CORS:  []string{"*"},
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:   func() time.Time { return now },
+	}
+	return httptest.NewServer(s.Handler())
 }
 
 func serverWithWebhooks(manager WebhookManager, codec *webhook.SecretCodec, token string) *httptest.Server {
@@ -287,6 +317,7 @@ func TestMalformedPathIDs(t *testing.T) {
 		"/v1/assets/CNOPE",
 		"/v1/assets/not-a-sac/supply",
 		"/v1/assets/not-a-sac/reports",
+		"/v1/assets/not-a-sac/disputes",
 	} {
 		body := get(t, srv, path, 400)
 		if body["code"] != "invalid_sac" || body["message"] == nil {
@@ -309,6 +340,7 @@ func TestUnlistedPathIDs(t *testing.T) {
 		"/v1/assets/" + unknown,
 		"/v1/assets/" + unknown + "/supply",
 		"/v1/assets/" + unknown + "/reports",
+		"/v1/assets/" + unknown + "/disputes",
 	} {
 		body := get(t, srv, path, 404)
 		if body["code"] != "asset_not_listed" || body["message"] != "asset not listed" {
@@ -396,6 +428,111 @@ func TestListedAssetHistory(t *testing.T) {
 	}
 	if got := get(t, srv, "/v1/assets/"+sac+"/reports", 200)["reports"].([]any); len(got) != 1 {
 		t.Fatalf("report history %+v", got)
+	}
+}
+
+func TestCoveredAssetsEndpoint(t *testing.T) {
+	second := contractAddress(t, 0x02)
+	stale := contractAddress(t, 0x03)
+	under := contractAddress(t, 0x04)
+	f := &fake{
+		assets: []coverage.Asset{
+			{SAC: sac, Code: "PUSD", Issuer: "GISS"},
+			{SAC: second, Code: "QUSD", Issuer: "GISS"},
+			{SAC: stale, Code: "STALE", Issuer: "GISS"},
+			{SAC: under, Code: "UNDER", Issuer: "GISS"},
+		},
+		supply: map[string]*coverage.Supply{
+			sac:    {Amount: big.NewInt(1_000), Ledger: 100, PostedAt: now.Add(-time.Hour)},
+			second: {Amount: big.NewInt(1_000), Ledger: 100, PostedAt: now.Add(-time.Hour)},
+			stale:  {Amount: big.NewInt(1_000), Ledger: 100, PostedAt: now.Add(-48 * time.Hour)},
+			under:  {Amount: big.NewInt(1_000), Ledger: 100, PostedAt: now.Add(-time.Hour)},
+		},
+		reports: map[string]map[uint32]coverage.Report{
+			sac:    {coverage.TierIssuerSigned: {Tier: coverage.TierIssuerSigned, Amount: big.NewInt(1_000), AsOf: now.Add(-2 * time.Hour), Reporter: "GISS"}},
+			second: {coverage.TierIssuerSigned: {Tier: coverage.TierIssuerSigned, Amount: big.NewInt(2_000), AsOf: now.Add(-2 * time.Hour), Reporter: "GISS"}},
+			stale:  {coverage.TierIssuerSigned: {Tier: coverage.TierIssuerSigned, Amount: big.NewInt(1_000), AsOf: now.Add(-2 * time.Hour), Reporter: "GISS"}},
+			under:  {coverage.TierIssuerSigned: {Tier: coverage.TierIssuerSigned, Amount: big.NewInt(500), AsOf: now.Add(-2 * time.Hour), Reporter: "GISS"}},
+		},
+	}
+	srv := serverFor(f)
+	defer srv.Close()
+
+	body := get(t, srv, "/v1/assets/covered", 200)
+	assets := body["assets"].([]any)
+	if len(assets) != 2 {
+		t.Fatalf("covered assets = %d, want sac and second", len(assets))
+	}
+	if assets[0].(map[string]any)["sac"] != sac || assets[1].(map[string]any)["sac"] != second {
+		t.Fatalf("covered assets = %+v, want the two fresh, backed assets", assets)
+	}
+
+	if got := get(t, srv, "/v1/assets/covered?min_bps=10001", 200)["assets"].([]any); len(got) != 1 {
+		t.Fatalf("min_bps=10001 returned %d assets, want only the over-backed one", len(got))
+	}
+	if got := get(t, srv, "/v1/assets/covered?max_age=1h", 200)["assets"].([]any); len(got) != 0 {
+		t.Fatalf("max_age=1h returned %d assets, want none", len(got))
+	}
+	if got := get(t, srv, "/v1/assets/covered?min_tier=3", 200)["assets"].([]any); len(got) != 0 {
+		t.Fatalf("min_tier=3 returned %d assets, want none", len(got))
+	}
+
+	page := get(t, srv, "/v1/assets/covered?limit=1", 200)
+	if len(page["assets"].([]any)) != 1 || page["next_offset"].(float64) != 1 {
+		t.Fatalf("first page = %+v, want one asset and next_offset 1", page)
+	}
+	page = get(t, srv, "/v1/assets/covered?limit=1&offset=1", 200)
+	if len(page["assets"].([]any)) != 1 || page["next_offset"] != nil {
+		t.Fatalf("second page = %+v, want one asset and no next page", page)
+	}
+
+	get(t, srv, "/v1/assets/covered?min_bps=abc", 400)
+	get(t, srv, "/v1/assets/covered?max_age=0", 400)
+	get(t, srv, "/v1/assets/covered?offset=-1", 400)
+}
+
+func TestAssetDisputes(t *testing.T) {
+	resolvedLedger := uint32(160)
+	resolvedAt := now.Add(-time.Hour)
+	f := &fake{
+		assets: []coverage.Asset{{SAC: sac, Code: "PUSD", Issuer: "GISS"}},
+		disputes: map[string][]coverage.Dispute{
+			sac: {
+				{SAC: sac, Reporter: "GISS", Disputer: "GWATCH", Status: "open",
+					ReportAsOf: now.Add(-3 * time.Hour), HoldUntilLedger: 200,
+					OpenedLedger: 150, OpenedAt: now.Add(-2 * time.Hour), TxHash: "tx-open"},
+				{SAC: sac, Reporter: "GISS", Disputer: "GWATCH", Status: "resolved",
+					Resolution: "upheld", ReportAsOf: now.Add(-6 * time.Hour), HoldUntilLedger: 190,
+					OpenedLedger: 140, OpenedAt: now.Add(-3 * time.Hour),
+					ResolvedLedger: &resolvedLedger, ResolvedAt: &resolvedAt, TxHash: "tx-resolved"},
+			},
+		},
+	}
+	srv := serverFor(f)
+	defer srv.Close()
+
+	all := get(t, srv, "/v1/assets/"+sac+"/disputes", 200)["disputes"].([]any)
+	if len(all) != 2 {
+		t.Fatalf("disputes = %d, want 2", len(all))
+	}
+	open := get(t, srv, "/v1/assets/"+sac+"/disputes?status=open", 200)["disputes"].([]any)
+	if len(open) != 1 || open[0].(map[string]any)["status"] != "open" {
+		t.Fatalf("open disputes = %+v, want one open", open)
+	}
+	if open[0].(map[string]any)["disputer"] != "GWATCH" || open[0].(map[string]any)["reporter"] != "GISS" {
+		t.Errorf("dispute actors missing: %+v", open[0])
+	}
+	resolved := get(t, srv, "/v1/assets/"+sac+"/disputes?status=resolved", 200)["disputes"].([]any)
+	if len(resolved) != 1 || resolved[0].(map[string]any)["resolution"] != "upheld" {
+		t.Fatalf("resolved disputes = %+v, want the upheld one", resolved)
+	}
+
+	page := get(t, srv, "/v1/assets/"+sac+"/disputes?limit=1", 200)
+	if len(page["disputes"].([]any)) != 1 || page["next_offset"].(float64) != 1 {
+		t.Fatalf("first page = %+v, want one dispute and next_offset 1", page)
+	}
+	if body := get(t, srv, "/v1/assets/"+sac+"/disputes?status=pending", 400); body["code"] != "invalid_status" {
+		t.Fatalf("invalid status body = %+v", body)
 	}
 }
 
