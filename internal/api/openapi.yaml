@@ -606,7 +606,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
-          description: Breakdown hash not found
+          description: >-
+            No breakdown with this hash backs an on-chain snapshot. The poster
+            saves a breakdown before it posts it; one whose post has not been
+            confirmed (by the transaction, the supply_posted event or the
+            ledger's current snapshot) is not served, and is deleted after a
+            grace period if the post never lands.
           content:
             application/json:
               schema:

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -107,6 +108,21 @@ func schemaOf(t *testing.T, url string) []string {
 	return out
 }
 
+// embeddedVersions is every migration version compiled into the binary, in
+// order: what a database is at once Open has run.
+func embeddedVersions(t *testing.T) []int {
+	t.Helper()
+	ms, err := loadMigrations(migrationsFS())
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := make([]int, len(ms))
+	for i, m := range ms {
+		out[i] = m.Version
+	}
+	return out
+}
+
 func appliedVersions(t *testing.T, url string) []int {
 	t.Helper()
 	ctx := context.Background()
@@ -151,9 +167,8 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 	if len(want) == 0 {
 		t.Fatal("fresh database has no schema")
 	}
-	if got := appliedVersions(t, fresh); len(got) != 5 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 || got[4] != 5 {
-		t.Fatalf("fresh database recorded %v, want [1 2 3 4 5]", got)
-	}
+if got, want := appliedVersions(t, fresh), embeddedVersions(t); !slices.Equal(got, want) {
+		t.Fatalf("fresh database recorded %v, want %v", got, want)	}
 
 	for name, schema := range map[string]string{
 		"created by the last schema.sql":            legacySchema(t),
@@ -165,6 +180,11 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 			execSQL(t, url, `INSERT INTO assets (sac, code, issuer, listed_ledger, listed_at, event_id)
 				VALUES ('CSAC', 'PUSD', 'GISS', 7, now(), 'ev-1')`)
 			execSQL(t, url, `INSERT INTO breakdowns (hash, sac, body) VALUES ('h1', 'CSAC', '{"total":"5"}')`)
+			// The snapshot that h1 backs, so the breakdown is confirmed and served
+			// after the upgrade (the breakdown_confirmation migration).
+			execSQL(t, url, `INSERT INTO supply_snapshots
+				(event_id, sac, amount, at_ledger, breakdown_hash, poster, posted_ledger, posted_at, tx_hash)
+				VALUES ('ev-h1', 'CSAC', 5, 7, 'h1', 'GPOSTER', 8, now(), 'tx-h1')`)
 
 			s, err := Open(context.Background(), url)
 			if err != nil {
@@ -175,9 +195,8 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 			if d := schemaDiff(want, schemaOf(t, url)); len(d) > 0 {
 				t.Fatalf("schema differs from a fresh database:\n%s", strings.Join(d, "\n"))
 			}
-			if got := appliedVersions(t, url); len(got) != 5 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 || got[4] != 5 {
-				t.Fatalf("recorded %v, want [1 2 3 4 5]", got)
-			}
+if got, want := appliedVersions(t, url), embeddedVersions(t); !slices.Equal(got, want) {
+				t.Fatalf("recorded %v, want %v", got, want)			}
 			a, err := s.GetAsset(context.Background(), "CSAC")
 			if err != nil || a.Code != "PUSD" {
 				t.Fatalf("existing asset after migration: %+v, %v", a, err)
@@ -197,9 +216,8 @@ func TestReopeningAppliesNothingTwice(t *testing.T) {
 		t.Fatal(err)
 	}
 	s2.Close()
-	if got := appliedVersions(t, url); len(got) != 5 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 || got[4] != 5 {
-		t.Fatalf("recorded %v, want [1 2 3 4 5]", got)
-	}
+if got, want := appliedVersions(t, url), embeddedVersions(t); !slices.Equal(got, want) {
+		t.Fatalf("recorded %v, want %v", got, want)	}
 }
 
 // Instances starting together serialise on the advisory lock. Without it, two
@@ -230,9 +248,8 @@ func TestConcurrentStartsDoNotRace(t *testing.T) {
 	for err := range errs {
 		t.Errorf("concurrent open: %v", err)
 	}
-	if got := appliedVersions(t, url); len(got) != 5 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 || got[4] != 5 {
-		t.Fatalf("recorded %v, want [1 2 3 4 5]", got)
-	}
+if got, want := appliedVersions(t, url), embeddedVersions(t); !slices.Equal(got, want) {
+		t.Fatalf("recorded %v, want %v", got, want)	}
 }
 
 func tableExists(t *testing.T, p *pgxpool.Pool, name string) bool {

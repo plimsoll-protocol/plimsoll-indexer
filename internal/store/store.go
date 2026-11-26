@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
@@ -171,6 +172,9 @@ func applyEvent(ctx context.Context, tx pgx.Tx, ev any) error {
 			ON CONFLICT (event_id) DO NOTHING`,
 			e.ID, e.SAC, e.Amount.String(), int64(e.AtLedger), e.BreakdownHash, e.Poster,
 			int64(e.Ledger), e.ClosedAt, e.TxHash)
+		if err == nil {
+			err = confirmBreakdown(ctx, tx, e.SAC, e.BreakdownHash)
+		}
 	case soroban.ReservePosted:
 		_, err = tx.Exec(ctx, `
 			INSERT INTO reserve_reports
@@ -573,20 +577,81 @@ func (s *Store) Reporters(ctx context.Context) ([]coverage.Reporter, error) {
 
 // ---- breakdowns and toml --------------------------------------------------
 
+// SaveBreakdown stores a breakdown the poster is about to post. It is not
+// served until it is confirmed (see ConfirmBreakdown). Saving an unconfirmed
+// breakdown again, for a retried post, restarts its grace period.
 func (s *Store) SaveBreakdown(ctx context.Context, hash, sac string, body []byte) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO breakdowns (hash, sac, body) VALUES ($1, $2, $3)
-		ON CONFLICT (hash) DO NOTHING`, hash, sac, string(body))
+		ON CONFLICT (hash) DO UPDATE SET created_at = now()
+		WHERE breakdowns.confirmed_at IS NULL`, hash, sac, string(body))
 	return err
 }
 
+// Breakdown returns the body of a confirmed breakdown, byte for byte. A
+// breakdown whose post never reached the chain is ErrNotFound.
 func (s *Store) Breakdown(ctx context.Context, hash string) ([]byte, error) {
 	var body string
-	err := s.pool.QueryRow(ctx, `SELECT body FROM breakdowns WHERE hash = $1`, hash).Scan(&body)
+	err := s.pool.QueryRow(ctx,
+		`SELECT body FROM breakdowns WHERE hash = $1 AND confirmed_at IS NOT NULL`, hash).Scan(&body)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	return []byte(body), err
+}
+
+// HasBreakdown reports whether the body for hash is stored, confirmed or not.
+func (s *Store) HasBreakdown(ctx context.Context, hash string) (bool, error) {
+	var ok bool
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM breakdowns WHERE hash = $1)`, hash).Scan(&ok)
+	if err != nil {
+		return false, fmt.Errorf("look up breakdown: %w", err)
+	}
+	return ok, nil
+}
+
+// ConfirmBreakdown marks the breakdown for hash as backing an on-chain
+// snapshot: the poster's post_supply succeeded, or the coverage ledger holds
+// the hash. Confirmed breakdowns are served and never deleted.
+func (s *Store) ConfirmBreakdown(ctx context.Context, hash string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE breakdowns SET confirmed_at = now() WHERE hash = $1 AND confirmed_at IS NULL`, hash)
+	if err != nil {
+		return fmt.Errorf("confirm breakdown: %w", err)
+	}
+	return nil
+}
+
+// confirmBreakdown confirms the breakdown a stored snapshot points at.
+func confirmBreakdown(ctx context.Context, db interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}, sac, hash string) error {
+	_, err := db.Exec(ctx, `
+		UPDATE breakdowns SET confirmed_at = now()
+		WHERE hash = $1 AND sac = $2 AND confirmed_at IS NULL`, hash, sac)
+	if err != nil {
+		return fmt.Errorf("confirm breakdown: %w", err)
+	}
+	return nil
+}
+
+// DeleteUnconfirmedBreakdowns deletes the breakdowns saved more than
+// olderThan ago that nothing has confirmed, and returns how many it deleted.
+// These are posts that never reached the chain: the transaction failed, or
+// the post was abandoned after the breakdown was saved. A breakdown a
+// snapshot row points at is kept even if its confirmation was missed.
+func (s *Store) DeleteUnconfirmedBreakdowns(ctx context.Context, olderThan time.Duration) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `
+		DELETE FROM breakdowns b
+		WHERE b.confirmed_at IS NULL
+		  AND b.created_at < now() - make_interval(secs => $1)
+		  AND NOT EXISTS (
+		      SELECT 1 FROM supply_snapshots s WHERE s.sac = b.sac AND s.breakdown_hash = b.hash
+		  )`, olderThan.Seconds())
+	if err != nil {
+		return 0, fmt.Errorf("delete unconfirmed breakdowns: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 // SaveToml stores the stellar.toml lookup result (info JSON or an error).
@@ -798,6 +863,10 @@ func (s *Store) SaveChainSupply(ctx context.Context, sac string, sp coverage.Sup
 		sp.BreakdownHash, sp.Poster, sp.PostedAt)
 	if err != nil {
 		return false, fmt.Errorf("save chain supply: %w", err)
+	}
+	// The ledger holds this hash, so its breakdown backs a real snapshot.
+	if err := confirmBreakdown(ctx, s.pool, sac, sp.BreakdownHash); err != nil {
+		return false, err
 	}
 	return tag.RowsAffected() > 0, nil
 }

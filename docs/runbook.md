@@ -149,6 +149,16 @@ new secret, restart, confirm a post succeeds, then revoke the old reporter.
 account and a ledger above the last snapshot (the poster never posts at or below
 the last snapshot's ledger). Check `job failed` entries with `job=poster`.
 
+**Breakdown returns 404 for an on-chain hash.** The poster saves each
+breakdown before it posts it and serves it only once the post is confirmed: by
+the successful transaction, by ingesting its `supply_posted` event, or by
+reading the ledger's current snapshot back (the poster does this every tick).
+A breakdown whose post never landed is deleted after 24 hours
+(`DefaultBreakdownGrace`); the poster logs `deleted breakdowns whose post never
+reached the chain`. A 404 for a hash that is on chain therefore means the
+confirmation has not run yet (check `job failed` entries with `job=poster` and
+`job=ingest`) or the breakdown was never stored by this database.
+
 **Move to another network.** Set `NETWORK` (and `STELLAR_RPC_URL` for mainnet),
 the two contract ids and `START_LEDGER` for that deployment. Use a fresh
 database: one database holds one network's history.

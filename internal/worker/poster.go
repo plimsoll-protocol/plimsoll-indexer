@@ -42,9 +42,18 @@ type postLocker interface {
 // breakdownStore is the storage surface the poster needs.
 type breakdownStore interface {
 	ListAssets(ctx context.Context) ([]coverage.Asset, error)
-	Breakdown(ctx context.Context, hash string) ([]byte, error)
+	HasBreakdown(ctx context.Context, hash string) (bool, error)
 	SaveBreakdown(ctx context.Context, hash, sac string, body []byte) error
+	ConfirmBreakdown(ctx context.Context, hash string) error
+	DeleteUnconfirmedBreakdowns(ctx context.Context, olderThan time.Duration) (int64, error)
 }
+
+// DefaultBreakdownGrace is how long a breakdown whose post was never confirmed
+// is kept before it is deleted, when Poster.BreakdownGrace is zero. It is far
+// longer than a transaction can stay pending, so a post that did land has
+// been confirmed (by the poster reading the ledger back, by ingestion or by
+// the reconciler) long before its breakdown could be deleted.
+const DefaultBreakdownGrace = 24 * time.Hour
 
 type latestLedger interface {
 	GetLatestLedger(ctx context.Context) (protocol.GetLatestLedgerResponse, error)
@@ -83,6 +92,10 @@ type Poster struct {
 	// Info and returns nil. This prevents duplicate posts when multiple
 	// instances run against the same database.
 	Lock postLocker
+
+	// BreakdownGrace is how long an unconfirmed breakdown is kept before Run
+	// deletes it. Zero means DefaultBreakdownGrace.
+	BreakdownGrace time.Duration
 }
 
 // errSupplyDisagreement stops a post when two Horizons report different totals
@@ -164,7 +177,28 @@ func (p *Poster) Run(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("%s:%s: %w", a.Code, a.Issuer, err))
 		}
 	}
+	if err := p.pruneBreakdowns(ctx); err != nil {
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
+}
+
+// pruneBreakdowns deletes the breakdowns of posts that never reached the
+// chain once they are older than the grace period. They are already not
+// served; this keeps them from piling up.
+func (p *Poster) pruneBreakdowns(ctx context.Context) error {
+	grace := p.BreakdownGrace
+	if grace <= 0 {
+		grace = DefaultBreakdownGrace
+	}
+	n, err := p.Store.DeleteUnconfirmedBreakdowns(ctx, grace)
+	if err != nil {
+		return fmt.Errorf("prune breakdowns: %w", err)
+	}
+	if n > 0 {
+		p.Log.Info("deleted breakdowns whose post never reached the chain", "count", n, "older_than", grace)
+	}
+	return nil
 }
 
 func (p *Poster) postOne(ctx context.Context, sac, code, issuer string) error {
@@ -198,10 +232,17 @@ func (p *Poster) postOne(ctx context.Context, sac, code, issuer string) error {
 		recent := p.Now().Sub(last.Timestamp) < p.RepostAfter
 		// A snapshot whose breakdown this instance cannot serve (e.g. posted by
 		// another instance) is unverifiable, so replace it with one we can.
-		_, err := p.Store.Breakdown(ctx, last.BreakdownHash)
-		servable := err == nil
-		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			return fmt.Errorf("look up breakdown: %w", err)
+		servable, err := p.Store.HasBreakdown(ctx, last.BreakdownHash)
+		if err != nil {
+			return err
+		}
+		if servable {
+			// The ledger holds this hash, so the breakdown backs a real
+			// snapshot even if the post looked like it failed or ingestion has
+			// not seen its event yet.
+			if err := p.Store.ConfirmBreakdown(ctx, last.BreakdownHash); err != nil {
+				return err
+			}
 		}
 		if unchanged && recent && servable {
 			return nil
@@ -219,6 +260,9 @@ func (p *Poster) postOne(ctx context.Context, sac, code, issuer string) error {
 		}
 	}
 
+	// Saved before posting, so the hash on chain always has a body here. It
+	// stays unconfirmed, and is not served, until the post is known to have
+	// landed.
 	hash := b.Hash()
 	if err := p.Store.SaveBreakdown(ctx, hash, sac, b.Canonical()); err != nil {
 		return fmt.Errorf("save breakdown: %w", err)
@@ -243,7 +287,13 @@ func (p *Poster) postOne(ctx context.Context, sac, code, issuer string) error {
 	args := []xdr.ScVal{posterVal, sacVal, amountVal, soroban.U32Val(b.Ledger), hashVal}
 	res, err := p.Invoker.Invoke(ctx, p.LedgerID, "post_supply", args)
 	if err != nil {
+		// The breakdown stays unconfirmed. If the transaction landed after all,
+		// the next tick reads its hash back from the ledger and confirms it;
+		// otherwise pruneBreakdowns deletes it after the grace period.
 		return fmt.Errorf("post_supply: %w", err)
+	}
+	if err := p.Store.ConfirmBreakdown(ctx, hash); err != nil {
+		return fmt.Errorf("posted supply in %s but could not confirm its breakdown: %w", res.TxHash, err)
 	}
 	p.Log.Info("posted supply", "code", code, "amount", b.Total, "at_ledger", b.Ledger, "tx", res.TxHash)
 	return nil
