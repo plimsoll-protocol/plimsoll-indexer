@@ -81,6 +81,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("HEAD /v1/assets/{sac}", s.headAsset)
 	mux.HandleFunc("GET /v1/assets/{sac}/supply", s.supplyHistory)
 	mux.HandleFunc("GET /v1/assets/{sac}/reports", s.reportHistory)
+	mux.HandleFunc("GET /v1/assets/{sac}/coverage/now", s.coverageNow)
 	mux.HandleFunc("GET /v1/reporters", s.reporters)
 	mux.HandleFunc("GET /v1/changelog", s.changelog)
 	mux.HandleFunc("GET /v1/breakdowns/{hash}", s.breakdown)
@@ -125,6 +126,17 @@ type assetJSON struct {
 	Supply   *supplyJSON            `json:"supply"`
 	Reports  map[string]*reportJSON `json:"reports"`
 	Coverage *coverageJSON          `json:"coverage"`
+}
+
+// coverageNowJSON is the shortcut view of the live coverage figure: the bps,
+// tier, as_of and reporter that /v1/assets/{sac} reports under "coverage",
+// without the supply, reports and history behind them.
+type coverageNowJSON struct {
+	// Bps is null when nothing is owed (zero supply), as in coverageJSON.
+	Bps      *uint32   `json:"bps"`
+	Tier     string    `json:"tier"`
+	AsOf     time.Time `json:"as_of"`
+	Reporter string    `json:"reporter"`
 }
 
 type reporterJSON struct {
@@ -358,6 +370,48 @@ func (s *Server) reportHistory(w http.ResponseWriter, r *http.Request) {
 		out = append(out, toReport(rep))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"reports": out})
+}
+
+// coverageNow answers the current coverage figure alone, for clients that poll
+// bps and do not need the asset document or the history behind it.
+//
+// The report is selected with coverage.Compute, the same rule /v1/assets/{sac}
+// and the contract's coverage() use, so the three always agree.
+func (s *Server) coverageNow(w http.ResponseWriter, r *http.Request) {
+	sac, ok := parseSAC(w, r)
+	if !ok {
+		return
+	}
+	if !s.requireAsset(w, r, sac) {
+		return
+	}
+	supply, err := s.Store.LatestSupply(r.Context(), sac)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	reports, err := s.Store.LatestReports(r.Context(), sac)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	res := coverage.Compute(supply, reports, coverage.TierTranscribed)
+	if res == nil {
+		// Either nothing has been reported or there is no supply to measure
+		// reserves against; both mean there is no live coverage figure.
+		writeError(w, http.StatusNotFound, codeCoverageNotFound, "no live coverage report")
+		return
+	}
+	out := coverageNowJSON{
+		Tier:     coverage.TierName(res.Tier),
+		AsOf:     res.ReportAsOf.UTC(),
+		Reporter: res.ReportReporter,
+	}
+	if !res.NothingIsOwed {
+		bps := res.Bps
+		out.Bps = &bps
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) reporters(w http.ResponseWriter, r *http.Request) {
@@ -623,6 +677,7 @@ const (
 	codeAssetNotListed        = "asset_not_listed"
 	codeInvalidBreakdownHash  = "invalid_breakdown_hash"
 	codeBreakdownNotFound     = "breakdown_not_found"
+	codeCoverageNotFound      = "coverage_not_found"
 	codeInvalidMinTier        = "invalid_min_tier"
 	codeInvalidLimit          = "invalid_limit"
 	codeInvalidBody           = "invalid_body"

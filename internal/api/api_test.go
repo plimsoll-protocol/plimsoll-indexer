@@ -157,6 +157,19 @@ func serverWithWebhooks(manager WebhookManager, codec *webhook.SecretCodec, toke
 	return httptest.NewServer(s.Handler())
 }
 
+// serverFor runs the API over a specific store, so a test can vary the supply
+// and reports behind an asset.
+func serverFor(f *fake) *httptest.Server {
+	s := &Server{
+		Store:     f,
+		CORS:      []string{"*"},
+		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:       func() time.Time { return now },
+		Changelog: testChangelog,
+	}
+	return httptest.NewServer(s.Handler())
+}
+
 func get(t *testing.T, srv *httptest.Server, path string, want int) map[string]any {
 	t.Helper()
 	resp, err := http.Get(srv.URL + path)
@@ -185,6 +198,92 @@ func TestGetAssetCoverage(t *testing.T) {
 	}
 	if body["supply"].(map[string]any)["amount"] != "10000000000" {
 		t.Errorf("supply %+v", body["supply"])
+	}
+}
+
+// The shortcut carries the same figure as the coverage object on the asset
+// document, and nothing else.
+func TestCoverageNow(t *testing.T) {
+	srv := server()
+	defer srv.Close()
+	body := get(t, srv, "/v1/assets/"+sac+"/coverage/now", 200)
+	if body["bps"].(float64) != 10_200 {
+		t.Errorf("bps = %v, want 10200", body["bps"])
+	}
+	if body["tier"] != "issuer_signed" {
+		t.Errorf("tier = %v, want issuer_signed", body["tier"])
+	}
+	if body["as_of"] != "2026-10-05T10:00:00Z" {
+		t.Errorf("as_of = %v, want the report's as_of in UTC", body["as_of"])
+	}
+	if body["reporter"] != "GISS" {
+		t.Errorf("reporter = %v, want GISS", body["reporter"])
+	}
+	if len(body) != 4 {
+		t.Errorf("body has %d fields, want only bps, tier, as_of and reporter: %+v", len(body), body)
+	}
+}
+
+// Zero supply means nothing is owed, which the asset document reports as a
+// null bps rather than a number; the shortcut does the same.
+func TestCoverageNowNullBpsWhenNothingIsOwed(t *testing.T) {
+	srv := serverFor(&fake{
+		assets: []coverage.Asset{{SAC: sac, Code: "PUSD", Issuer: "GISS"}},
+		supply: map[string]*coverage.Supply{sac: {Amount: big.NewInt(0), Ledger: 1, PostedAt: now}},
+		reports: map[string]map[uint32]coverage.Report{sac: {
+			coverage.TierTranscribed: {
+				Tier: coverage.TierTranscribed, Amount: big.NewInt(0), AsOf: now, Reporter: "GISS",
+			},
+		}},
+	})
+	defer srv.Close()
+	body := get(t, srv, "/v1/assets/"+sac+"/coverage/now", 200)
+	if body["bps"] != nil {
+		t.Errorf("bps = %v, want null for zero supply", body["bps"])
+	}
+	if body["tier"] != "transcribed" {
+		t.Errorf("tier = %v", body["tier"])
+	}
+}
+
+// Without a live report, or without supply to measure it against, there is no
+// coverage figure to return.
+func TestCoverageNowNotFound(t *testing.T) {
+	asset := coverage.Asset{SAC: sac, Code: "PUSD", Issuer: "GISS"}
+	cases := map[string]*fake{
+		"no reports": {
+			assets: []coverage.Asset{asset},
+			supply: map[string]*coverage.Supply{sac: {Amount: big.NewInt(1), Ledger: 1, PostedAt: now}},
+		},
+		"no supply": {
+			assets: []coverage.Asset{asset},
+			reports: map[string]map[uint32]coverage.Report{sac: {
+				coverage.TierIssuerSigned: {
+					Tier: coverage.TierIssuerSigned, Amount: big.NewInt(1), AsOf: now, Reporter: "GISS",
+				},
+			}},
+		},
+	}
+	for name, f := range cases {
+		srv := serverFor(f)
+		body := get(t, srv, "/v1/assets/"+sac+"/coverage/now", 404)
+		srv.Close()
+		if body["code"] != "coverage_not_found" || body["message"] == nil {
+			t.Errorf("%s: body %+v, want a coverage_not_found error", name, body)
+		}
+	}
+}
+
+// The path id is checked before any coverage lookup, exactly as on the asset
+// document it summarises.
+func TestCoverageNowPathValidation(t *testing.T) {
+	srv := server()
+	defer srv.Close()
+	if body := get(t, srv, "/v1/assets/not-a-sac/coverage/now", 400); body["code"] != "invalid_sac" {
+		t.Errorf("malformed sac: body %+v", body)
+	}
+	if body := get(t, srv, "/v1/assets/"+unlistedSAC(t)+"/coverage/now", 404); body["code"] != "asset_not_listed" {
+		t.Errorf("unlisted asset: body %+v", body)
 	}
 }
 
@@ -434,6 +533,10 @@ func TestOpenAPISpec(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "operationId: headAsset") {
 		t.Error("expected the spec to document the HEAD asset operation")
+	}
+	if !strings.Contains(string(body), "operationId: getCoverageNow") ||
+		!strings.Contains(string(body), "CoverageNow:") {
+		t.Error("expected the spec to document the current coverage endpoint and its schema")
 	}
 }
 
