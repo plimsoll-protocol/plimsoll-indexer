@@ -57,9 +57,13 @@ type Config struct {
 	CoverageLedgerID     string
 	ReporterRegistryID   string
 	StartLedger          uint32
+	IngestWorkers        int
 	PosterSecret         string
 	WebhookAdminToken    string
+	WebhookAPIKeys       []string
 	WebhookEncryptionKey string
+	SlackWebhookURL      string
+	DiscordWebhookURL    string
 	IngestInterval       time.Duration
 	PostInterval         time.Duration
 	// ReconcileInterval is how often contract state is read back to repair
@@ -90,8 +94,13 @@ type Config struct {
 }
 
 // Load reads the environment. Missing required values are reported together.
+// A local .env.local overlay is applied first when present, unless
+// GO_ENV=production.
 func Load() (Config, error) {
 	var errs []error
+	if err := loadEnvLocal(); err != nil {
+		errs = append(errs, err)
+	}
 	network := strings.ToLower(envOr("NETWORK", "testnet"))
 	preset, ok := Presets[network]
 	if !ok {
@@ -112,8 +121,19 @@ func Load() (Config, error) {
 		PosterSecret:         os.Getenv("SUPPLY_POSTER_SECRET"),
 		WebhookAdminToken:    os.Getenv("WEBHOOK_ADMIN_TOKEN"),
 		WebhookEncryptionKey: os.Getenv("WEBHOOK_ENCRYPTION_KEY"),
+		SlackWebhookURL:      os.Getenv("SLACK_WEBHOOK_URL"),
+		DiscordWebhookURL:    os.Getenv("DISCORD_WEBHOOK_URL"),
 		LogLevel:             envOr("LOG_LEVEL", "info"),
+		IngestWorkers:        2,
 		KeepAwakeURL:         keepAwakeURL(os.Getenv("KEEP_AWAKE_URL"), os.Getenv("RENDER_EXTERNAL_URL")),
+	}
+	if rawKeys := os.Getenv("WEBHOOK_API_KEYS"); rawKeys != "" {
+		keys, err := parseWebhookAPIKeys(rawKeys, c.WebhookAdminToken)
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			c.WebhookAPIKeys = keys
+		}
 	}
 
 	if c.RPCURL == "" {
@@ -131,6 +151,9 @@ func Load() (Config, error) {
 	if (c.WebhookAdminToken == "") != (c.WebhookEncryptionKey == "") {
 		errs = append(errs, errors.New("WEBHOOK_ADMIN_TOKEN and WEBHOOK_ENCRYPTION_KEY must be configured together"))
 	}
+	if len(c.WebhookAPIKeys) > 0 && c.WebhookAdminToken == "" {
+		errs = append(errs, errors.New("WEBHOOK_API_KEYS requires WEBHOOK_ADMIN_TOKEN and WEBHOOK_ENCRYPTION_KEY"))
+	}
 	if c.WebhookEncryptionKey != "" {
 		key, err := base64.StdEncoding.DecodeString(c.WebhookEncryptionKey)
 		if err != nil || len(key) != 32 {
@@ -143,6 +166,13 @@ func Load() (Config, error) {
 		errs = append(errs, fmt.Errorf("START_LEDGER: %w", err))
 	}
 	c.StartLedger = uint32(start)
+
+	workers, err := strconv.Atoi(envOr("INGEST_WORKERS", "2"))
+	if err != nil || workers < 1 {
+		errs = append(errs, errors.New("INGEST_WORKERS must be a positive integer"))
+	} else {
+		c.IngestWorkers = workers
+	}
 
 	durations := []struct {
 		name string
@@ -192,6 +222,23 @@ func Load() (Config, error) {
 	}
 
 	return c, errors.Join(errs...)
+}
+
+func parseWebhookAPIKeys(raw, adminToken string) ([]string, error) {
+	seen := map[string]struct{}{adminToken: {}}
+	var keys []string
+	for _, key := range strings.Split(raw, ",") {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return nil, errors.New("WEBHOOK_API_KEYS must contain unique, non-empty comma-separated keys")
+		}
+		if _, ok := seen[key]; ok {
+			return nil, errors.New("WEBHOOK_API_KEYS must contain unique, non-empty comma-separated keys")
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	return keys, nil
 }
 
 // keepAwakeURL picks the URL to ping: KEEP_AWAKE_URL if set ("none" turns

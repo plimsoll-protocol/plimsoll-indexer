@@ -14,6 +14,10 @@ cp .env.example .env && set -a && . ./.env && set +a
 go run ./cmd/plimsoll-indexer
 ```
 
+Use `.env.local` for machine-specific overrides; it is gitignored and loaded
+automatically by the indexer. Set `GO_ENV=production` to ignore it (as
+deployments do).
+
 ## End-to-end test
 
 `internal/e2e` runs the standalone network preset and the event ingester
@@ -28,6 +32,28 @@ It needs Docker and port 8000 free, and removes its container afterwards.
 `PLIMSOLL_E2E_IMAGE` overrides the image. The Plimsoll contracts are not
 deployed to that network, so it covers connectivity, the preset defaults and
 the ingest loop, not decoding of contract events.
+
+## Weekly testnet integration
+
+The contracts live on testnet independently of this repository, so
+`.github/workflows/weekly-testnet.yml` runs every Sunday at 06:00 UTC against
+the live deployments. It reads the addresses from `deployments/testnet.json`
+(the same manifest the contracts repository publishes), runs the offline suite,
+the `TestTestnet…` cases in `internal/e2e`, and the live RPC read in
+`internal/worker`. A failure opens or appends to a GitHub issue, and posts to
+`TESTNET_ALERT_WEBHOOK_URL` when that repository secret is set.
+
+Run the live part yourself with:
+
+```bash
+PLIMSOLL_TESTNET=1 go test ./internal/e2e/ -run TestTestnet -v -timeout 10m
+PLIMSOLL_LIVE=1 go test ./internal/worker/ -run TestLive -v
+```
+
+`PLIMSOLL_TESTNET_DEPLOYMENT` points the suite at another manifest, for example
+a fork's or a redeploy's. `TestTestnetDeploymentManifest` needs no network and
+runs in the normal suite, so a malformed address fails the pull request that
+introduced it.
 
 ## Pull request checklist
 

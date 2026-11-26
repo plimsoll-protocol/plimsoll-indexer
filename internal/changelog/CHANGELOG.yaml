@@ -1,0 +1,19 @@
+# Breaking changes to the HTTP API, newest first. GET /v1/changelog serves this
+# file, so clients can discover what they must change without reading release
+# notes. Add an entry when a field is removed, an endpoint is renamed, or a
+# parameter becomes required; those break existing clients. Adding a field or an
+# endpoint does not, so it does not belong here.
+#
+# Each version lists its changes with a kind and a detail:
+#
+#   - version: "1.2.0"
+#     date: "2026-12-01"
+#     changes:
+#       - kind: removed_field
+#         detail: "coverage.ratio was removed; compute it from bps."
+#
+# `make generate` does not touch this file: it is maintained by hand.
+
+- version: "1.0.0"
+  date: "2026-10-05"
+  changes: []

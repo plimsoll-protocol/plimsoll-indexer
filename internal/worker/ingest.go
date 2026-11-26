@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 
@@ -14,8 +15,7 @@ import (
 )
 
 const (
-	cursorName = "plimsoll-events"
-	pageLimit  = 200
+	pageLimit = 200
 )
 
 // eventSource is the RPC surface ingestion needs.
@@ -36,22 +36,111 @@ type Ingester struct {
 	Store       eventStore
 	ContractIDs []string
 	StartLedger uint32
+	Workers     int
 	Log         *slog.Logger
 }
 
 // Run pulls every available page once. Call it on a ticker.
 func (in *Ingester) Run(ctx context.Context) error {
+	contractIDs := uniqueStrings(in.ContractIDs)
+	if len(contractIDs) == 0 {
+		return nil
+	}
+	if len(contractIDs) == 1 {
+		return in.runStream(ctx, store.LegacyIngestCursorName, contractIDs, store.Progress{})
+	}
+
+	legacyProgress, err := in.Store.Progress(ctx, store.LegacyIngestCursorName)
+	if err != nil {
+		return fmt.Errorf("read legacy progress: %w", err)
+	}
+	streams := make([]ingestStream, len(contractIDs))
+	for i, contractID := range contractIDs {
+		streams[i] = ingestStream{
+			name:        store.ContractIngestCursorName(contractID),
+			contractIDs: []string{contractID},
+		}
+	}
+	workers := in.Workers
+	if workers <= 0 {
+		workers = 2
+	}
+	if workers > len(streams) {
+		workers = len(streams)
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	jobs := make(chan ingestStream, len(streams))
+	for _, stream := range streams {
+		jobs <- stream
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	var once sync.Once
+	var runErr error
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for stream := range jobs {
+				if err := in.runStream(ctx, stream.name, stream.contractIDs, legacyProgress); err != nil {
+					once.Do(func() {
+						runErr = err
+						cancel()
+					})
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if runErr != nil {
+		return runErr
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("ingest streams: %w", err)
+	}
+	return nil
+}
+
+type ingestStream struct {
+	name        string
+	contractIDs []string
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	unique := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		unique = append(unique, value)
+	}
+	return unique
+}
+
+func (in *Ingester) runStream(ctx context.Context, cursorName string, contractIDs []string, fallback store.Progress) error {
 	progress, err := in.Store.Progress(ctx, cursorName)
 	if err != nil {
-		return fmt.Errorf("read progress: %w", err)
+		return fmt.Errorf("read progress for %s: %w", cursorName, err)
 	}
 	cursor := progress.Cursor
+	if cursor == "" && progress.ScannedLedger == 0 {
+		cursor = fallback.Cursor
+		if cursor != "" {
+			progress = fallback
+		}
+	}
 	recovered := false
 	for {
 		req := protocol.GetEventsRequest{
 			Filters: []protocol.EventFilter{{
 				EventType:   protocol.EventTypeSet{protocol.EventTypeContract: nil},
-				ContractIDs: in.ContractIDs,
+				ContractIDs: contractIDs,
 			}},
 			Pagination: &protocol.PaginationOptions{Limit: pageLimit},
 		}
@@ -62,7 +151,7 @@ func (in *Ingester) Run(ctx context.Context) error {
 			}
 			req.Pagination.Cursor = &c
 		} else {
-			start, err := in.startLedger(ctx)
+			start, err := in.startLedger(ctx, contractIDs)
 			if err != nil {
 				return err
 			}
@@ -80,7 +169,7 @@ func (in *Ingester) Run(ctx context.Context) error {
 			// cannot spin.
 			if cursor != "" && !recovered && outsideRetention(err) {
 				in.Log.Warn("ingest cursor is older than RPC retention; restarting from the oldest ledger RPC serves and skipping the gap",
-					"cursor", cursor, "scanned_to_ledger", progress.ScannedLedger,
+					"cursor", cursor, "stream", cursorName, "scanned_to_ledger", progress.ScannedLedger,
 					"last_event_ledger", progress.EventLedger, "error", err)
 				cursor, recovered = "", true
 				continue
@@ -92,10 +181,10 @@ func (in *Ingester) Run(ctx context.Context) error {
 			return err
 		}
 		if err := in.Store.ApplyEvents(ctx, cursorName, resp.Cursor, resp.LatestLedger, decoded); err != nil {
-			return fmt.Errorf("apply events: %w", err)
+			return fmt.Errorf("apply events for %s: %w", cursorName, err)
 		}
 		if len(decoded) > 0 {
-			in.Log.Info("ingested events", "count", len(decoded), "latest_ledger", resp.LatestLedger)
+			in.Log.Info("ingested events", "stream", cursorName, "count", len(decoded), "latest_ledger", resp.LatestLedger)
 		}
 		cursor = resp.Cursor
 		if len(resp.Events) < pageLimit {
@@ -135,7 +224,7 @@ func decodePage(events []protocol.EventInfo) ([]any, error) {
 }
 
 // startLedger clamps the configured start to RPC's retention window.
-func (in *Ingester) startLedger(ctx context.Context) (uint32, error) {
+func (in *Ingester) startLedger(ctx context.Context, contractIDs []string) (uint32, error) {
 	latest, err := in.RPC.GetLatestLedger(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("getLatestLedger: %w", err)
@@ -147,7 +236,7 @@ func (in *Ingester) startLedger(ctx context.Context) (uint32, error) {
 	// RPC keeps roughly 7 days; asking for older ledgers is an error.
 	probe, err := in.RPC.GetEvents(ctx, protocol.GetEventsRequest{
 		StartLedger: latest.Sequence,
-		Filters:     []protocol.EventFilter{{ContractIDs: in.ContractIDs}},
+		Filters:     []protocol.EventFilter{{ContractIDs: contractIDs}},
 		Pagination:  &protocol.PaginationOptions{Limit: 1},
 	})
 	if err == nil && start < probe.OldestLedger {

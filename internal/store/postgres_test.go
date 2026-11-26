@@ -3,12 +3,14 @@ package store
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
 )
 
 // The store tests run against a real Postgres: embedded-postgres downloads the
@@ -85,7 +88,7 @@ func freePort() (uint32, error) {
 
 // newDatabase creates an empty database for one test, drops it when the test
 // ends, and returns its URL.
-func newDatabase(t *testing.T) string {
+func newDatabase(t testing.TB) string {
 	t.Helper()
 	if adminURL == "" {
 		t.Skip("embedded postgres is not running (go test -short)")
@@ -116,7 +119,7 @@ func newDatabase(t *testing.T) string {
 
 // openStore opens a Store on a fresh database, applying the schema the way
 // the indexer does on start.
-func openStore(t *testing.T) (*Store, string) {
+func openStore(t testing.TB) (*Store, string) {
 	t.Helper()
 	url := newDatabase(t)
 	s, err := Open(context.Background(), url)
@@ -159,6 +162,40 @@ func testPool(t *testing.T, url string) *pgxpool.Pool {
 	return p
 }
 
+func TestAssetPaginationKeyset(t *testing.T) {
+	s, url := openStore(t)
+	ctx := context.Background()
+	at := time.Date(2026, 11, 25, 2, 0, 0, 0, time.UTC)
+	for i, asset := range []struct {
+		sac, code, issuer string
+	}{
+		{"C1", "PUSD", "G1"},
+		{"C2", "PUSD", "G2"},
+		{"C3", "USDX", "G3"},
+		{"C4", "USDX", "G4"},
+		{"C5", "USDX", "G5"},
+	} {
+		execSQL(t, url, `
+			INSERT INTO assets (sac, code, issuer, listed_ledger, listed_at, event_id)
+			VALUES ($1, $2, $3, $4, $5, $6)`,
+			asset.sac, asset.code, asset.issuer, i+1, at, fmt.Sprintf("listed-%d", i))
+	}
+
+	first, err := s.ListAssetsPage(ctx, 3, "", "")
+	if err != nil || len(first) != 3 ||
+		first[0].Code != "PUSD" || first[1].Issuer != "G2" || first[2].Issuer != "G3" {
+		t.Fatalf("first page = %+v, err=%v", first, err)
+	}
+	middle, err := s.ListAssetsPage(ctx, 3, first[2].Code, first[2].Issuer)
+	if err != nil || len(middle) != 2 || middle[0].Issuer != "G4" || middle[1].Issuer != "G5" {
+		t.Fatalf("middle page = %+v, err=%v", middle, err)
+	}
+	last, err := s.ListAssetsPage(ctx, 3, middle[1].Code, middle[1].Issuer)
+	if err != nil || len(last) != 0 {
+		t.Fatalf("last page = %+v, err=%v", last, err)
+	}
+}
+
 func TestIssuerTomlSnapshotsDetectChanges(t *testing.T) {
 	s, _ := openStore(t)
 	ctx := context.Background()
@@ -194,27 +231,161 @@ func TestWebhookPersistence(t *testing.T) {
 	s, _ := openStore(t)
 	ctx := context.Background()
 	ciphertext := []byte{1, 2, 3, 4}
-	created, err := s.CreateWebhook(ctx, "https://receiver.example/hook", "sha256-hash", ciphertext)
+	ownerKeyHash := "owner-key-hash"
+	created, err := s.CreateWebhook(ctx, "https://receiver.example/hook", "sha256-hash", ciphertext, ownerKeyHash)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if created.ID < 1 || created.SecretHash != "sha256-hash" || !bytes.Equal(created.SecretCiphertext, ciphertext) {
+	if created.ID < 1 || created.SecretHash != "sha256-hash" || created.OwnerKeyHash != ownerKeyHash ||
+		!bytes.Equal(created.SecretCiphertext, ciphertext) {
 		t.Fatalf("created webhook = %+v", created)
 	}
 
+	if err := s.DeleteWebhook(ctx, created.ID, "different-owner", false); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("delete webhook as non-owner: err=%v, want ErrForbidden", err)
+	}
+	if err := s.DeleteWebhook(ctx, created.ID, ownerKeyHash, false); err != nil {
+		t.Fatalf("delete webhook as owner: %v", err)
+	}
+	if err := s.DeleteWebhook(ctx, created.ID, ownerKeyHash, false); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("delete missing webhook: err=%v, want ErrNotFound", err)
+	}
+
 	list, err := s.ListWebhooks(ctx)
-	if err != nil || len(list) != 1 || list[0].ID != created.ID ||
+	if err != nil || len(list) != 0 {
+		t.Fatalf("listed webhooks after delete = %+v, %v", list, err)
+	}
+	if _, err := s.CreateWebhook(ctx, "https://receiver.example/hook", "sha256-hash", ciphertext, ownerKeyHash); err != nil {
+		t.Fatal(err)
+	}
+	list, err = s.ListWebhooks(ctx)
+	if err != nil || len(list) != 1 ||
 		list[0].URL != created.URL || list[0].SecretHash != created.SecretHash ||
 		!bytes.Equal(list[0].SecretCiphertext, ciphertext) {
 		t.Fatalf("listed webhooks = %+v, %v", list, err)
 	}
-	deleted, err := s.DeleteWebhook(ctx, created.ID)
-	if err != nil || !deleted {
-		t.Fatalf("delete webhook: deleted=%v err=%v", deleted, err)
+
+	var legacyID int64
+	err = s.pool.QueryRow(ctx, `
+		INSERT INTO webhooks (url, secret_hash, secret_ciphertext)
+		VALUES ('https://legacy.example/hook', 'legacy-hash', $1)
+		RETURNING id`, ciphertext).Scan(&legacyID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	deleted, err = s.DeleteWebhook(ctx, created.ID)
-	if err != nil || deleted {
-		t.Fatalf("delete missing webhook: deleted=%v err=%v", deleted, err)
+	if err := s.DeleteWebhook(ctx, legacyID, "owner-key-hash", false); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("delete legacy webhook as owner key: err=%v, want ErrForbidden", err)
+	}
+	if err := s.DeleteWebhook(ctx, legacyID, "admin-key-hash", true); err != nil {
+		t.Fatalf("delete legacy webhook as admin: %v", err)
+	}
+}
+
+func TestApplyEventsIsIdempotentAcrossReconnect(t *testing.T) {
+	s, _ := openStore(t)
+	ctx := context.Background()
+	at := time.Date(2026, 11, 25, 5, 0, 0, 0, time.UTC)
+
+	supply := soroban.SupplyPosted{
+		Meta:          soroban.Meta{ID: "supply-event-1", Ledger: 100, ClosedAt: at},
+		SAC:           "CSAC",
+		Amount:        big.NewInt(500),
+		AtLedger:      99,
+		BreakdownHash: "hash",
+		Poster:        "GPOSTER",
+	}
+	reserve := soroban.ReservePosted{
+		Meta:     soroban.Meta{ID: "reserve-event-1", Ledger: 101, ClosedAt: at.Add(time.Minute)},
+		SAC:      "CSAC",
+		Tier:     1,
+		Amount:   big.NewInt(300),
+		AsOf:     at,
+		Reporter: "GREPORTER",
+		DocHash:  "doc-hash",
+		DocURI:   "https://example.com/report",
+	}
+
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-1", 101, []any{supply, reserve}); err != nil {
+		t.Fatalf("apply first page: %v", err)
+	}
+	// A reconnect can return the tail of the first page again alongside new data.
+	nextSupply := supply
+	nextSupply.ID = "supply-event-2"
+	nextSupply.Ledger = 102
+	nextReserve := reserve
+	nextReserve.ID = "reserve-event-2"
+	nextReserve.Ledger = 102
+	nextReserve.AsOf = at.Add(time.Minute)
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-2", 102,
+		[]any{supply, reserve, nextSupply, nextReserve}); err != nil {
+		t.Fatalf("apply replayed page: %v", err)
+	}
+
+	for _, table := range []string{"supply_snapshots", "reserve_reports"} {
+		var count int
+		if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM `+table).Scan(&count); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		if count != 2 {
+			t.Errorf("%s has %d rows after replay, want 2 (one replayed and one new event)", table, count)
+		}
+	}
+
+	progress, err := s.Progress(ctx, "plimsoll-events")
+	if err != nil || progress.Cursor != "cursor-2" {
+		t.Fatalf("progress after replay = %+v, %v", progress, err)
+	}
+}
+
+func TestEventIDMigrationRepairsLegacyTables(t *testing.T) {
+	url := newDatabase(t)
+	schema := strings.ReplaceAll(legacySchema(t),
+		"event_id        TEXT PRIMARY KEY,", "event_id        TEXT NOT NULL,")
+	if !strings.Contains(schema, "event_id        TEXT NOT NULL,") {
+		t.Fatal("legacy schema did not contain event ID primary keys")
+	}
+	execSQL(t, url, schema)
+	execSQL(t, url, `
+		INSERT INTO supply_snapshots
+		  (event_id, sac, amount, at_ledger, breakdown_hash, poster, posted_ledger, posted_at, tx_hash)
+		VALUES
+		  ('supply-duplicate', 'CSAC', 5, 10, 'hash', 'GPOSTER', 10, now(), 'tx'),
+		  ('supply-duplicate', 'CSAC', 5, 10, 'hash', 'GPOSTER', 10, now(), 'tx')`)
+	execSQL(t, url, `
+		INSERT INTO reserve_reports
+		  (event_id, sac, tier, amount, as_of, reporter, doc_hash, doc_uri, posted_ledger, posted_at, tx_hash)
+		VALUES
+		  ('reserve-duplicate', 'CSAC', 1, 5, now(), 'GREPORTER', 'hash', 'https://example.com',
+		   10, now(), 'tx'),
+		  ('reserve-duplicate', 'CSAC', 1, 5, now(), 'GREPORTER', 'hash', 'https://example.com',
+		   10, now(), 'tx')`)
+
+	s, err := Open(context.Background(), url)
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	defer s.Close()
+
+	for _, table := range []string{"supply_snapshots", "reserve_reports"} {
+		var count int
+		if err := s.pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM `+table).Scan(&count); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		if count != 1 {
+			t.Errorf("%s has %d rows after migration, want 1", table, count)
+		}
+	}
+	var constraints int
+	if err := s.pool.QueryRow(context.Background(), `
+		SELECT count(*)
+		FROM pg_constraint
+		WHERE conname IN ('supply_snapshots_event_id_unique', 'reserve_reports_event_id_unique')`,
+	).Scan(&constraints); err != nil {
+		t.Fatal(err)
+	}
+	if constraints != 2 {
+		t.Fatalf("created %d event ID constraints, want 2", constraints)
 	}
 }
 

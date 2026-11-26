@@ -6,16 +6,21 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/crypto/bcrypt"
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
 )
 
 var ErrNotFound = errors.New("not found")
+var ErrForbidden = errors.New("forbidden")
 
 // ErrLockNotAcquired is returned by TryPostLock when another poster instance
 // already holds the advisory lock.
@@ -30,6 +35,7 @@ type Webhook struct {
 	URL              string
 	SecretHash       string
 	SecretCiphertext []byte
+	OwnerKeyHash     string
 	CreatedAt        time.Time
 }
 
@@ -62,6 +68,14 @@ func (s *Store) Close() { s.pool.Close() }
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
 // ---- ingest cursor --------------------------------------------------------
+
+// LegacyIngestCursorName is the pre-streaming cursor retained for upgrades.
+const LegacyIngestCursorName = "plimsoll-events"
+
+// ContractIngestCursorName returns the checkpoint name for one event stream.
+func ContractIngestCursorName(contractID string) string {
+	return LegacyIngestCursorName + ":" + contractID
+}
 
 // Progress is how far ingestion has reached.
 type Progress struct {
@@ -214,6 +228,32 @@ func (s *Store) ListAssets(ctx context.Context) ([]coverage.Asset, error) {
 	return out, rows.Err()
 }
 
+// ListAssetsPage returns rows ordered by (code, issuer). The API requests
+// one extra row to determine whether another page exists.
+func (s *Store) ListAssetsPage(ctx context.Context, limit int, afterCode, afterIssuer string) ([]coverage.Asset, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+assetCols+`
+		FROM assets
+		WHERE ($1 = '' AND $2 = '')
+		   OR code > $1
+		   OR (code = $1 AND issuer > $2)
+		ORDER BY code, issuer
+		LIMIT $3`, afterCode, afterIssuer, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []coverage.Asset
+	for rows.Next() {
+		a, err := scanAsset(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) GetAsset(ctx context.Context, sac string) (coverage.Asset, error) {
 	a, err := scanAsset(s.pool.QueryRow(ctx, `SELECT `+assetCols+` FROM assets WHERE sac = $1`, sac))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -289,21 +329,150 @@ func (s *Store) LatestSupplies(ctx context.Context, sacs []string) (map[string]*
 	return out, nil
 }
 
-func (s *Store) ReportHistory(ctx context.Context, sac string, limit int) ([]coverage.Report, error) {
-	return s.queryReports(ctx, `
-		SELECT tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source,
+// LatestReportsBySAC returns the newest report for each tier of each requested SAC.
+func (s *Store) LatestReportsBySAC(ctx context.Context, sacs []string) (map[string]map[uint32]coverage.Report, error) {
+	out := make(map[string]map[uint32]coverage.Report)
+	if len(sacs) == 0 {
+		return out, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT ON (sac, tier)
+		       sac, tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source,
 		       COALESCE(doc_check, '')
-		FROM reserve_reports WHERE sac = $1
-		ORDER BY posted_ledger DESC, as_of DESC LIMIT $2`, sac, limit)
+		FROM reserve_reports
+		WHERE sac = ANY($1)
+		ORDER BY sac, tier, as_of DESC`, sacs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sac string
+		var r coverage.Report
+		var tier int16
+		var amount string
+		if err := rows.Scan(&sac, &tier, &amount, &r.AsOf, &r.PostedAt, &r.Reporter, &r.DocHash, &r.DocURI, &r.TxHash, &r.Source, &r.DocCheck); err != nil {
+			return nil, err
+		}
+		r.Tier = uint32(tier)
+		r.Amount = mustBig(amount)
+		if out[sac] == nil {
+			out[sac] = make(map[uint32]coverage.Report)
+		}
+		out[sac][r.Tier] = r
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// reportHistorySQL returns one asset's reports newest-posted first. The
+// reserve_reports_sac_posted_ledger index (migration 0004) supplies that order,
+// so LIMIT stops the scan early instead of sorting the whole history.
+const reportHistorySQL = `
+	SELECT tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source,
+	       COALESCE(doc_check, '')
+	FROM reserve_reports WHERE sac = $1
+	ORDER BY posted_ledger DESC, as_of DESC LIMIT $2`
+
+func (s *Store) ReportHistory(ctx context.Context, sac string, limit int) ([]coverage.Report, error) {
+	return s.queryReports(ctx, reportHistorySQL, sac, limit)
+}
+
+// latestReportsSQL asks for one report per tier, each the newest by as_of.
+//
+// It is written as one bounded lookup per tier rather than
+// `DISTINCT ON (tier)` over the asset's reports: the composite index
+// reserve_reports_sac_tier_asof (migration 0001) answers each lookup with a
+// single index probe, so the cost is O(log n) in the asset's report count
+// instead of reading and sorting every report it has ever posted.
+const latestReportsSQL = `
+	SELECT r.tier, r.amount::text, r.as_of, r.posted_at, r.reporter, r.doc_hash, r.doc_uri, r.tx_hash, r.source,
+	       COALESCE(r.doc_check, '')
+	FROM (VALUES (1::smallint), (2::smallint), (3::smallint)) AS wanted(tier)
+	CROSS JOIN LATERAL (
+		SELECT tier, amount, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source, doc_check
+		FROM reserve_reports
+		WHERE sac = $1 AND tier = wanted.tier
+		ORDER BY as_of DESC
+		LIMIT 1
+	) AS r`
+
+type ReportExportCursor struct {
+	Ledger  int64
+	EventID string
+}
+
+type ReportExportRow struct {
+	Ledger    uint32
+	Timestamp time.Time
+	Reporter  string
+	Bps       *uint32
+	Tier      uint32
+	DocURI    string
+	Cursor    ReportExportCursor
+}
+
+// ReportExportPage returns one bounded page of report history in posting order.
+// The optional date bounds are inclusive dates represented as [from, to).
+func (s *Store) ReportExportPage(ctx context.Context, sac string, from, to *time.Time, after *ReportExportCursor, limit int) ([]ReportExportRow, error) {
+	var afterLedger *int64
+	var afterEventID *string
+	if after != nil {
+		afterLedger = &after.Ledger
+		afterEventID = &after.EventID
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT r.posted_ledger, r.event_id, r.posted_at, r.reporter, r.tier, r.doc_uri,
+		       r.amount::text, supply.amount::text
+		FROM reserve_reports r
+		LEFT JOIN LATERAL (
+		    SELECT amount FROM supply_snapshots
+		    WHERE sac = r.sac AND posted_at <= r.posted_at
+		    ORDER BY posted_at DESC, posted_ledger DESC, event_id DESC
+		    LIMIT 1
+		) supply ON true
+		WHERE r.sac = $1
+		  AND ($2::timestamptz IS NULL OR r.posted_at >= $2)
+		  AND ($3::timestamptz IS NULL OR r.posted_at < $3)
+		  AND ($4::bigint IS NULL OR (r.posted_ledger, r.event_id) > ($4, $5))
+		ORDER BY r.posted_ledger, r.event_id
+		LIMIT $6`, sac, from, to, afterLedger, afterEventID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query report export page: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ReportExportRow
+	for rows.Next() {
+		var row ReportExportRow
+		var ledger int64
+		var tier int16
+		var amount string
+		var supplyAmount pgtype.Text
+		if err := rows.Scan(&ledger, &row.Cursor.EventID, &row.Timestamp, &row.Reporter, &tier, &row.DocURI, &amount, &supplyAmount); err != nil {
+			return nil, fmt.Errorf("scan report export row: %w", err)
+		}
+		row.Ledger = uint32(ledger)
+		row.Tier = uint32(tier)
+		row.Cursor.Ledger = ledger
+		if supplyAmount.Valid {
+			bps := coverage.BPS(mustBig(amount), mustBig(supplyAmount.String))
+			row.Bps = &bps
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read report export page: %w", err)
+	}
+	return out, nil
 }
 
 // LatestReports returns the newest report (by as_of) for each tier.
 func (s *Store) LatestReports(ctx context.Context, sac string) (map[uint32]coverage.Report, error) {
-	list, err := s.queryReports(ctx, `
-		SELECT DISTINCT ON (tier) tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source,
-		                           COALESCE(doc_check, '')
-		FROM reserve_reports WHERE sac = $1
-		ORDER BY tier, as_of DESC`, sac)
+	list, err := s.queryReports(ctx, latestReportsSQL, sac)
 	if err != nil {
 		return nil, err
 	}
@@ -456,14 +625,14 @@ func (s *Store) SaveIssuerTomlSnapshot(ctx context.Context, issuer, domain, hash
 	return oldHash, changed, nil
 }
 
-func (s *Store) CreateWebhook(ctx context.Context, url, secretHash string, ciphertext []byte) (Webhook, error) {
+func (s *Store) CreateWebhook(ctx context.Context, url, secretHash string, ciphertext []byte, ownerKeyHash string) (Webhook, error) {
 	var w Webhook
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO webhooks (url, secret_hash, secret_ciphertext)
-		VALUES ($1, $2, $3)
-		RETURNING id, url, secret_hash, secret_ciphertext, created_at`,
-		url, secretHash, ciphertext,
-	).Scan(&w.ID, &w.URL, &w.SecretHash, &w.SecretCiphertext, &w.CreatedAt)
+		INSERT INTO webhooks (url, secret_hash, secret_ciphertext, owner_key_hash)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id, url, secret_hash, secret_ciphertext, owner_key_hash, created_at`,
+		url, secretHash, ciphertext, ownerKeyHash,
+	).Scan(&w.ID, &w.URL, &w.SecretHash, &w.SecretCiphertext, &w.OwnerKeyHash, &w.CreatedAt)
 	if err != nil {
 		return Webhook{}, fmt.Errorf("create webhook: %w", err)
 	}
@@ -489,12 +658,71 @@ func (s *Store) ListWebhooks(ctx context.Context) ([]Webhook, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) DeleteWebhook(ctx context.Context, id int64) (bool, error) {
-	tag, err := s.pool.Exec(ctx, `DELETE FROM webhooks WHERE id = $1`, id)
+func (s *Store) DeleteWebhook(ctx context.Context, id int64, ownerKeyHash string, allowLegacyAdmin bool) error {
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return false, fmt.Errorf("delete webhook: %w", err)
+		return fmt.Errorf("begin delete webhook: %w", err)
 	}
-	return tag.RowsAffected() != 0, nil
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var storedOwner string
+	err = tx.QueryRow(ctx, `SELECT owner_key_hash FROM webhooks WHERE id = $1 FOR UPDATE`, id).Scan(&storedOwner)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("read webhook owner: %w", err)
+	}
+	// Rows created before owner tracking have no key hash and are admin-only.
+	if storedOwner != ownerKeyHash && !(storedOwner == "" && allowLegacyAdmin) {
+		return ErrForbidden
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM webhooks WHERE id = $1`, id); err != nil {
+		return fmt.Errorf("delete webhook: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit delete webhook: %w", err)
+	}
+	return nil
+}
+
+// CreateAPIKey stores a bcrypt hash and returns the selector used to locate it.
+func (s *Store) CreateAPIKey(ctx context.Context, keyHash string) (int64, error) {
+	var id int64
+	err := s.pool.QueryRow(ctx,
+		`INSERT INTO api_keys (key_hash) VALUES ($1) RETURNING id`, keyHash,
+	).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("create API key: %w", err)
+	}
+	return id, nil
+}
+
+// ValidateAPIKey checks the secret portion of an id.secret API key.
+func (s *Store) ValidateAPIKey(ctx context.Context, key string) (bool, error) {
+	id, secret, ok := strings.Cut(key, ".")
+	if !ok || id == "" || secret == "" || strings.Contains(secret, ".") || len(secret) > 72 {
+		return false, nil
+	}
+	var keyID int64
+	keyID, err := strconv.ParseInt(id, 10, 64)
+	if err != nil || keyID < 1 {
+		return false, nil
+	}
+	var hash string
+	if err := s.pool.QueryRow(ctx, `SELECT key_hash FROM api_keys WHERE id = $1`, keyID).Scan(&hash); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read API key: %w", err)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(secret)); err != nil {
+		if errors.Is(err, bcrypt.ErrMismatchedHashAndPassword) {
+			return false, nil
+		}
+		return false, fmt.Errorf("compare API key: %w", err)
+	}
+	return true, nil
 }
 
 func mustBig(s string) *big.Int {
