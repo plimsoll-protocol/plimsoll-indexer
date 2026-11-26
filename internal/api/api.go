@@ -21,6 +21,7 @@ import (
 
 	"github.com/stellar/go-stellar-sdk/strkey"
 
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/changelog"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/webhook"
@@ -78,6 +79,10 @@ type Server struct {
 	// alerts at /v1/coverage-webhooks, administered with the same token.
 	CoverageWebhooks     CoverageWebhookStore
 	WebhookSigningSecret string
+
+	// Changelog is the breaking-change history served at /v1/changelog. It is
+	// loaded from the hand-maintained CHANGELOG.yaml at start-up.
+	Changelog []changelog.Entry
 }
 
 type WebhookManager interface {
@@ -97,10 +102,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/assets/{sac}/supply", s.supplyHistory)
 	mux.HandleFunc("GET /v1/assets/{sac}/reports", s.reportHistory)
 	mux.HandleFunc("GET /v1/reporters", s.reporters)
+	mux.HandleFunc("GET /v1/changelog", s.changelog)
 	mux.HandleFunc("GET /v1/breakdowns/{hash}", s.breakdown)
 	mux.HandleFunc("POST /v1/webhooks", s.createWebhook)
 	mux.HandleFunc("GET /v1/webhooks", s.listWebhooks)
 	mux.HandleFunc("DELETE /v1/webhooks/{id}", s.deleteWebhook)
+	mux.HandleFunc("POST /v1/coverage-webhooks", s.createCoverageWebhook)
+	mux.HandleFunc("DELETE /v1/coverage-webhooks/{id}", s.deleteCoverageWebhook)
 	return s.cors(errorEnvelope(mux))
 }
 
@@ -420,6 +428,14 @@ func (s *Server) reporters(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"reporters": out})
 }
 
+func (s *Server) changelog(w http.ResponseWriter, _ *http.Request) {
+	entries := s.Changelog
+	if entries == nil {
+		entries = []changelog.Entry{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"changelog": entries})
+}
+
 func (s *Server) breakdown(w http.ResponseWriter, r *http.Request) {
 	hash := r.PathValue("hash")
 	if !isBreakdownHash(hash) {
@@ -564,12 +580,12 @@ func (s *Server) createCoverageWebhook(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req coverageWebhookRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "body must be a JSON object")
+		writeError(w, http.StatusBadRequest, codeInvalidBody, "body must be a JSON object")
 		return
 	}
 	req.URL = strings.TrimSpace(req.URL)
-	if err := validateCoverageWebhook(req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if code, msg := validateCoverageWebhook(req); code != "" {
+		writeError(w, http.StatusBadRequest, code, msg)
 		return
 	}
 	wh, err := s.CoverageWebhooks.CreateCoverageWebhook(r.Context(), coverage.Webhook{
@@ -588,12 +604,13 @@ func (s *Server) deleteCoverageWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id <= 0 {
-		writeError(w, http.StatusBadRequest, "id must be a positive integer")
+		writeErrorDetails(w, http.StatusBadRequest, codeInvalidWebhookID,
+			"webhook id must be a positive integer", map[string]any{"id": r.PathValue("id")})
 		return
 	}
 	err = s.CoverageWebhooks.DeleteCoverageWebhook(r.Context(), id)
 	if errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "webhook not found")
+		writeError(w, http.StatusNotFound, codeWebhookNotFound, "webhook not found")
 		return
 	}
 	if err != nil {
@@ -608,7 +625,7 @@ func (s *Server) deleteCoverageWebhook(w http.ResponseWriter, r *http.Request) {
 // when the request is refused.
 func (s *Server) requireCoverageAdmin(w http.ResponseWriter, r *http.Request) bool {
 	if s.WebhookAdminToken == "" || s.CoverageWebhooks == nil || s.WebhookSigningSecret == "" {
-		writeError(w, http.StatusServiceUnavailable, "coverage webhook administration is disabled")
+		writeError(w, http.StatusServiceUnavailable, codeWebhooksNotConfigured, "coverage webhook administration is disabled")
 		return false
 	}
 	const prefix = "Bearer "
@@ -618,27 +635,29 @@ func (s *Server) requireCoverageAdmin(w http.ResponseWriter, r *http.Request) bo
 	}
 	if subtle.ConstantTimeCompare([]byte(token), []byte(s.WebhookAdminToken)) != 1 {
 		w.Header().Set("WWW-Authenticate", "Bearer")
-		writeError(w, http.StatusUnauthorized, "invalid admin token")
+		writeError(w, http.StatusUnauthorized, codeUnauthorized, "invalid admin token")
 		return false
 	}
 	return true
 }
 
-func validateCoverageWebhook(req coverageWebhookRequest) error {
+// validateCoverageWebhook returns an error code and message, both empty when
+// the request is valid.
+func validateCoverageWebhook(req coverageWebhookRequest) (code, msg string) {
 	u, err := url.Parse(req.URL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return errors.New("url must be an absolute http or https URL")
+		return codeInvalidWebhookURL, "url must be an absolute http or https URL"
 	}
 	if req.SAC == "" {
-		return errors.New("sac is required")
+		return codeInvalidSAC, "sac is required"
 	}
 	if req.MinBps < 1 || req.MinBps > 10_000 {
-		return errors.New("min_bps must be between 1 and 10000")
+		return codeInvalidBody, "min_bps must be between 1 and 10000"
 	}
 	if req.MinTier < 1 || req.MinTier > 3 {
-		return errors.New("min_tier must be 1, 2 or 3")
+		return codeInvalidBody, "min_tier must be 1, 2 or 3"
 	}
-	return nil
+	return "", ""
 }
 
 // ---- helpers --------------------------------------------------------------

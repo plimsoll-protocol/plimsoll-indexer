@@ -199,6 +199,7 @@ func serverWithWebhooks(manager WebhookManager, codec *webhook.SecretCodec, toke
 		CORS:              []string{"*"},
 		Log:               slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Now:               func() time.Time { return now },
+		Changelog:         testChangelog,
 	}
 	return httptest.NewServer(s.Handler())
 }

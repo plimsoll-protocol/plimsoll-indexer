@@ -270,6 +270,29 @@ paths:
                       $ref: '#/components/schemas/Reporter'
                 required:
                   - reporters
+  /v1/changelog:
+    get:
+      summary: List breaking changes per released API version
+      operationId: getChangelog
+      description: >-
+        Machine-readable changelog, newest version first, generated from the
+        hand-maintained CHANGELOG.yaml. Each version lists the changes that
+        break existing clients: removed fields, renamed endpoints and new
+        required parameters.
+      responses:
+        '200':
+          description: Breaking changes per version, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  changelog:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ChangelogEntry'
+                required:
+                  - changelog
   /v1/webhooks:
     post:
       summary: Register an issuer TOML change webhook
@@ -457,7 +480,7 @@ paths:
   /v1/coverage-webhooks/{id}:
     delete:
       summary: Remove a webhook registration
-      description: Requires `Authorization: Bearer <WEBHOOK_ADMIN_TOKEN>`.
+      description: 'Requires `Authorization: Bearer <WEBHOOK_ADMIN_TOKEN>`.'
       operationId: deleteCoverageWebhook
       security:
         - WebhookAdminAuth: []
@@ -662,7 +685,8 @@ components:
         listed_at:
           type: string
           format: date-time
-          example: "2026-10-01T00:00:00Z"        toml:
+          example: "2026-10-01T00:00:00Z"
+        toml:
           type: [object, "null"]
           description: >-
             The issuer's SEP-1 data. When the asset's stellar.toml lists
@@ -745,6 +769,39 @@ components:
         - sac
         - min_bps
         - min_tier
+    ChangelogEntry:
+      type: object
+      properties:
+        version:
+          type: string
+          example: "1.2.0"
+        date:
+          type: string
+          format: date
+          example: "2026-12-01"
+        changes:
+          type: array
+          description: Breaking changes introduced in this version; empty when there were none.
+          items:
+            $ref: '#/components/schemas/ChangelogChange'
+      required:
+        - version
+        - date
+        - changes
+    ChangelogChange:
+      type: object
+      properties:
+        kind:
+          type: string
+          description: 'What broke: removed_field, renamed_endpoint, new_required_param, and similarly named breakages.'
+          example: "removed_field"
+        detail:
+          type: string
+          description: What a client must change.
+          example: "coverage.ratio was removed; compute it from bps."
+      required:
+        - kind
+        - detail
     Webhook:
       type: object
       properties:
