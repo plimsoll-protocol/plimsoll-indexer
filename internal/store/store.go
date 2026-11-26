@@ -108,14 +108,21 @@ func (s *Store) Progress(ctx context.Context, name string) (Progress, error) {
 	return p, err
 }
 
-// ApplyEvents writes decoded events and advances the cursor in one transaction.
-func (s *Store) ApplyEvents(ctx context.Context, name, cursor string, ledger uint32, events []any) error {
+// ApplyEvents writes one page of events and advances the cursor in one
+// transaction: raw holds every event in the page, decoded or not, and events
+// the decoded ones. A page delivered twice stores each raw event once.
+func (s *Store) ApplyEvents(ctx context.Context, name, cursor string, ledger uint32, raw []soroban.RawEvent, events []any) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	for _, r := range raw {
+		if err := saveRawEvent(ctx, tx, r); err != nil {
+			return err
+		}
+	}
 	for _, ev := range events {
 		if err := applyEvent(ctx, tx, ev); err != nil {
 			return err
@@ -151,6 +158,117 @@ func (s *Store) ApplyEvents(ctx context.Context, name, cursor string, ledger uin
 		name, cursor, int64(ledger), eventLedger, eventAt)
 	if err != nil {
 		return fmt.Errorf("save cursor: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
+func saveRawEvent(ctx context.Context, tx pgx.Tx, r soroban.RawEvent) error {
+	var closedAt *time.Time
+	if !r.ClosedAt.IsZero() {
+		closedAt = &r.ClosedAt
+	}
+	topics := r.TopicXDR
+	if topics == nil {
+		topics = []string{}
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO raw_events (id, contract, ledger, closed_at, tx_hash, topics_xdr, value_xdr)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (id) DO NOTHING`,
+		r.ID, r.Contract, int64(r.Ledger), closedAt, r.TxHash, topics, r.ValueXDR)
+	if err != nil {
+		return fmt.Errorf("save raw event %s: %w", r.ID, err)
+	}
+	return nil
+}
+
+// ReplayStats counts what ReplayRawEvents read and applied.
+type ReplayStats struct {
+	// Events is every raw event read.
+	Events int
+	// Decoded is the events the current decoder turned into typed rows; the
+	// rest are events it does not track.
+	Decoded int
+}
+
+// ReplayRawEvents decodes every stored raw event again with the current
+// decoder, in event order, and applies the typed rows, batchSize events per
+// transaction. Applying is idempotent, so a replay over tables that already
+// hold the rows leaves them as they are and adds the ones a newer decoder
+// recognises. The ingest cursor is not touched.
+//
+// An event the decoder rejects stops the replay with its id; the batches
+// before it stay applied.
+func (s *Store) ReplayRawEvents(ctx context.Context, batchSize int) (ReplayStats, error) {
+	if batchSize <= 0 {
+		batchSize = 500
+	}
+	var stats ReplayStats
+	after := ""
+	for {
+		batch, err := s.rawEventsAfter(ctx, after, batchSize)
+		if err != nil {
+			return stats, err
+		}
+		if len(batch) == 0 {
+			return stats, nil
+		}
+		decoded := make([]any, 0, len(batch))
+		for _, r := range batch {
+			ev, err := soroban.Decode(r.Info())
+			if err != nil {
+				return stats, fmt.Errorf("replay: %w", err)
+			}
+			if ev != nil {
+				decoded = append(decoded, ev)
+			}
+		}
+		if err := s.applyDecoded(ctx, decoded); err != nil {
+			return stats, fmt.Errorf("replay after %s: %w", after, err)
+		}
+		stats.Events += len(batch)
+		stats.Decoded += len(decoded)
+		after = batch[len(batch)-1].ID
+	}
+}
+
+// rawEventsAfter returns up to limit raw events with ids after the given one,
+// in id order. RPC event ids are zero-padded, so id order is chain order.
+func (s *Store) rawEventsAfter(ctx context.Context, after string, limit int) ([]soroban.RawEvent, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, contract, ledger, closed_at, tx_hash, topics_xdr, value_xdr
+		FROM raw_events WHERE id > $1 ORDER BY id LIMIT $2`, after, limit)
+	if err != nil {
+		return nil, fmt.Errorf("read raw events: %w", err)
+	}
+	defer rows.Close()
+	var out []soroban.RawEvent
+	for rows.Next() {
+		var r soroban.RawEvent
+		var ledger int64
+		var closedAt *time.Time
+		if err := rows.Scan(&r.ID, &r.Contract, &ledger, &closedAt, &r.TxHash, &r.TopicXDR, &r.ValueXDR); err != nil {
+			return nil, fmt.Errorf("read raw events: %w", err)
+		}
+		r.Ledger = uint32(ledger)
+		if closedAt != nil {
+			r.ClosedAt = closedAt.UTC()
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) applyDecoded(ctx context.Context, events []any) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, ev := range events {
+		if err := applyEvent(ctx, tx, ev); err != nil {
+			return err
+		}
 	}
 	return tx.Commit(ctx)
 }

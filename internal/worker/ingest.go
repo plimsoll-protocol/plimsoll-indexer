@@ -27,7 +27,7 @@ type eventSource interface {
 // eventStore is the storage surface ingestion needs.
 type eventStore interface {
 	Progress(ctx context.Context, name string) (store.Progress, error)
-	ApplyEvents(ctx context.Context, name, cursor string, ledger uint32, events []any) error
+	ApplyEvents(ctx context.Context, name, cursor string, ledger uint32, raw []soroban.RawEvent, events []any) error
 }
 
 // Ingester copies Plimsoll contract events from RPC into Postgres.
@@ -176,12 +176,12 @@ func (in *Ingester) runStream(ctx context.Context, cursorName string, contractID
 			}
 			return fmt.Errorf("getEvents: %w", err)
 		}
-		decoded, err := decodePage(resp.Events)
+		raw, decoded, err := decodePage(resp.Events)
 		if err != nil {
 			return err
 		}
-		if err := in.Store.ApplyEvents(ctx, cursorName, resp.Cursor, resp.LatestLedger, decoded); err != nil {
-			return fmt.Errorf("apply events for %s: %w", cursorName, err)
+		if err := in.Store.ApplyEvents(ctx, cursorName, resp.Cursor, resp.LatestLedger, raw, decoded); err != nil {
+			return fmt.Errorf("apply events: %w", err)
 		}
 		if len(decoded) > 0 {
 			in.Log.Info("ingested events", "stream", cursorName, "count", len(decoded), "latest_ledger", resp.LatestLedger)
@@ -202,25 +202,28 @@ func outsideRetention(err error) bool {
 }
 
 // decodePage turns one page of RPC events into the typed events this indexer
-// stores, dropping the ones it does not track.
+// stores. raw keeps every event in the page, including the ones the decoder
+// does not track, so they can be decoded later (see store.ReplayRawEvents).
 //
 // Every event a page carries is kept. RPC used to mark events raised by calls
 // that later failed with inSuccessfulContractCall=false, and stopped sending
 // the field once it only ever returned events from successful calls. Filtering
 // on it silently dropped every event once the field went missing, which wedged
 // ingestion, so the filter is gone rather than defaulted either way.
-func decodePage(events []protocol.EventInfo) ([]any, error) {
+func decodePage(events []protocol.EventInfo) ([]soroban.RawEvent, []any, error) {
+	raw := make([]soroban.RawEvent, 0, len(events))
 	decoded := make([]any, 0, len(events))
 	for _, e := range events {
 		ev, err := soroban.Decode(e)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+		raw = append(raw, soroban.NewRawEvent(e))
 		if ev != nil {
 			decoded = append(decoded, ev)
 		}
 	}
-	return decoded, nil
+	return raw, decoded, nil
 }
 
 // startLedger clamps the configured start to RPC's retention window.

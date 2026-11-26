@@ -23,6 +23,7 @@ import (
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/config"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/horizon"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/worker"
 )
@@ -160,7 +161,7 @@ func (m *memStore) Progress(context.Context, string) (store.Progress, error) {
 	return m.progress, nil
 }
 
-func (m *memStore) ApplyEvents(_ context.Context, _, cursor string, ledger uint32, events []any) error {
+func (m *memStore) ApplyEvents(_ context.Context, _, cursor string, ledger uint32, _ []soroban.RawEvent, events []any) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.progress.Cursor, m.progress.ScannedLedger = cursor, ledger

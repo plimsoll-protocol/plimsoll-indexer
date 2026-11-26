@@ -54,6 +54,24 @@ go run ./cmd/plimsoll-indexer verify --sac <SAC_ADDRESS> [--indexer http://local
 
 The command fetches the asset's snapshot breakdown from the indexer, verifies the snapshot on-chain via Soroban RPC simulation (`get_supply`), checks its SHA-256 hash integrity, recomputes balances directly from Horizon, prints a formatted diff table, and exits `0` on match or `1` on mismatch. Network discovery is fetched automatically from `/v1/network`.
 
+### Raw events and replay
+
+Ingestion keeps every event the two contracts emit in `raw_events` (id,
+contract, ledger, close time, transaction hash, topic and value XDR), written
+in the same transaction as the decoded rows, including events the decoder does
+not track yet. RPC only serves about seven days of events, so this is what lets
+a decoder change apply to older history:
+
+```bash
+DATABASE_URL=postgres://... go run ./cmd/plimsoll-indexer replay [-batch 500]
+```
+
+`replay` decodes every raw event again, in chain order, with the binary's
+decoder and applies the typed rows. Rows that already exist are left as they
+are, so it is safe on a live database, and on an empty one that holds only
+`raw_events` it rebuilds `assets`, `supply_snapshots`, `reserve_reports` and
+`reporters`. The ingest cursor is not touched.
+
 ## API
 
 | Method and path | Returns |

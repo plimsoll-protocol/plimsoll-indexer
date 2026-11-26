@@ -305,7 +305,7 @@ func TestApplyEventsIsIdempotentAcrossReconnect(t *testing.T) {
 		DocURI:   "https://example.com/report",
 	}
 
-	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-1", 101, []any{supply, reserve}); err != nil {
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-1", 101, nil, []any{supply, reserve}); err != nil {
 		t.Fatalf("apply first page: %v", err)
 	}
 	// A reconnect can return the tail of the first page again alongside new data.
@@ -316,7 +316,7 @@ func TestApplyEventsIsIdempotentAcrossReconnect(t *testing.T) {
 	nextReserve.ID = "reserve-event-2"
 	nextReserve.Ledger = 102
 	nextReserve.AsOf = at.Add(time.Minute)
-	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-2", 102,
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-2", 102, nil,
 		[]any{supply, reserve, nextSupply, nextReserve}); err != nil {
 		t.Fatalf("apply replayed page: %v", err)
 	}

@@ -167,8 +167,9 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 	if len(want) == 0 {
 		t.Fatal("fresh database has no schema")
 	}
-if got, want := appliedVersions(t, fresh), embeddedVersions(t); !slices.Equal(got, want) {
-		t.Fatalf("fresh database recorded %v, want %v", got, want)	}
+	if got, want := appliedVersions(t, fresh), embeddedVersions(t); !slices.Equal(got, want) {
+		t.Fatalf("fresh database recorded %v, want %v", got, want)
+	}
 
 	for name, schema := range map[string]string{
 		"created by the last schema.sql":            legacySchema(t),
@@ -195,8 +196,9 @@ if got, want := appliedVersions(t, fresh), embeddedVersions(t); !slices.Equal(go
 			if d := schemaDiff(want, schemaOf(t, url)); len(d) > 0 {
 				t.Fatalf("schema differs from a fresh database:\n%s", strings.Join(d, "\n"))
 			}
-if got, want := appliedVersions(t, url), embeddedVersions(t); !slices.Equal(got, want) {
-				t.Fatalf("recorded %v, want %v", got, want)			}
+			if got, want := appliedVersions(t, url), embeddedVersions(t); !slices.Equal(got, want) {
+				t.Fatalf("recorded %v, want %v", got, want)
+			}
 			a, err := s.GetAsset(context.Background(), "CSAC")
 			if err != nil || a.Code != "PUSD" {
 				t.Fatalf("existing asset after migration: %+v, %v", a, err)
@@ -216,8 +218,9 @@ func TestReopeningAppliesNothingTwice(t *testing.T) {
 		t.Fatal(err)
 	}
 	s2.Close()
-if got, want := appliedVersions(t, url), embeddedVersions(t); !slices.Equal(got, want) {
-		t.Fatalf("recorded %v, want %v", got, want)	}
+	if got, want := appliedVersions(t, url), embeddedVersions(t); !slices.Equal(got, want) {
+		t.Fatalf("recorded %v, want %v", got, want)
+	}
 }
 
 // Instances starting together serialise on the advisory lock. Without it, two
@@ -248,8 +251,9 @@ func TestConcurrentStartsDoNotRace(t *testing.T) {
 	for err := range errs {
 		t.Errorf("concurrent open: %v", err)
 	}
-if got, want := appliedVersions(t, url), embeddedVersions(t); !slices.Equal(got, want) {
-		t.Fatalf("recorded %v, want %v", got, want)	}
+	if got, want := appliedVersions(t, url), embeddedVersions(t); !slices.Equal(got, want) {
+		t.Fatalf("recorded %v, want %v", got, want)
+	}
 }
 
 func tableExists(t *testing.T, p *pgxpool.Pool, name string) bool {

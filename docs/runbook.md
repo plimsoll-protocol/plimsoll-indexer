@@ -159,6 +159,12 @@ reached the chain`. A 404 for a hash that is on chain therefore means the
 confirmation has not run yet (check `job failed` entries with `job=poster` and
 `job=ingest`) or the breakdown was never stored by this database.
 
+**After a decoder change.** Events the old decoder did not track are already
+in `raw_events`. Deploy the new binary, then run
+`plimsoll-indexer replay` against the same `DATABASE_URL` once: it prints how
+many raw events it decoded. It is idempotent and can run while the indexer is
+up.
+
 **Move to another network.** Set `NETWORK` (and `STELLAR_RPC_URL` for mainnet),
 the two contract ids and `START_LEDGER` for that deployment. Use a fresh
 database: one database holds one network's history.
@@ -166,7 +172,8 @@ database: one database holds one network's history.
 **Database restore or loss.** The schema recreates itself. Ingestion restarts
 from `START_LEDGER` and is clamped to RPC retention; older events cannot be
 recovered from RPC, but the reconciler restores the latest supply and report
-state from the contracts. Breakdowns for old snapshots can be lost: they are
+state from the contracts. A backup that holds `raw_events` can rebuild the
+typed tables with `plimsoll-indexer replay`. Breakdowns for old snapshots can be lost: they are
 stored only in this database.
 
 ## Local network testing
