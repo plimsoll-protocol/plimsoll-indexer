@@ -326,6 +326,47 @@ func TestPosterPostsWhenLockIsAcquired(t *testing.T) {
 	}
 }
 
+func TestPosterWarnsWhenSupplyMovesSixOrdersOfMagnitude(t *testing.T) {
+	var buf strings.Builder
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	b := testBreakdown("100000", 5_469_000)
+	db := &fakeBreakdowns{have: map[string]bool{b.Hash(): true}}
+	c := &fakeContracts{supply: onChainSnapshot(t, 1_000_000_000_000, 5_468_000, postedAt.Add(-time.Minute), b.Hash())}
+	p := newPoster(&fakeHorizon{breakdown: b}, c, db)
+	p.DecimalCheck = true
+	p.Log = log
+
+	if err := p.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.invoked) != 1 {
+		t.Fatalf("invoked %v, want the snapshot posted despite the warning", c.invoked)
+	}
+	got := buf.String()
+	for _, want := range []string{"six orders", "previous_amount=1000000000000", "new_amount=100000", "code=PUSD", "issuer=GISSUER"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("warning %q does not contain %q", got, want)
+		}
+	}
+}
+
+func TestPosterDecimalCheckCanBeDisabled(t *testing.T) {
+	var buf strings.Builder
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	b := testBreakdown("100000", 5_469_000)
+	db := &fakeBreakdowns{have: map[string]bool{b.Hash(): true}}
+	c := &fakeContracts{supply: onChainSnapshot(t, 1_000_000_000_000, 5_468_000, postedAt.Add(-time.Minute), b.Hash())}
+	p := newPoster(&fakeHorizon{breakdown: b}, c, db)
+	p.Log = log // DecimalCheck is left at its disabled zero value.
+
+	if err := p.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf.String(), "six orders") {
+		t.Errorf("disabled check still warned: %s", buf.String())
+	}
+}
+
 // TestPosterPostsZeroSnapshotForAssetWithNoHolders proves that an asset with
 // no trustlines gets a zero snapshot posted (u32::MAX bps = fully covered)
 // rather than being left as 'unknown'. Fixes #46.

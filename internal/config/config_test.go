@@ -24,7 +24,7 @@ func TestKeepAwakeURL(t *testing.T) {
 
 func setBase(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"NETWORK", "STELLAR_RPC_URL", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE", "WEBHOOK_ADMIN_TOKEN", "WEBHOOK_ENCRYPTION_KEY"} {
+	for _, k := range []string{"NETWORK", "STELLAR_RPC_URL", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE", "WEBHOOK_ADMIN_TOKEN", "WEBHOOK_ENCRYPTION_KEY", "DECIMAL_CHECK_ENABLED"} {
 		t.Setenv(k, "")
 	}
 	t.Setenv("DATABASE_URL", "postgres://x")
@@ -302,6 +302,33 @@ func TestKeepAwakeURLIntegration(t *testing.T) {
 				t.Errorf("KeepAwakeURL = %q, want %q", got.KeepAwakeURL, c.want)
 			}
 		})
+	}
+}
+
+func TestDecimalCheckEnabled(t *testing.T) {
+	setBase(t)
+	got, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.DecimalCheckEnabled {
+		t.Error("DecimalCheckEnabled = false by default, want true")
+	}
+
+	setBase(t)
+	t.Setenv("DECIMAL_CHECK_ENABLED", "false")
+	got, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DecimalCheckEnabled {
+		t.Error("DecimalCheckEnabled = true with DECIMAL_CHECK_ENABLED=false")
+	}
+
+	setBase(t)
+	t.Setenv("DECIMAL_CHECK_ENABLED", "sometimes")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "DECIMAL_CHECK_ENABLED") {
+		t.Fatalf("want an invalid boolean error, got %v", err)
 	}
 }
 
