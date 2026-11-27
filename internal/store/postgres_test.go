@@ -18,6 +18,7 @@ import (
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
@@ -537,6 +538,7 @@ func TestApplyEventsIsIdempotentAcrossReconnect(t *testing.T) {
 		BreakdownHash: "hash",
 		Poster:        "GPOSTER",
 	}
+
 	reserve := soroban.ReservePosted{
 		Meta:     soroban.Meta{ID: "reserve-event-1", Ledger: 101, ClosedAt: at.Add(time.Minute)},
 		SAC:      "CSAC",
@@ -616,6 +618,46 @@ func TestDisputesByAssetAndStatus(t *testing.T) {
 	page, err := s.Disputes(ctx, "CSAC", "", 1, 1)
 	if err != nil || len(page) != 1 || page[0].Status != "resolved" {
 		t.Fatalf("second page = %+v, %v; want the resolved dispute", page, err)
+func TestBackfillCannotRegressReporterState(t *testing.T) {
+	s, _ := openStore(t)
+	ctx := context.Background()
+	at := time.Date(2026, 11, 25, 8, 0, 0, 0, time.UTC)
+	reporter := "GDACI55IMI5DDZWMZ2EAXWK57AV75VE4626YYBAHQJYDV7QFPNNFK6HJ"
+	newerID := (protocol.Cursor{Ledger: 200, Tx: 3}).String()
+	olderSameLedgerID := (protocol.Cursor{Ledger: 200, Tx: 2}).String()
+
+	if err := s.ApplyEvents(ctx, "plimsoll-events", newerID, 200, []any{
+		soroban.ReporterSet{
+			Meta:     soroban.Meta{ID: newerID, Ledger: 200, ClosedAt: at},
+			Reporter: reporter, Role: 2, Name: "newer",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ApplyEvents(ctx, "plimsoll-backfill", olderSameLedgerID, 200, []any{
+		soroban.ReporterSet{
+			Meta:     soroban.Meta{ID: olderSameLedgerID, Ledger: 200, ClosedAt: at},
+			Reporter: reporter, Role: 1, Name: "older",
+		},
+		soroban.ReporterRevoked{
+			Meta:     soroban.Meta{ID: olderSameLedgerID, Ledger: 200, ClosedAt: at},
+			Reporter: reporter,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var role int16
+	var name string
+	var active bool
+	var eventID string
+	if err := s.pool.QueryRow(ctx, `
+		SELECT role, name, active, updated_event_id FROM reporters WHERE address = $1`, reporter,
+	).Scan(&role, &name, &active, &eventID); err != nil {
+		t.Fatal(err)
+	}
+	if role != 2 || name != "newer" || !active || eventID != newerID {
+		t.Fatalf("reporter state = role %d name %q active %v event %q", role, name, active, eventID)
 	}
 }
 

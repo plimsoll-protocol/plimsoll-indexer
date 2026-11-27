@@ -130,6 +130,7 @@ type Server struct {
 	Changelog []changelog.Entry
 	Network           NetworkInfo
 	CORS              []string
+	Metrics           *metrics.Metrics
 	Log               *slog.Logger
 	Now               func() time.Time
 
@@ -211,6 +212,11 @@ func (s *Server) compress(next http.Handler) http.Handler {
 			s.Log.Error("write compressed API response", "err", err)
 		}
 	})
+	if s.Metrics != nil {
+		mux.Handle("GET /metrics", s.Metrics.Handler())
+		return s.Metrics.Middleware(s.cors(mux))
+	}
+	return s.cors(mux)
 }
 
 // ---- JSON shapes ----------------------------------------------------------

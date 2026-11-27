@@ -45,6 +45,10 @@ type eventStore interface {
 	LatestReporterReports(ctx context.Context) ([]store.ReporterLatestReport, error)
 }
 
+type ingestMetrics interface {
+	SetIngestProgress(ingested, latest uint32)
+}
+
 // Ingester copies Plimsoll contract events from RPC into Postgres.
 type Ingester struct {
 	RPC         EventSource
@@ -70,6 +74,7 @@ type Ingester struct {
 	// scan has reached. Reindex uses it to report progress every 1 000
 	// ledgers; normal ingestion leaves it nil.
 	OnProgress func(scannedLedger uint32)
+	Metrics     ingestMetrics
 }
 
 // Run pulls every available page once. Call it on a ticker.
@@ -160,6 +165,16 @@ func (in *Ingester) runStream(ctx context.Context, cursorName string, contractID
 	if err != nil {
 		return fmt.Errorf("read progress for %s: %w", cursorName, err)
 	}
+	latestLedger := progress.ScannedLedger
+	if in.Metrics != nil {
+		latest, err := in.RPC.GetLatestLedger(ctx)
+		if err != nil {
+			in.Log.Warn("could not refresh ingest metrics", "err", err)
+		} else {
+			latestLedger = latest.Sequence
+			in.Metrics.SetIngestProgress(progress.ScannedLedger, latestLedger)
+		}
+	}
 	cursor := progress.Cursor
 	if cursor == "" && progress.ScannedLedger == 0 {
 		cursor = fallback.Cursor
@@ -240,6 +255,11 @@ func (in *Ingester) runStream(ctx context.Context, cursorName string, contractID
 			if c, err := protocol.ParseCursor(resp.Cursor); err == nil {
 				in.OnProgress(c.Ledger)
 			}
+		if resp.LatestLedger > latestLedger {
+			latestLedger = resp.LatestLedger
+		}
+		if in.Metrics != nil {
+			in.Metrics.SetIngestProgress(resp.LatestLedger, latestLedger)
 		}
 		if len(decoded) > 0 {
 			in.Log.Info("ingested events", "stream", cursorName, "count", len(decoded), "latest_ledger", resp.LatestLedger)
