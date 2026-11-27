@@ -151,6 +151,7 @@ progress logs to estimate the full range.
 | `GET /v1/assets/{sac}/supply?limit=100` | Supply snapshot history. Each row carries `source`: `event` for a figure decoded from a contract event, with the `tx_hash` that produced it, or `chain` for one recovered from contract state after an ingestion gap, where `tx_hash` is empty. |
 | `GET /v1/assets/{sac}/reports?limit=100` | Reserve report history |
 | `GET /v1/assets/{sac}/coverage/now` | The `bps`, `tier`, `as_of` and `reporter` of the live report `coverage()` selects, without the asset document. `404` when no live report exists |
+| `GET /v1/assets/{sac}/coverage?from=&to=&interval=1h&min_tier=1` | Coverage time series. Each point uses the latest supply snapshot and the best report posted at or before it, selected and rounded by the same rules as `coverage()` on-chain. `from` and `to` are RFC 3339 timestamps (default: the last 24 hours); `interval` runs from `5m` to `7d`; a request returns at most 1,000 points. |
 | `GET /v1/reporters` | Active registered reporters |
 | `GET /v1/changelog` | Breaking API changes per released version, newest first |
 | `GET /v1/breakdowns/{hash}` | Exact bytes of a supply breakdown that backs an on-chain snapshot |

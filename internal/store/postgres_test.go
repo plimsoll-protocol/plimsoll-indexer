@@ -774,5 +774,88 @@ func TestLatestSuppliesAndReportsBySAC(t *testing.T) {
 	}
 	if len(bySAC["CSAC2"]) != 1 {
 		t.Fatalf("CSAC2 reports = %+v", bySAC["CSAC2"])
+func TestSeriesInputsIncludeStateBeforeWindow(t *testing.T) {
+	s, url := openStore(t)
+	ctx := context.Background()
+	at := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+
+	supply := []struct {
+		event  string
+		amount int64
+		ledger int64
+		posted time.Time
+	}{
+		{"supply-old", 100, 10, at.Add(-2 * time.Hour)},
+		{"supply-new", 200, 20, at.Add(-10 * time.Minute)},
+		{"supply-future", 300, 30, at.Add(time.Hour)},
+	}
+	for _, row := range supply {
+		execSQL(t, url, `
+			INSERT INTO supply_snapshots
+			  (event_id, sac, amount, at_ledger, breakdown_hash, poster, posted_ledger, posted_at, tx_hash, source)
+			VALUES ($1, 'CSAC', $2::numeric, $3, 'hash', 'GPOSTER', $3, $4, 'tx', 'event')`,
+			row.event, row.amount, row.ledger, row.posted)
+	}
+
+	from, to := at.Add(-time.Hour), at
+	got, err := s.SeriesSupply(ctx, "CSAC", from, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Ledger != 10 || got[1].Ledger != 20 {
+		t.Fatalf("series supply = %+v", got)
+	}
+	if got[1].Amount.Int64() != 200 {
+		t.Fatalf("newest amount = %v", got[1].Amount)
+	}
+
+	// With the whole window before any row, the latest state is still returned.
+	got, err = s.SeriesSupply(ctx, "CSAC", at, at)
+	if err != nil || len(got) != 1 || got[0].Ledger != 20 {
+		t.Fatalf("latest supply at %v = %+v, %v", at, got, err)
+	}
+
+	reports := []struct {
+		event  string
+		tier   int16
+		amount int64
+		asOf   time.Time
+		posted time.Time
+	}{
+		{"report-t1-old", 1, 110, at.Add(-4 * time.Hour), at.Add(-2 * time.Hour)},
+		{"report-t2", 2, 150, at.Add(-5 * time.Hour), at.Add(-90 * time.Minute)},
+		{"report-t1-new", 1, 120, at.Add(-3 * time.Hour), at.Add(-30 * time.Minute)},
+	}
+	for _, row := range reports {
+		execSQL(t, url, `
+			INSERT INTO reserve_reports
+			  (event_id, sac, tier, amount, as_of, reporter, doc_hash, doc_uri, posted_ledger, posted_at, tx_hash, source)
+			VALUES ($1, 'CSAC', $2, $3::numeric, $4, 'GREPORTER', 'doc', 'https://example.com', 1, $5, 'tx', 'event')`,
+			row.event, row.tier, row.amount, row.asOf, row.posted)
+	}
+
+	reps, err := s.SeriesReports(ctx, "CSAC", from, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reps) != 3 {
+		t.Fatalf("series reports = %+v", reps)
+	}
+	for i := 1; i < len(reps); i++ {
+		if reps[i].PostedAt.Before(reps[i-1].PostedAt) {
+			t.Fatalf("reports not oldest first: %+v", reps)
+		}
+	}
+
+	reps, err = s.SeriesReports(ctx, "CSAC", at, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byTier := map[uint32]coverage.Report{}
+	for _, rep := range reps {
+		byTier[rep.Tier] = rep
+	}
+	if len(reps) != 2 || byTier[1].Amount.Int64() != 120 || byTier[2].Amount.Int64() != 150 {
+		t.Fatalf("best reports at %v = %+v", at, reps)
 	}
 }
