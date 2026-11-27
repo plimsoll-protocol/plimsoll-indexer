@@ -649,6 +649,34 @@ func TestReportExportStreamsPagesAndAppliesDateFilters(t *testing.T) {
 	}
 }
 
+// adminRequest sends a webhook-administration request and returns the status
+// and decoded body (nil for 204).
+func adminRequest(t *testing.T, srv *httptest.Server, method, path, token, body string) (int, map[string]any) {
+	t.Helper()
+	var r io.Reader
+	if body != "" {
+		r = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, srv.URL+path, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent {
+		return resp.StatusCode, nil
+	}
+	var out map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return resp.StatusCode, out
+}
+
 func makeExportRows(n int) []store.ReportExportRow {
 	rows := make([]store.ReportExportRow, n)
 	bps := uint32(10_200)
@@ -978,7 +1006,7 @@ type unreadable struct{ *fake }
 
 var errUnreadable = errors.New(`supply snapshot at ledger 100: amount "NaN" is not an integer`)
 
-func (unreadable) LatestSupply(context.Context, string) (*coverage.Supply, error) {
+func (unreadable) LatestSupplies(context.Context, []string) (map[string]*coverage.Supply, error) {
 	return nil, errUnreadable
 }
 
@@ -988,7 +1016,7 @@ func (unreadable) LatestSupplies(context.Context, []string) (map[string]*coverag
 func (unreadable) SupplyHistory(context.Context, string, int) ([]coverage.Supply, error) {
 	return nil, errUnreadable
 }
-func (unreadable) LatestReports(context.Context, string) (map[uint32]coverage.Report, error) {
+func (unreadable) LatestReportsBySAC(context.Context, []string) (map[string]map[uint32]coverage.Report, error) {
 	return nil, errUnreadable
 }
 func (unreadable) LatestReportsBySAC(context.Context, []string) (map[string]map[uint32]coverage.Report, error) {

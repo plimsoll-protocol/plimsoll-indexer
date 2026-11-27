@@ -336,6 +336,7 @@ type eventTrackingStore struct {
 	mu       sync.Mutex
 	names    map[string]bool
 	eventIDs map[string]int
+	raw      [][]soroban.RawEvent
 }
 
 func (s *eventTrackingStore) Progress(context.Context, string) (store.Progress, error) {
@@ -346,6 +347,7 @@ func (s *eventTrackingStore) ApplyEvents(_ context.Context, name, _ string, _ ui
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.names[name] = true
+	s.raw = append(s.raw, raw)
 	for _, event := range events {
 		supply, ok := event.(soroban.SupplyPosted)
 		if !ok {

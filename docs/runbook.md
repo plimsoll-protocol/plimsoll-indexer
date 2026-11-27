@@ -39,7 +39,10 @@ values are reported together at startup.
 | `STELLAR_NETWORK_PASSPHRASE` | preset | Must match the network, or signed posts are rejected. |
 | `HORIZON_CHECK_URL` | empty | Second, independently operated Horizon. Empty disables the cross-check. |
 | `START_LEDGER` | `0` | First ledger to ingest. `0` or a ledger in the future means "latest"; older than RPC retention is clamped. |
-| `SUPPLY_POSTER_SECRET` | empty | Empty runs read-only. Never log or share it. |
+| `SUPPLY_POSTER_SECRET` | empty | Empty runs read-only. Never log or share it. Ignored when `SUPPLY_POSTER_SECRET_NAME` is set. |
+| `SECRETS_PROVIDER` | `env` | `env`, `ssm` (AWS Systems Manager Parameter Store) or `gcp` (GCP Secret Manager). |
+| `SUPPLY_POSTER_SECRET_NAME` | empty | SSM parameter or GCP secret holding the poster secret. Empty keeps `SUPPLY_POSTER_SECRET`. |
+| `DATABASE_PASSWORD_SECRET_NAME` | empty | SSM parameter or GCP secret holding the database password. Empty keeps the password in `DATABASE_URL`. |
 | `WEBHOOK_ADMIN_TOKEN` | empty | Enables authenticated webhook management when set with `WEBHOOK_ENCRYPTION_KEY`. |
 | `WEBHOOK_API_KEYS` | empty | Optional comma-separated owner API keys; each can delete only its own webhooks. |
 | `WEBHOOK_ENCRYPTION_KEY` | empty | Base64-encoded 32-byte key (`openssl rand -base64 32`); keep stable to preserve webhook delivery. |
@@ -56,6 +59,25 @@ values are reported together at startup.
 | `HTTP_KEEPALIVE_TIMEOUT` | `90s` | How long an idle HTTP/2 connection to Horizon or Soroban RPC is kept open for reuse. |
 
 Intervals use Go duration syntax (`10s`, `15m`, `6h`).
+
+### Secrets backend
+
+`SECRETS_PROVIDER` selects where the poster secret and the database password
+come from. `env` (the default) reads `SUPPLY_POSTER_SECRET` and the password in
+`DATABASE_URL`. `ssm` reads AWS Systems Manager Parameter Store parameters and
+needs `AWS_REGION` plus the AWS SDK's usual credentials (environment, shared
+config or instance role). `gcp` reads GCP Secret Manager with application
+default credentials; `GOOGLE_CLOUD_PROJECT` is needed when
+`*_SECRET_NAME` is a bare secret id rather than a `projects/…` resource.
+
+`SUPPLY_POSTER_SECRET_NAME` and `DATABASE_PASSWORD_SECRET_NAME` name the
+parameter or secret. Values are fetched once before the database connection is
+opened, so a rotated secret takes effect on restart. Leave a name empty and
+that credential keeps its environment variable, which lets one stay in env vars
+while the other comes from the backend. Lookups are made with decryption on
+for SSM (`SecureString`) and against the latest version for GCP; a missing or
+empty secret stops startup with an error naming the variable and the key, never
+the value.
 
 Presets:
 
@@ -134,6 +156,8 @@ Logs are JSON (`log/slog`). Key messages:
 | info | `coverage below webhook threshold` (`webhook_id`, `sac`, `bps`, `min_bps`) | A registered alert fired. |
 | warn | `webhook delivery failed` (`webhook_id`, `delivery_id`, `status`, `retry_at`) | Delivery will be retried with backoff, at most five attempts in total. |
 | info | `supply posting disabled (SUPPLY_POSTER_SECRET not set)` | Expected on read-only instances. |
+| info | `supply posting disabled (no poster secret configured)` | Expected on read-only instances. |
+| info | `secrets loaded` (`provider`) | Credentials were read from `ssm` or `gcp`. The values themselves are never logged. |
 | info | `supply cross-check disabled (HORIZON_CHECK_URL not set)` | The poster signs on one Horizon's word. |
 | info | `indexed reporter events` | The reporter watcher stored a registration or revocation. |
 | info | `replay progress` / `replay complete` | A `replay` run advanced through its ledger range. |
@@ -143,9 +167,10 @@ Logs are JSON (`log/slog`). Key messages:
 ## Common procedures
 
 **Enable posting.** The account must be registered as `SupplyPoster` in the
-reporter registry and funded for fees. Set `SUPPLY_POSTER_SECRET`, restart, and
-look for `supply posting enabled` with the poster address. An invalid seed stops
-startup with `SUPPLY_POSTER_SECRET is not a valid secret seed`.
+reporter registry and funded for fees. Set `SUPPLY_POSTER_SECRET`, or name a
+backend secret in `SUPPLY_POSTER_SECRET_NAME`, restart, and look for `supply
+posting enabled` with the poster address. An invalid seed stops startup with
+`SUPPLY_POSTER_SECRET is not a valid secret seed`.
 
 **Rotate the poster key.** Register the new account as `SupplyPoster`, set the
 new secret, restart, confirm a post succeeds, then revoke the old reporter.

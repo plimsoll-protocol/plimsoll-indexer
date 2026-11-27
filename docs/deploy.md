@@ -29,6 +29,14 @@ seed of a funded account registered with the reporter registry's `SupplyPoster`
 role. Never put a seed in this guide, source control, an image, or a checked-in
 environment file.
 
+Instead of environment variables, the poster secret and the database password
+can come from a secrets backend. Set `SECRETS_PROVIDER=ssm` (AWS Systems Manager
+Parameter Store) or `gcp` (GCP Secret Manager) and name the parameter or secret
+in `SUPPLY_POSTER_SECRET_NAME` and `DATABASE_PASSWORD_SECRET_NAME`. Values are
+fetched once at startup and never logged. Leave a name unset to keep that
+credential in its environment variable. See the
+[operations runbook](runbook.md#secrets-backend) for the provider setup details.
+
 Optional webhook administration requires both `WEBHOOK_ADMIN_TOKEN` and
 `WEBHOOK_ENCRYPTION_KEY`. The latter must be a base64-encoded 32-byte key; for
 example, generate one with `openssl rand -base64 32`. Keep it stable because

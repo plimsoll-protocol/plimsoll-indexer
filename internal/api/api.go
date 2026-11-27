@@ -553,12 +553,25 @@ func (s *Server) assembleWithData(ctx context.Context, a coverage.Asset, sp *cov
 	if err != nil {
 		return assetJSON{}, err
 	}
+	out := s.assembleWithData(a, supplies[a.SAC], reportsBySAC[a.SAC], minTier)
+	out.Toml = tomlBody
+	return out, nil
+}
+
+func (s *Server) assembleWithData(a coverage.Asset, sp *coverage.Supply, reports map[uint32]coverage.Report, minTier uint32) assetJSON {
 	out := assetJSON{
-		Asset:    a,
-		Toml:     tomlBody,
-		Supply:   toSupply(sp),
-		Reports:  map[string]*reportJSON{},
-		Coverage: s.toCoverage(coverage.Compute(sp, reports, minTier)),
+		Asset:         a,
+		Toml:          json.RawMessage("null"),
+		TomlCheckedAt: a.TomlCheckedAt,
+		Supply:        toSupply(sp),
+		Reports:       map[string]*reportJSON{},
+		Coverage:      s.toCoverage(coverage.Compute(sp, reports, minTier)),
+	}
+	if a.TomlError != "" {
+		out.TomlError = &a.TomlError
+	}
+	if len(a.Toml) > 0 {
+		out.Toml = a.Toml
 	}
 	for tier, rep := range reports {
 		out.Reports[coverage.TierName(tier)] = toReport(rep)
@@ -1264,6 +1277,7 @@ const (
 	codeUnauthorized          = "unauthorized"
 	codeAuthUnavailable       = "auth_unavailable"
 	codeInternal              = "internal_error"
+	codeAPIAuthNotConfigured  = "api_auth_not_configured"
 	codeDBUnavailable         = "db_unavailable"
 	codeProgressUnavailable   = "progress_unavailable"
 )
