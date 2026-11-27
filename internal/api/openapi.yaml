@@ -180,6 +180,50 @@ paths:
                 items:
                   $ref: '#/components/schemas/Reporter'
   /v1/webhooks/test:
+                type: object
+                properties:
+                  reporters:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Reporter'
+                required:
+                  - reporters
+  /v1/events:
+    get:
+      summary: Stream ingested contract events as server-sent events
+      operationId: streamEvents
+      description: |
+        Emits `asset_listed`, `supply_posted` and `reserve_posted` frames as
+        they commit during ingestion, so a client does not have to poll. Each
+        frame's `data` is the same JSON the corresponding REST resource serves.
+        Send the `id` of the last frame received as `Last-Event-ID` when
+        reconnecting to replay missed events from storage. `: keepalive`
+        comments are sent on idle connections.
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          required: false
+          description: Event id to resume after; the last `id` the client received.
+          schema:
+            type: string
+            example: "0023421401557905408-0000000000"
+      responses:
+        '200':
+          description: >-
+            Server-sent event stream. Frames carry an `id`, an `event` name
+            (`asset_listed`, `supply_posted` or `reserve_posted`) and a single
+            JSON `data` line.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '503':
+          description: Streaming is not configured, or the subscriber cap is reached
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/webhooks:
     post:
       summary: Register an issuer TOML change webhook endpoint
       operationId: createWebhook

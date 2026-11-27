@@ -108,6 +108,10 @@ One command serves both modes: `replay` with no `-from`/`-to` rebuilds from
 | `POST /v1/webhooks`, `GET /v1/webhooks`, `DELETE /v1/webhooks/{id}` | Manage authenticated issuer TOML change subscriptions. One API key may register up to 10 endpoints; every event fans out to all of them, and `GET /v1/webhooks` reports delivery state per endpoint. |
 | `POST /v1/coverage-webhooks` | Register a coverage threshold (admin token required) |
 | `DELETE /v1/coverage-webhooks/{id}` | Remove a registration and its delivery log (admin token required) |
+| `GET /v1/breakdowns/{hash}` | Exact bytes of a supply breakdown |
+| `GET /v1/events` | `text/event-stream` of `asset_listed`, `supply_posted` and `reserve_posted`, for clients that would otherwise poll |
+| `POST /v1/webhooks`, `GET /v1/webhooks`, `DELETE /v1/webhooks/{id}` | Manage authenticated issuer TOML change subscriptions |
+
 Every `4xx` and `5xx` response has the same body:
 `{"code":"asset_not_listed","message":"…"}`, with an optional `details` object.
 `code` is machine-readable and stable, so clients should match on it instead of
@@ -153,6 +157,43 @@ The payload carries `event` (`coverage_dropped`), `webhook_id`, `sac`,
 and timestamps are UTC. Deliveries are logged in `coverage_webhook_deliveries` and
 retried with exponential backoff (30s, 1m, 2m, 4m) until they succeed or five
 attempts have been made.
+### Live events
+
+`GET /v1/events` streams ingested events as server-sent events, so a dashboard
+can update when a report lands instead of refetching every asset on a timer:
+
+```bash
+curl -N localhost:8080/v1/events
+```
+
+```
+id: 0023421401557905408-0000000000
+event: supply_posted
+data: {"amount":"9999000000000","ledger":5453219,"posted_at":"2026-10-29T16:02:20Z",...}
+
+: keepalive
+
+```
+
+Each event's `data` is the same JSON the corresponding REST resource serves
+(`Supply`, `Report`, or the listed fields of `Asset`). Events are fanned out
+from the ingest transaction as soon as it commits, so they arrive within one
+`INGEST_INTERVAL`; a `: keepalive` comment every 15 s holds idle connections
+open. At most 128 subscribers are served at once (the rest get `503`); a
+subscriber that stops reading is disconnected rather than allowed to delay
+ingestion.
+
+Resume with the event id: send the `id` of the last event received as
+`Last-Event-ID` on reconnect — EventSource does this automatically — and the
+indexer replays what was missed from Postgres before continuing with live
+events:
+
+```bash
+curl -N -H 'Last-Event-ID: 0023421401557905408-0000000000' localhost:8080/v1/events
+```
+
+The replay comes from storage, not a memory buffer, so it still works after a
+restart and past RPC's ~7-day event retention.
 
 ## Quick start
 

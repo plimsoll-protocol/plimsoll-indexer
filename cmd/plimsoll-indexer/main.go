@@ -20,6 +20,7 @@ import (
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/api"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/changelog"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/config"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/events"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/horizon"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/netclient"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/secrets"
@@ -91,6 +92,13 @@ func run(cfg config.Config, build buildinfo.Info, log *slog.Logger) error {
 			netclient.Transport(cfg.HTTPKeepAlive), log.With("component", "rpc")),
 	}
 	rpc := rpcclient.NewClient(cfg.RPCURL, rpcHTTP)
+	// Ingestion publishes into this hub, and /v1/events streams from it. It is
+	// in-process: one instance fans out to its own clients, and a reconnecting
+	// client replays what it missed from Postgres.
+	hub := events.NewHub(events.DefaultMaxSubscribers)
+	db.Publisher = hub
+
+	rpc := rpcclient.NewClient(cfg.RPCURL, &http.Client{Timeout: 30 * time.Second})
 	defer rpc.Close()
 	hz := horizon.NewClient(cfg.HorizonURL)
 	hz.HTTP = netclient.New(20*time.Second, cfg.HTTPKeepAlive)
@@ -257,6 +265,12 @@ func run(cfg config.Config, build buildinfo.Info, log *slog.Logger) error {
 			Log:                  log.With("component", "api"),
 			Now:                  time.Now,
 			Changelog:            changes,
+			CORS:   cfg.CORSOrigins,
+			Log:    log.With("component", "api"),
+			Now:    time.Now,
+			Events: hub,
+			// Closing ctx ends live streams so shutdown does not wait on them.
+			Done: ctx.Done(),
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second, // Bounds the time clients can spend sending request bodies.
