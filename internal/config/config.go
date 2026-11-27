@@ -54,6 +54,7 @@ type Config struct {
 	DatabaseURL string
 	Port        string
 	RPCURL      string
+	RPCURLs     []string
 	HorizonURL  string
 	// HorizonCheckURL is a second, independent Horizon the poster compares the
 	// supply against before signing it on chain. One Horizon is one point of
@@ -138,13 +139,32 @@ func Load() (Config, error) {
 	posterSecret, err := loadPosterSecret()
 	if err != nil {
 		errs = append(errs, err)
+	var rpcURLs []string
+	if raw := envOr("RPC_URLS", os.Getenv("STELLAR_RPC_URLS")); raw != "" {
+		for _, u := range strings.Split(raw, ",") {
+			if u = strings.TrimSpace(u); u != "" {
+				rpcURLs = append(rpcURLs, u)
+			}
+		}
+	}
+	if len(rpcURLs) == 0 {
+		single := envOr("STELLAR_RPC_URL", envOr("RPC_URL", preset.RPCURL))
+		if single != "" {
+			rpcURLs = []string{single}
+		}
+	}
+
+	primaryRPC := ""
+	if len(rpcURLs) > 0 {
+		primaryRPC = rpcURLs[0]
 	}
 
 	c := Config{
 		Network:              network,
 		DatabaseURL:          os.Getenv("DATABASE_URL"),
 		Port:                 envOr("PORT", "8080"),
-		RPCURL:               envOr("STELLAR_RPC_URL", preset.RPCURL),
+		RPCURL:               primaryRPC,
+		RPCURLs:              rpcURLs,
 		HorizonURL:           strings.TrimRight(envOr("HORIZON_URL", preset.HorizonURL), "/"),
 		HorizonCheckURL:      strings.TrimRight(os.Getenv("HORIZON_CHECK_URL"), "/"),
 		NetworkPassphrase:    envOr("STELLAR_NETWORK_PASSPHRASE", preset.Passphrase),
@@ -199,7 +219,7 @@ func Load() (Config, error) {
 		KeepAwakeURL:       keepAwakeURL(os.Getenv("KEEP_AWAKE_URL"), os.Getenv("RENDER_EXTERNAL_URL")),
 	}
 
-	if c.RPCURL == "" {
+	if len(c.RPCURLs) == 0 || c.RPCURL == "" {
 		errs = append(errs, fmt.Errorf("STELLAR_RPC_URL is required for NETWORK=%s", network))
 	}
 	if c.DatabaseURL == "" {

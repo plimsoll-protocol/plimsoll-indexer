@@ -76,6 +76,7 @@ func setBase(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{"NETWORK", "STELLAR_RPC_URL", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE", "WEBHOOK_ADMIN_TOKEN", "WEBHOOK_API_KEYS", "WEBHOOK_ENCRYPTION_KEY", "WEBHOOK_SIGNING_SECRET", "SECRETS_PROVIDER", "SUPPLY_POSTER_SECRET", "SUPPLY_POSTER_SECRET_NAME", "DATABASE_PASSWORD_SECRET_NAME"} {
 	for _, k := range []string{"NETWORK", "STELLAR_RPC_URL", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE", "SUPPLY_POSTER_SECRET", "SUPPLY_POSTER_SECRET_FILE"} {
+	for _, k := range []string{"NETWORK", "STELLAR_RPC_URL", "RPC_URL", "RPC_URLS", "STELLAR_RPC_URLS", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE", "WEBHOOK_ADMIN_TOKEN", "WEBHOOK_ENCRYPTION_KEY"} {
 		t.Setenv(k, "")
 	}
 	t.Setenv("DATABASE_URL", "postgres://x")
@@ -197,6 +198,54 @@ func TestUnknownNetwork(t *testing.T) {
 	t.Setenv("NETWORK", "futurenet")
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "NETWORK") {
 		t.Fatalf("want unknown network error, got %v", err)
+	}
+}
+
+func TestMultipleRPCURLs(t *testing.T) {
+	setBase(t)
+	t.Setenv("RPC_URLS", " https://rpc1.example.org , https://rpc2.example.org/rpc,https://rpc3.example.org ")
+	got, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{
+		"https://rpc1.example.org",
+		"https://rpc2.example.org/rpc",
+		"https://rpc3.example.org",
+	}
+	if len(got.RPCURLs) != len(want) {
+		t.Fatalf("got %d URLs, want %d: %v", len(got.RPCURLs), len(want), got.RPCURLs)
+	}
+	for i, u := range want {
+		if got.RPCURLs[i] != u {
+			t.Errorf("RPCURLs[%d] = %q, want %q", i, got.RPCURLs[i], u)
+		}
+	}
+	if got.RPCURL != want[0] {
+		t.Errorf("RPCURL = %q, want %q", got.RPCURL, want[0])
+	}
+}
+
+func TestSingleRPCURLFallback(t *testing.T) {
+	cases := []struct {
+		envKey, url string
+	}{
+		{"RPC_URL", "https://single-rpc.example.org"},
+		{"STELLAR_RPC_URL", "https://stellar-rpc.example.org"},
+	}
+	for _, tc := range cases {
+		setBase(t)
+		t.Setenv(tc.envKey, tc.url)
+		got, err := Load()
+		if err != nil {
+			t.Fatalf("%s: %v", tc.envKey, err)
+		}
+		if got.RPCURL != tc.url {
+			t.Errorf("%s: RPCURL = %q, want %q", tc.envKey, got.RPCURL, tc.url)
+		}
+		if len(got.RPCURLs) != 1 || got.RPCURLs[0] != tc.url {
+			t.Errorf("%s: RPCURLs = %v, want [%s]", tc.envKey, got.RPCURLs, tc.url)
+		}
 	}
 }
 
