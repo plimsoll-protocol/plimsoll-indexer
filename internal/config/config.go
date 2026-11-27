@@ -91,6 +91,7 @@ type Config struct {
 	// idle services (Render's free tier) keeps this one, and its poster, up.
 	KeepAwakeURL      string
 	KeepAwakeInterval time.Duration
+	ShutdownTimeout   time.Duration
 
 	// ReporterInterval is how often the registry contract is polled on its own
 	// cursor. It is deliberately shorter than IngestInterval so a reporter
@@ -295,6 +296,7 @@ func Load() (Config, error) {
 		"TOML_INTERVAL":       true,
 		"KEEP_AWAKE_INTERVAL": true,
 		{"REPORTER_STALE_THRESHOLD", "720h", &c.ReporterStaleThreshold},
+		{"SHUTDOWN_TIMEOUT", "30s", &c.ShutdownTimeout},
 	}
 	for _, d := range durations {
 		v, err := time.ParseDuration(envOr(d.name, d.def))
