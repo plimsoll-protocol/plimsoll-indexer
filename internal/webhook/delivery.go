@@ -16,13 +16,26 @@ import (
 type deliveryStore interface {
 	ListWebhooks(context.Context) ([]store.Webhook, error)
 	RecordWebhookDelivery(ctx context.Context, id int64, at time.Time, failure string) error
+	GetWebhook(context.Context, int64) (store.Webhook, bool, error)
+	CreateWebhookDLQ(context.Context, int64, []byte, string, int) error
+	ListWebhookDLQ(context.Context, int64, int) ([]store.WebhookDLQ, error)
+	GetWebhookDLQ(context.Context, int64, int64) (store.WebhookDLQ, bool, error)
+	UpdateWebhookDLQFailure(context.Context, int64, int64, string, int) (bool, error)
+	DeleteWebhookDLQ(context.Context, int64, int64) (bool, error)
 }
+
+const maxRetries = 3
 
 type Dispatcher struct {
 	Store  deliveryStore
 	Codec  *SecretCodec
 	Client *http.Client
 	Now    func() time.Time
+	Store      subscriptionStore
+	Codec      *SecretCodec
+	Client     *http.Client
+	Now        func() time.Time
+	RetryDelay time.Duration
 }
 
 type TOMLChangedPayload struct {
@@ -54,7 +67,8 @@ func NewDispatcher(db subscriptionStore, codec *SecretCodec) *Dispatcher {
 				return http.ErrUseLastResponse
 			},
 		},
-		Now: time.Now,
+		Now:        time.Now,
+		RetryDelay: time.Second,
 	}
 }
 
@@ -114,6 +128,13 @@ func (d *Dispatcher) SupplyDrop(ctx context.Context, sac, prev, curr string, dro
 	for _, w := range webhooks {
 		if err := d.deliver(ctx, w, payload); err != nil {
 			failures = append(failures, fmt.Errorf("deliver webhook %d: %w", w.ID, err))
+		attempts, err := d.deliverWithRetries(ctx, w, payload)
+		if err != nil {
+			dlqErr := d.Store.CreateWebhookDLQ(ctx, w.ID, payload, err.Error(), attempts)
+			if dlqErr != nil {
+				err = errors.Join(err, fmt.Errorf("store failed delivery in webhook DLQ: %w", dlqErr))
+			}
+			failures = append(failures, fmt.Errorf("deliver webhook %d after %d attempts: %w", w.ID, attempts, err))
 		}
 	}
 	return errors.Join(failures...)
@@ -149,6 +170,62 @@ func (d *Dispatcher) DeliverTest(ctx context.Context, w store.Webhook) (int, err
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4097))
 	return resp.StatusCode, nil
+// RetryWebhookDLQ immediately redelivers one stored payload, applying the same
+// bounded retry policy as a fresh event. A successful delivery removes the row.
+func (d *Dispatcher) RetryWebhookDLQ(ctx context.Context, webhookID, deliveryID int64) (bool, error) {
+	item, found, err := d.Store.GetWebhookDLQ(ctx, webhookID, deliveryID)
+	if err != nil || !found {
+		return found, err
+	}
+	w, found, err := d.Store.GetWebhook(ctx, webhookID)
+	if err != nil || !found {
+		return false, err
+	}
+
+	attempts, deliveryErr := d.deliverWithRetries(ctx, w, item.Payload)
+	if deliveryErr != nil {
+		updated, err := d.Store.UpdateWebhookDLQFailure(ctx, webhookID, deliveryID, deliveryErr.Error(), attempts)
+		if err != nil {
+			return true, errors.Join(deliveryErr, fmt.Errorf("update failed webhook DLQ retry: %w", err))
+		}
+		if !updated {
+			return false, nil
+		}
+		return true, fmt.Errorf("retry webhook delivery after %d attempts: %w", attempts, deliveryErr)
+	}
+	deleted, err := d.Store.DeleteWebhookDLQ(ctx, webhookID, deliveryID)
+	if err != nil {
+		return true, fmt.Errorf("remove delivered webhook DLQ entry: %w", err)
+	}
+	return deleted, nil
+}
+
+func (d *Dispatcher) deliverWithRetries(ctx context.Context, w store.Webhook, payload []byte) (int, error) {
+	for attempt := 1; ; attempt++ {
+		err := d.deliver(ctx, w, payload)
+		if err == nil {
+			return attempt, nil
+		}
+		if attempt > maxRetries {
+			return attempt, err
+		}
+		delay := d.RetryDelay * time.Duration(1<<(attempt-1))
+		if delay <= 0 {
+			continue
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return attempt, errors.Join(err, ctx.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 func (d *Dispatcher) deliver(ctx context.Context, w store.Webhook, payload []byte) error {

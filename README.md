@@ -111,6 +111,7 @@ One command serves both modes: `replay` with no `-from`/`-to` rebuilds from
 | `GET /v1/breakdowns/{hash}` | Exact bytes of a supply breakdown |
 | `GET /v1/events` | `text/event-stream` of `asset_listed`, `supply_posted` and `reserve_posted`, for clients that would otherwise poll |
 | `POST /v1/webhooks`, `GET /v1/webhooks`, `DELETE /v1/webhooks/{id}` | Manage authenticated issuer TOML change subscriptions |
+| `GET /v1/webhooks/{id}/dlq`, `POST /v1/webhooks/{id}/dlq/{delivery_id}/retry` | Inspect and retry failed webhook deliveries |
 
 Every `4xx` and `5xx` response has the same body:
 `{"code":"asset_not_listed","message":"…"}`, with an optional `details` object.
