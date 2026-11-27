@@ -84,6 +84,9 @@ type fake struct {
 	supplySeries map[string][]coverage.Supply
 	reportSeries map[string][]coverage.Report
 	bodies       map[string][]byte
+
+	stats      store.Stats
+	statsCalls int
 }
 
 func (f *fake) Ping(context.Context) error { return nil }
@@ -225,6 +228,10 @@ func (f *fake) Breakdown(_ context.Context, h string) ([]byte, error) {
 func (f *fake) Progress(_ context.Context, name string) (store.Progress, error) {
 	if p, ok := f.progress[name]; ok {
 		return p, nil
+func (f *fake) Stats(context.Context, time.Time) (store.Stats, error) {
+	f.statsCalls++
+	return f.stats, nil
+}
 func (f *fake) Progress(context.Context, string) (store.Progress, error) {
 	return store.Progress{
 		Cursor:        "c",
@@ -1462,6 +1469,66 @@ func TestMetricsEndpointIsOptional(t *testing.T) {
 		t.Fatalf("disabled metrics endpoint status = %d, want 404", disabledResponse.StatusCode)
 	}
 }
+
+func TestStats(t *testing.T) {
+	f := &fake{stats: store.Stats{
+		TotalAssets:     12,
+		CoveredAssets:   9,
+		TotalReporters:  5,
+		ActiveReporters: 3,
+		ReportsToday:    7,
+		LastEventAt:     ptrTime(now.Add(-90 * time.Second)),
+	}}
+	clock := now
+	s := &Server{
+		Store: f,
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:   func() time.Time { return clock },
+	}
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	body := get(t, srv, "/v1/stats", 200)
+	want := map[string]float64{
+		"totalAssets": 12, "coveredAssets": 9, "totalReporters": 5,
+		"activeReporters": 3, "reportsToday": 7, "ingestLagSeconds": 90,
+	}
+	for k, v := range want {
+		if body[k] != v {
+			t.Errorf("%s = %v, want %v", k, body[k], v)
+		}
+	}
+
+	// Within the TTL the database is not read again.
+	clock = now.Add(30 * time.Second)
+	get(t, srv, "/v1/stats", 200)
+	if f.statsCalls != 1 {
+		t.Fatalf("stats read %d times within cache window, want 1", f.statsCalls)
+	}
+	// After 60s a new aggregate set is read.
+	clock = now.Add(61 * time.Second)
+	get(t, srv, "/v1/stats", 200)
+	if f.statsCalls != 2 {
+		t.Fatalf("stats read %d times after cache expiry, want 2", f.statsCalls)
+	}
+}
+
+func TestStatsWithoutEvents(t *testing.T) {
+	f := &fake{}
+	s := &Server{
+		Store: f,
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:   func() time.Time { return now },
+	}
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+	body := get(t, srv, "/v1/stats", 200)
+	if body["ingestLagSeconds"] != float64(0) {
+		t.Fatalf("ingestLagSeconds = %v, want 0", body["ingestLagSeconds"])
+	}
+}
+
+func ptrTime(t time.Time) *time.Time { return &t }
 
 func TestOpenAPISpec(t *testing.T) {
 	srv := server()

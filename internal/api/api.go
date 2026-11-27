@@ -27,7 +27,7 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
-	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -92,6 +92,7 @@ type assetCursor struct {
 	Version int    `json:"v"`
 	Code    string `json:"code"`
 	Issuer  string `json:"issuer"`
+	Stats(ctx context.Context, dayStart time.Time) (store.Stats, error)
 }
 
 // NetworkInfo is served at /v1/network so clients can discover contract ids.
@@ -165,6 +166,17 @@ type WebhookManager interface {
 
 type WebhookRetryer interface {
 	RetryWebhookDLQ(context.Context, int64, int64) (bool, error)
+	statsMu    sync.Mutex
+	statsEntry *statsEntry
+}
+
+// statsCacheTTL is how long /v1/stats serves an aggregate set before reading
+// the database again.
+const statsCacheTTL = 60 * time.Second
+
+type statsEntry struct {
+	stats   store.Stats
+	expires time.Time
 }
 
 func (s *Server) Handler() http.Handler {
@@ -188,6 +200,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/assets/{sac}/coverage", s.coverageSeries)
 	mux.HandleFunc("GET /v1/reporters", s.reporters)
 	mux.HandleFunc("GET /v1/changelog", s.changelog)
+	mux.HandleFunc("GET /v1/stats", s.stats)
 	mux.HandleFunc("GET /v1/breakdowns/{hash}", s.breakdown)
 	mux.HandleFunc("GET /v1/events", s.events)
 	if s.GraphQL != nil {
@@ -299,6 +312,15 @@ type seriesJSON struct {
 	From     time.Time         `json:"from"`
 	To       time.Time         `json:"to"`
 	Points   []seriesPointJSON `json:"points"`
+}
+
+type statsJSON struct {
+	TotalAssets      int64 `json:"totalAssets"`
+	CoveredAssets    int64 `json:"coveredAssets"`
+	TotalReporters   int64 `json:"totalReporters"`
+	ActiveReporters  int64 `json:"activeReporters"`
+	ReportsToday     int64 `json:"reportsToday"`
+	IngestLagSeconds int64 `json:"ingestLagSeconds"`
 }
 
 type reporterJSON struct {
@@ -1155,6 +1177,8 @@ func (s *Server) coveredAssets(w http.ResponseWriter, r *http.Request) {
 	}
 
 	assets, err := s.Store.ListAssets(r.Context())
+func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
+	st, err := s.cachedStats(r.Context())
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -1247,6 +1271,44 @@ func (s *Server) changelog(w http.ResponseWriter, _ *http.Request) {
 // @Success 200 {string} string "Canonical JSON breakdown"
 // @Failure 404 {object} map[string]string
 // @Router /v1/breakdowns/{hash} [get]
+	var lag int64
+	if st.LastEventAt != nil {
+		if secs := int64(s.Now().Sub(*st.LastEventAt).Seconds()); secs > 0 {
+			lag = secs
+		}
+	}
+	writeJSON(w, http.StatusOK, statsJSON{
+		TotalAssets:      st.TotalAssets,
+		CoveredAssets:    st.CoveredAssets,
+		TotalReporters:   st.TotalReporters,
+		ActiveReporters:  st.ActiveReporters,
+		ReportsToday:     st.ReportsToday,
+		IngestLagSeconds: lag,
+	})
+}
+
+// cachedStats serves the aggregates from memory until statsCacheTTL has
+// passed. Failures are not cached, so a transient database error does not keep
+// /v1/stats broken for a minute.
+func (s *Server) cachedStats(ctx context.Context) (store.Stats, error) {
+	now := s.Now()
+	s.statsMu.Lock()
+	e := s.statsEntry
+	s.statsMu.Unlock()
+	if e != nil && now.Before(e.expires) {
+		return e.stats, nil
+	}
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	st, err := s.Store.Stats(ctx, dayStart)
+	if err != nil {
+		return store.Stats{}, err
+	}
+	s.statsMu.Lock()
+	s.statsEntry = &statsEntry{stats: st, expires: now.Add(statsCacheTTL)}
+	s.statsMu.Unlock()
+	return st, nil
+}
+
 func (s *Server) breakdown(w http.ResponseWriter, r *http.Request) {
 	hash := r.PathValue("hash")
 	if !isBreakdownHash(hash) {
