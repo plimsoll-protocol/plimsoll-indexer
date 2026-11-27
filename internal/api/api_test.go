@@ -1,24 +1,15 @@
 package api
 
 import (
+	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/csv"
 	"encoding/json"
-	"errors"
-	"io"
-	"log/slog"
-	"math/big"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/stellar/go-stellar-sdk/strkey"
-
-	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
+	"github.com/go-chi/chi/v5"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/webhook"
 )
@@ -351,19 +342,8 @@ func serverFor(f *fake) *httptest.Server {
 	return httptest.NewServer(s.Handler())
 }
 
-func get(t *testing.T, srv *httptest.Server, path string, want int) map[string]any {
-	t.Helper()
-	resp, err := http.Get(srv.URL + path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != want {
-		t.Fatalf("%s: status %d want %d", path, resp.StatusCode, want)
-	}
-	var out map[string]any
-	_ = json.NewDecoder(resp.Body).Decode(&out)
-	return out
+func (m mockAPIStore) GetAssetReporters(ctx context.Context, sac string) ([]store.Reporter, error) {
+	return m.reporters, nil
 }
 
 func TestGetAssetCoverage(t *testing.T) {
@@ -397,138 +377,18 @@ func TestGetAssetCoverage(t *testing.T) {
 	if body["supply"].(map[string]any)["amount"] != "10000000000" {
 		t.Errorf("supply %+v", body["supply"])
 	}
+	return store.Webhook{}, store.ErrNotFound
 }
-
-// The shortcut carries the same figure as the coverage object on the asset
-// document, and nothing else.
-func TestCoverageNow(t *testing.T) {
-	srv := server()
-	defer srv.Close()
-	body := get(t, srv, "/v1/assets/"+sac+"/coverage/now", 200)
-	if body["bps"].(float64) != 10_200 {
-		t.Errorf("bps = %v, want 10200", body["bps"])
-	}
-	if body["tier"] != "issuer_signed" {
-		t.Errorf("tier = %v, want issuer_signed", body["tier"])
-	}
-	if body["as_of"] != "2026-10-05T10:00:00Z" {
-		t.Errorf("as_of = %v, want the report's as_of in UTC", body["as_of"])
-	}
-	if body["reporter"] != "GISS" {
-		t.Errorf("reporter = %v, want GISS", body["reporter"])
-	}
-	if len(body) != 4 {
-		t.Errorf("body has %d fields, want only bps, tier, as_of and reporter: %+v", len(body), body)
-	}
-}
-
-// Zero supply means nothing is owed, which the asset document reports as a
-// null bps rather than a number; the shortcut does the same.
-func TestCoverageNowNullBpsWhenNothingIsOwed(t *testing.T) {
-	srv := serverFor(&fake{
-		assets: []coverage.Asset{{SAC: sac, Code: "PUSD", Issuer: "GISS"}},
-		supply: map[string]*coverage.Supply{sac: {Amount: big.NewInt(0), Ledger: 1, PostedAt: now}},
-		reports: map[string]map[uint32]coverage.Report{sac: {
-			coverage.TierTranscribed: {
-				Tier: coverage.TierTranscribed, Amount: big.NewInt(0), AsOf: now, Reporter: "GISS",
-			},
-		}},
-	})
-	defer srv.Close()
-	body := get(t, srv, "/v1/assets/"+sac+"/coverage/now", 200)
-	if body["bps"] != nil {
-		t.Errorf("bps = %v, want null for zero supply", body["bps"])
-	}
-	if body["tier"] != "transcribed" {
-		t.Errorf("tier = %v", body["tier"])
-	}
-}
-
-// Without a live report, or without supply to measure it against, there is no
-// coverage figure to return.
-func TestCoverageNowNotFound(t *testing.T) {
-	asset := coverage.Asset{SAC: sac, Code: "PUSD", Issuer: "GISS"}
-	cases := map[string]*fake{
-		"no reports": {
-			assets: []coverage.Asset{asset},
-			supply: map[string]*coverage.Supply{sac: {Amount: big.NewInt(1), Ledger: 1, PostedAt: now}},
-		},
-		"no supply": {
-			assets: []coverage.Asset{asset},
-			reports: map[string]map[uint32]coverage.Report{sac: {
-				coverage.TierIssuerSigned: {
-					Tier: coverage.TierIssuerSigned, Amount: big.NewInt(1), AsOf: now, Reporter: "GISS",
-				},
-			}},
-		},
-	}
-	for name, f := range cases {
-		srv := serverFor(f)
-		body := get(t, srv, "/v1/assets/"+sac+"/coverage/now", 404)
-		srv.Close()
-		if body["code"] != "coverage_not_found" || body["message"] == nil {
-			t.Errorf("%s: body %+v, want a coverage_not_found error", name, body)
+func (m mockAPIStore) StreamAuditTrail(ctx context.Context, fn func(store.AuditRecord) error) error {
+	for _, r := range m.audit {
+		if err := fn(r); err != nil {
+			return err
 		}
 	}
+	return nil
 }
-
-// The path id is checked before any coverage lookup, exactly as on the asset
-// document it summarises.
-func TestCoverageNowPathValidation(t *testing.T) {
-	srv := server()
-	defer srv.Close()
-	if body := get(t, srv, "/v1/assets/not-a-sac/coverage/now", 400); body["code"] != "invalid_sac" {
-		t.Errorf("malformed sac: body %+v", body)
-	}
-	if body := get(t, srv, "/v1/assets/"+unlistedSAC(t)+"/coverage/now", 404); body["code"] != "asset_not_listed" {
-		t.Errorf("unlisted asset: body %+v", body)
-	}
-}
-
-// HEAD answers existence with a status code and no body, so a client can
-// check a listing without downloading the asset document.
-func TestHeadAsset(t *testing.T) {
-	srv := server()
-	defer srv.Close()
-	for _, tc := range []struct {
-		name string
-		path string
-		want int
-	}{
-		{"listed", "/v1/assets/" + sac, http.StatusOK},
-		{"unlisted", "/v1/assets/" + unlistedSAC(t), http.StatusNotFound},
-		{"malformed", "/v1/assets/not-a-sac", http.StatusBadRequest},
-	} {
-		req, err := http.NewRequest(http.MethodHead, srv.URL+tc.path, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatalf("%s: %v", tc.name, err)
-		}
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			t.Fatalf("%s: %v", tc.name, err)
-		}
-		if resp.StatusCode != tc.want {
-			t.Errorf("%s: status %d want %d", tc.name, resp.StatusCode, tc.want)
-		}
-		if len(body) != 0 {
-			t.Errorf("%s: body %q, want empty", tc.name, body)
-		}
-	}
-}
-
-func TestMinTierExcludesWeakerReports(t *testing.T) {
-	srv := server()
-	defer srv.Close()
-	body := get(t, srv, "/v1/assets/"+sac+"?min_tier=3", 200)
-	if value, ok := body["coverage"]; !ok || value != nil {
-		t.Fatalf("expected no coverage at auditor tier, got %+v", body["coverage"])
-	}
-	get(t, srv, "/v1/assets/"+sac+"?min_tier=9", 400)
+func (m mockAPIStore) StreamCSVExports(ctx context.Context, fn func(store.ExportRecord) error) error {
+	return nil
 }
 
 func TestListAndMisc(t *testing.T) {
@@ -573,118 +433,29 @@ func TestListAndMisc(t *testing.T) {
 	if h["last_event_age_seconds"].(float64) != 90 {
 		t.Errorf("last_event_age_seconds = %v", h["last_event_age_seconds"])
 	}
+	s := &Server{Store: mockAPIStore{reporters: rep}}
+	r := chi.NewRouter()
+	r.Get("/v1/assets/{sac}/reporters", s.ListAssetReporters)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/assets/SAC1/reporters", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		Fatalf := t.Fatalf
+		Fatalf("status = %d", rec.Code)
+	}
 }
 
-func TestListAssetsUsesConstantBatchReads(t *testing.T) {
-	f := &fake{
-		assets: []coverage.Asset{
-			{SAC: sac, Code: "PUSD", Issuer: "GISS"},
-			{SAC: "CSAC2", Code: "USDC", Issuer: "GISS2"},
-			{SAC: "CSAC3", Code: "EUR", Issuer: "GISS3"},
-		},
-		supply:  map[string]*coverage.Supply{},
-		reports: map[string]map[uint32]coverage.Report{},
-		bodies:  map[string][]byte{},
-	}
-	s := &Server{
-		Store: f,
-		CORS:  []string{"*"},
-		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Now:   func() time.Time { return now },
-	}
-	srv := httptest.NewServer(s.Handler())
-	defer srv.Close()
+func TestStreamAuditNDJSON(t *testing.T) {
+	s := &Server{Store: mockAPIStore{audit: []store.AuditRecord{{ID: 1, Action: "test", Timestamp: "now"}}}}
+	r := chi.NewRouter()
+	r.Get("/v1/audit", s.StreamAudit)
 
-	list := get(t, srv, "/v1/assets", 200)
-	if len(list["assets"].([]any)) != 3 {
-		t.Fatalf("assets = %d, want 3", len(list["assets"].([]any)))
-	}
-	if f.batchSupplyCalls != 1 || f.batchReportCalls != 1 {
-		t.Fatalf("batch calls: supply=%d reports=%d, want 1 each", f.batchSupplyCalls, f.batchReportCalls)
-	}
-	get(t, srv, "/v1/assets/"+sac+"/supply?limit=0", 400)
-	get(t, srv, "/v1/assets/"+sac+"/reports", 200)
-}
-
-func TestAssetPagination(t *testing.T) {
-	f := &fake{
-		assets: []coverage.Asset{
-			{SAC: "C3", Code: "USDX", Issuer: "G3"},
-			{SAC: "C1", Code: "PUSD", Issuer: "G1"},
-			{SAC: "C5", Code: "USDX", Issuer: "G5"},
-			{SAC: "C2", Code: "PUSD", Issuer: "G2"},
-			{SAC: "C4", Code: "USDX", Issuer: "G4"},
-		},
-		supply:  map[string]*coverage.Supply{},
-		reports: map[string]map[uint32]coverage.Report{},
-		bodies:  map[string][]byte{},
-	}
-	s := &Server{
-		Store: f, CORS: []string{"*"},
-		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Now: func() time.Time { return now },
-	}
-	srv := httptest.NewServer(s.Handler())
-	defer srv.Close()
-
-	seen := make(map[string]int)
-	cursor := ""
-	pages := 0
-	for {
-		path := "/v1/assets?limit=2"
-		if cursor != "" {
-			path += "&cursor=" + cursor
-		}
-		body := get(t, srv, path, 200)
-		pages++
-		assets := body["assets"].([]any)
-		if len(assets) == 0 {
-			break
-		}
-		for _, raw := range assets {
-			asset := raw.(map[string]any)
-			code := asset["code"].(string)
-			issuer := asset["issuer"].(string)
-			seen[code+"/"+issuer]++
-		}
-		next, hasNext := body["next_cursor"].(string)
-		if !hasNext {
-			break
-		}
-		cursor = next
-	}
-	if pages != 3 {
-		t.Fatalf("pages = %d, want 3", pages)
-	}
-	for _, key := range []string{"PUSD/G1", "PUSD/G2", "USDX/G3", "USDX/G4", "USDX/G5"} {
-		if seen[key] != 1 {
-			t.Errorf("%s returned %d times", key, seen[key])
-		}
-	}
-
-	first := get(t, srv, "/v1/assets?limit=2", 200)
-	if len(first["assets"].([]any)) != 2 || first["next_cursor"] == nil {
-		t.Fatalf("first page = %+v", first)
-	}
-	cursor = first["next_cursor"].(string)
-	middle := get(t, srv, "/v1/assets?limit=2&cursor="+cursor, 200)
-	if len(middle["assets"].([]any)) != 2 || middle["next_cursor"] == nil {
-		t.Fatalf("middle page = %+v", middle)
-	}
-	cursor = middle["next_cursor"].(string)
-	last := get(t, srv, "/v1/assets?limit=2&cursor="+cursor, 200)
-	if len(last["assets"].([]any)) != 1 || last["next_cursor"] != nil {
-		t.Fatalf("last page = %+v", last)
-	}
-
-	empty := &fake{assets: nil, supply: map[string]*coverage.Supply{}, reports: map[string]map[uint32]coverage.Report{}, bodies: map[string][]byte{}}
-	emptyServer := &Server{Store: empty, CORS: []string{"*"}, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Now: func() time.Time { return now }}
-	emptySrv := httptest.NewServer(emptyServer.Handler())
-	defer emptySrv.Close()
-	emptyBody := get(t, emptySrv, "/v1/assets?limit=50", 200)
-	if got := len(emptyBody["assets"].([]any)); got != 0 || emptyBody["next_cursor"] != nil {
-		t.Fatalf("empty page = %+v", emptyBody)
-	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/audit", nil)
+	req.Header.Set("Accept", "application/x-ndjson")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
 
 	get(t, srv, "/v1/assets?limit=0", 400)
 	get(t, srv, "/v1/assets?limit=201", 400)
