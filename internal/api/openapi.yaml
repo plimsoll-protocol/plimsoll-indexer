@@ -109,6 +109,7 @@ paths:
           description: Opaque cursor returned as next_cursor by a previous page
           schema:
             type: string
+        - $ref: '#/components/parameters/MinTier'
       responses:
         '200':
           description: List of tracked assets
@@ -175,6 +176,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+          $ref: '#/components/responses/InvalidRequest'
   /v1/assets/{sac}:
     get:
       summary: List only assets that are currently covered
@@ -207,6 +209,8 @@ paths:
           in: query
           required: false
           description: Maximum age of the supply snapshot and report, as a Go duration
+        - $ref: '#/components/parameters/SAC'
+        - $ref: '#/components/parameters/MinTier'
       responses:
         '200':
           description: Asset details and current status
@@ -220,17 +224,14 @@ paths:
         '304':
           $ref: '#/components/responses/NotModified'
         '400':
-          description: Invalid request parameter
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
+          $ref: '#/components/responses/InvalidRequest'
         '404':
           description: Asset not found
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+          $ref: '#/components/responses/AssetNotFound'
   /v1/assets/{sac}/supply:
     get:
       summary: Get historical supply snapshots for an asset
@@ -260,6 +261,8 @@ paths:
           description: Return snapshots strictly before this ledger (at_ledger < before). Pass next_before from the previous page to walk older history.
           schema:
             type: integer
+        - $ref: '#/components/parameters/SAC'
+        - $ref: '#/components/parameters/Limit'
       responses:
         '200':
           description: Supply history snapshots
@@ -286,11 +289,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
-          description: Asset not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
+          $ref: '#/components/responses/AssetNotFound'
   /v1/assets/{sac}/reports:
     get:
       summary: Get historical reserve reports for an asset
@@ -320,6 +319,8 @@ paths:
           description: Return reports strictly before this posted ledger (posted_ledger < before). Pass next_before from the previous page to walk older history.
           schema:
             type: integer
+        - $ref: '#/components/parameters/SAC'
+        - $ref: '#/components/parameters/Limit'
       responses:
         '200':
           description: Covered assets
@@ -452,11 +453,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
-          description: Asset not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
+          $ref: '#/components/responses/AssetNotFound'
   /v1/reporters:
     get:
       summary: List registered reporters, roles, and profile metadata
@@ -510,6 +507,27 @@ paths:
                 type: string
         '503':
           description: Streaming is not configured, or the subscriber cap is reached
+  /v1/breakdowns/{hash}:
+    get:
+      summary: Get raw supply breakdown by hash
+      operationId: getBreakdown
+      parameters:
+        - $ref: '#/components/parameters/BreakdownHash'
+      responses:
+        '200':
+          description: Raw JSON breakdown served verbatim
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          description: Hash is not 64 hex characters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Breakdown hash not found
           content:
             application/json:
               schema:
@@ -566,12 +584,9 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+          $ref: '#/components/responses/Unauthorized'
         '503':
-          description: Webhook management is not configured
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
+          $ref: '#/components/responses/WebhooksNotConfigured'
     get:
       summary: List the authenticated key's webhooks and their delivery state
       operationId: listWebhooks
@@ -601,6 +616,9 @@ components:
           description: Missing or invalid administrator token
         '503':
           description: Webhook management is not configured
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/WebhooksNotConfigured'
   /v1/webhooks/{id}:
     delete:
       summary: Delete a registered webhook
@@ -608,12 +626,7 @@ components:
       security:
         - WebhookAdminAuth: []
       parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: integer
-            minimum: 1
+        - $ref: '#/components/parameters/WebhookID'
       responses:
         '204':
           description: Webhook deleted
@@ -659,7 +672,14 @@ components:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Webhook not found
 components:
+  # Hand-maintained part of the generated OpenAPI document: schemas, shared
+  # parameters, shared responses and the auth scheme. Endpoints are not listed
+  # here; they come from the route table in routes.go. Run `make generate` after
+  # editing this file.
   securitySchemes:
     WebhookAdminAuth:
       type: http
@@ -676,6 +696,67 @@ components:
       headers:
         ETag:
           $ref: '#/components/headers/ETag'
+  parameters:
+    SAC:
+      name: sac
+      in: path
+      required: true
+      description: Stellar Asset Contract (SAC) address
+      schema:
+        type: string
+        pattern: '^C[A-Z2-7]{55}$'
+        example: "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
+    MinTier:
+      name: min_tier
+      in: query
+      required: false
+      description: Minimum tier level (1=transcribed, 2=issuer_signed, 3=auditor_signed)
+      schema:
+        type: integer
+        enum: [1, 2, 3]
+        default: 1
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Maximum number of rows to return (1-1000)
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 100
+    BreakdownHash:
+      name: hash
+      in: path
+      required: true
+      description: SHA-256 breakdown hash, 64 hex characters
+      schema:
+        type: string
+        pattern: '^[0-9a-fA-F]{64}$'
+    WebhookID:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+  responses:
+    InvalidRequest:
+      description: Invalid request parameter
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    AssetNotFound:
+      description: Asset not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Unauthorized:
+      description: Missing or invalid administrator token
+    WebhooksNotConfigured:
+      description: Webhook management is not configured
   schemas:
     BuildInfo:
       type: object
@@ -697,6 +778,89 @@ components:
     Reporter:
       type: object
       required:
+        - network_passphrase
+        - rpc_url
+        - horizon_url
+        - coverage_ledger_id
+        - reporter_registry_id
+    Supply:
+      type: object
+      properties:
+        amount:
+          type: string
+          example: "10000000000"
+        ledger:
+          type: integer
+          example: 100
+        posted_at:
+          type: string
+          format: date-time
+          example: "2026-10-05T11:00:00Z"
+        breakdown_hash:
+          type: string
+          example: "abc"
+        poster:
+          type: string
+          example: "GPOST..."
+        tx_hash:
+          type: string
+          example: "tx123..."
+        source:
+          type: string
+          enum: [event, chain]
+          description: >
+            event for a figure decoded from a contract event, which carries the
+            transaction that produced it; chain for one recovered from contract
+            state after an ingestion gap, where tx_hash is empty.
+      required:
+        - amount
+        - ledger
+        - posted_at
+        - breakdown_hash
+        - poster
+        - tx_hash
+    Report:
+      type: object
+      properties:
+        tier:
+          type: string
+          enum: [transcribed, issuer_signed, auditor_signed]
+          example: "issuer_signed"
+        amount:
+          type: string
+          example: "10200000000"
+        as_of:
+          type: string
+          format: date-time
+          example: "2026-10-05T10:00:00Z"
+        posted_at:
+          type: string
+          format: date-time
+          example: "2026-10-05T10:05:00Z"
+        reporter:
+          type: string
+          example: "GISS..."
+        doc_hash:
+          type: string
+          example: "dochash123..."
+        doc_uri:
+          type: string
+          example: "https://x"
+        tx_hash:
+          type: string
+          example: "tx456..."
+        source:
+          type: string
+          enum: [event, chain]
+        doc_check:
+          type: string
+          enum: [match, mismatch, unreachable]
+          description: Result of the last document hash verification; absent until checked.
+      required:
+        - tier
+        - amount
+        - as_of
+        - posted_at
         - reporter
         - tier
         - last_post_at

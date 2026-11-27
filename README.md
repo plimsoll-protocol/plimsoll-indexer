@@ -197,6 +197,23 @@ or reverse-proxy layer when needed.
 `/v1/assets/{sac}`, `/v1/network` and `/v1/breakdowns/{hash}` return an `ETag`;
 send it back as `If-None-Match` and the API answers `304 Not Modified` with no
 body while the representation is unchanged.
+### OpenAPI spec
+
+[internal/api/openapi.yaml](internal/api/openapi.yaml) is generated, not
+maintained by hand: the endpoints come from the route table in
+[internal/api/routes.go](internal/api/routes.go), which is also what the server
+registers, and the schemas come from
+[internal/api/openapi.components.yaml](internal/api/openapi.components.yaml).
+After changing a route or a schema, regenerate the golden file:
+
+```bash
+make generate
+```
+
+CI runs `make generate` and fails when the committed file differs, and
+`go test ./internal/api` checks the same thing plus that every served route is
+documented. Edit the route table or the components file and regenerate; never
+edit `openapi.yaml` directly.
 
 Coverage in the API uses the same selection and rounding rules as the contract
 (`internal/coverage`), so the API and `coverage()` on-chain agree.

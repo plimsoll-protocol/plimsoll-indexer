@@ -21,3 +21,16 @@ generate:
 	@SWAG_BIN=$$(which swag 2>/dev/null || echo $(SWAG)); \
 	$$SWAG_BIN init -d internal/api -g api.go -o docs --ot yaml --v3.1 --parseInternal
 	@if [ -f docs/swagger.yaml ]; then mv docs/swagger.yaml docs/openapi.yaml; fi
+# `make generate` regenerates the committed OpenAPI document from the API's
+# route table (internal/api/routes.go) and its component schemas
+# (internal/api/openapi.components.yaml). CI runs it and fails when the output
+# differs from what is committed, so the published spec cannot drift from the
+# served API.
+
+.PHONY: generate test
+
+generate:
+	go run ./cmd/openapi
+
+test:
+	go test ./...

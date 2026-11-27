@@ -32,6 +32,11 @@ jobs:
           go install github.com/swaggo/swag/v2/cmd/swag@v2.0.0-rc6
           make generate
           git diff --exit-code docs/openapi.yaml
+      # The published spec is generated from the API's route table. Regenerate
+      # it and fail when the result differs from what is committed, so an
+      # undocumented API change cannot land.
+      - name: OpenAPI spec is committed
+        run: make generate && git diff --exit-code
 
   lint:
     name: lint
