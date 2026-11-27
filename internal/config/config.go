@@ -96,6 +96,9 @@ type Config struct {
 	// GraphQLEnabled mounts /graphql. It is off by default.
 	GraphQLEnabled bool
 	MetricsEnabled    bool
+	LogLevelAPI       string
+	LogLevelWorker    string
+	LogLevelIngest    string
 	// KeepAwakeURL is requested every KeepAwakeInterval so a host that sleeps
 	// idle services (Render's free tier) keeps this one, and its poster, up.
 	KeepAwakeURL      string
@@ -172,6 +175,7 @@ func Load() (Config, error) {
 		primaryRPC = rpcURLs[0]
 	}
 
+	levels := LoadLogLevels()
 	c := Config{
 		Network:            network,
 		DatabaseURL:        os.Getenv("DATABASE_URL"),
@@ -208,6 +212,10 @@ func Load() (Config, error) {
 		LogLevel:             envOr("LOG_LEVEL", "info"),
 		IngestWorkers:        2,
 		MetricsEnabled:       false,
+		LogLevel:             levels.Default,
+		LogLevelAPI:          levels.API,
+		LogLevelWorker:       levels.Worker,
+		LogLevelIngest:       levels.Ingest,
 		KeepAwakeURL:         keepAwakeURL(os.Getenv("KEEP_AWAKE_URL"), os.Getenv("RENDER_EXTERNAL_URL")),
 		DecimalCheckEnabled:  true,
 	}
@@ -531,6 +539,41 @@ func (c Config) redact() Config {
 		c.PosterSecret = "[REDACTED]"
 	}
 	return c
+// LogLevels holds the configured log level names for the indexer and its
+// individual components.
+type LogLevels struct {
+	Default string
+	API     string
+	Worker  string
+	Ingest  string
+}
+
+// LoadLogLevels reads LOG_LEVEL and component-specific overrides
+// (LOG_LEVEL_API, LOG_LEVEL_WORKER, LOG_LEVEL_INGEST) from the environment.
+// Unset or empty component variables fall back to LOG_LEVEL.
+func LoadLogLevels() LogLevels {
+	def := envOr("LOG_LEVEL", "info")
+	return LogLevels{
+		Default: def,
+		API:     envOr("LOG_LEVEL_API", def),
+		Worker:  envOr("LOG_LEVEL_WORKER", def),
+		Ingest:  envOr("LOG_LEVEL_INGEST", def),
+	}
+}
+
+// ParseLogLevel converts a level name ("debug", "info", "warn", "error") into
+// a slog.Level, defaulting to slog.LevelInfo for unrecognized values.
+func ParseLogLevel(level string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 func envOr(key, def string) string {

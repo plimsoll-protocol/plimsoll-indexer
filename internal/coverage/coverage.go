@@ -124,6 +124,24 @@ type Dispute struct {
 	TxHash          string     `json:"tx_hash,omitempty"`
 }
 
+// Vault holds metadata for a covered vault indexed for an asset.
+type Vault struct {
+	SAC            string    `json:"sac"`
+	VaultAddress   string    `json:"vault_address"`
+	ReserveBalance *big.Int  `json:"-"`
+	ThresholdBps   uint32    `json:"threshold_bps"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+// IssuerTomlSnapshot is the latest cached stellar.toml snapshot for an issuer.
+type IssuerTomlSnapshot struct {
+	Issuer     string    `json:"issuer"`
+	HomeDomain string    `json:"home_domain"`
+	SHA256Hash string    `json:"sha256_hash"`
+	Content    string    `json:"content"`
+	FetchedAt  time.Time `json:"fetched_at"`
+}
+
 // Result mirrors the contract's Coverage struct.
 type Result struct {
 	Bps            uint32

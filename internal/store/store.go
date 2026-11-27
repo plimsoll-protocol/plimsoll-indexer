@@ -1372,6 +1372,17 @@ func (s *Store) SaveToml(ctx context.Context, sac string, info []byte, lookupErr
 // SaveIssuerTomlSnapshot records a new content hash only when it differs from
 // the issuer's latest successful stellar.toml fetch.
 func (s *Store) SaveIssuerTomlSnapshot(ctx context.Context, issuer, domain, hash string, at time.Time) (string, bool, error) {
+	return s.saveIssuerTomlSnapshot(ctx, issuer, domain, hash, nil, at)
+}
+
+// SaveIssuerTomlSnapshotWithContent records the fetched stellar.toml content
+// and SHA-256 hash, inserting a new snapshot row only when the hash changes and
+// refreshing checked_at (and content) when unchanged.
+func (s *Store) SaveIssuerTomlSnapshotWithContent(ctx context.Context, issuer, domain, hash, content string, at time.Time) (string, bool, error) {
+	return s.saveIssuerTomlSnapshot(ctx, issuer, domain, hash, &content, at)
+}
+
+func (s *Store) saveIssuerTomlSnapshot(ctx context.Context, issuer, domain, hash string, content *string, at time.Time) (string, bool, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return "", false, fmt.Errorf("begin issuer TOML snapshot: %w", err)
@@ -1380,19 +1391,29 @@ func (s *Store) SaveIssuerTomlSnapshot(ctx context.Context, issuer, domain, hash
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, issuer); err != nil {
 		return "", false, fmt.Errorf("lock issuer TOML snapshot: %w", err)
 	}
+	var latestID int64
 	var oldHash string
 	err = tx.QueryRow(ctx, `
-		SELECT sha256_hash FROM issuer_toml_snapshots
-		WHERE issuer = $1 ORDER BY id DESC LIMIT 1`, issuer).Scan(&oldHash)
+		SELECT id, sha256_hash FROM issuer_toml_snapshots
+		WHERE issuer = $1 ORDER BY id DESC LIMIT 1`, issuer).Scan(&latestID, &oldHash)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return "", false, fmt.Errorf("read previous issuer TOML hash: %w", err)
 	}
 	changed := err == nil && oldHash != hash
-	if err == pgx.ErrNoRows || changed {
+	if errors.Is(err, pgx.ErrNoRows) || changed {
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO issuer_toml_snapshots (issuer, home_domain, sha256_hash, checked_at)
-			VALUES ($1, $2, $3, $4)`, issuer, domain, hash, at); err != nil {
+			INSERT INTO issuer_toml_snapshots (issuer, home_domain, sha256_hash, content, checked_at)
+			VALUES ($1, $2, $3, $4, $5)`, issuer, domain, hash, content, at.UTC()); err != nil {
 			return "", false, fmt.Errorf("insert issuer TOML snapshot: %w", err)
+		}
+	} else {
+		if _, err := tx.Exec(ctx, `
+			UPDATE issuer_toml_snapshots
+			SET home_domain = $2,
+			    checked_at = $3,
+			    content = COALESCE($4, content)
+			WHERE id = $1`, latestID, domain, at.UTC(), content); err != nil {
+			return "", false, fmt.Errorf("refresh issuer TOML snapshot: %w", err)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -1406,6 +1427,29 @@ const webhookCols = `id, owner_key_hash, url, secret_hash, secret_ciphertext, cr
 	deliveries, failures`
 
 func scanWebhook(row pgx.Row) (Webhook, error) {
+// LatestIssuerToml returns the most recently fetched stellar.toml snapshot
+// with cached content for issuer, or ErrNotFound when the issuer has not been
+// synced yet.
+func (s *Store) LatestIssuerToml(ctx context.Context, issuer string) (coverage.IssuerTomlSnapshot, error) {
+	var snap coverage.IssuerTomlSnapshot
+	err := s.pool.QueryRow(ctx, `
+		SELECT issuer, home_domain, sha256_hash, content, checked_at
+		FROM issuer_toml_snapshots
+		WHERE issuer = $1 AND content IS NOT NULL
+		ORDER BY id DESC
+		LIMIT 1`, issuer,
+	).Scan(&snap.Issuer, &snap.HomeDomain, &snap.SHA256Hash, &snap.Content, &snap.FetchedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return snap, ErrNotFound
+	}
+	if err != nil {
+		return snap, fmt.Errorf("latest issuer TOML: %w", err)
+	}
+	snap.FetchedAt = snap.FetchedAt.UTC()
+	return snap, nil
+}
+
+func (s *Store) CreateWebhook(ctx context.Context, url, secretHash string, ciphertext []byte) (Webhook, error) {
 	var w Webhook
 	err := row.Scan(&w.ID, &w.OwnerKeyHash, &w.URL, &w.SecretHash, &w.SecretCiphertext, &w.CreatedAt,
 		&w.LastDeliveryAt, &w.LastDeliveryStatus, &w.LastDeliveryError, &w.Deliveries, &w.Failures)
@@ -2133,4 +2177,53 @@ func (s *Store) SaveDocCheck(ctx context.Context, eventID, result string) error 
 		`UPDATE reserve_reports SET doc_check = $2 WHERE event_id = $1`,
 		eventID, result)
 	return err
+}
+
+// ---- vaults -----------------------------------------------------------------
+
+// GetVault returns the indexed vault metadata for sac, or ErrNotFound if no
+// vault has been indexed for that asset.
+func (s *Store) GetVault(ctx context.Context, sac string) (coverage.Vault, error) {
+	var v coverage.Vault
+	var balance string
+	var threshold int64
+	err := s.pool.QueryRow(ctx, `
+		SELECT sac, vault_address, reserve_balance::text, threshold_bps, updated_at
+		FROM vaults WHERE sac = $1`, sac,
+	).Scan(&v.SAC, &v.VaultAddress, &balance, &threshold, &v.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return v, ErrNotFound
+	}
+	if err != nil {
+		return v, fmt.Errorf("get vault: %w", err)
+	}
+	v.ReserveBalance = mustBig(balance)
+	v.ThresholdBps = uint32(threshold)
+	v.UpdatedAt = v.UpdatedAt.UTC()
+	return v, nil
+}
+
+// SaveVault inserts or updates indexed vault metadata for an asset.
+func (s *Store) SaveVault(ctx context.Context, v coverage.Vault) error {
+	balance := "0"
+	if v.ReserveBalance != nil {
+		balance = v.ReserveBalance.String()
+	}
+	updatedAt := v.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = time.Now().UTC()
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO vaults (sac, vault_address, reserve_balance, threshold_bps, updated_at)
+		VALUES ($1, $2, $3::numeric, $4, $5)
+		ON CONFLICT (sac) DO UPDATE
+		SET vault_address = EXCLUDED.vault_address,
+		    reserve_balance = EXCLUDED.reserve_balance,
+		    threshold_bps = EXCLUDED.threshold_bps,
+		    updated_at = EXCLUDED.updated_at`,
+		v.SAC, v.VaultAddress, balance, int64(v.ThresholdBps), updatedAt.UTC())
+	if err != nil {
+		return fmt.Errorf("save vault: %w", err)
+	}
+	return nil
 }

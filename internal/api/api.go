@@ -93,6 +93,8 @@ type assetCursor struct {
 	Code    string `json:"code"`
 	Issuer  string `json:"issuer"`
 	Stats(ctx context.Context, dayStart time.Time) (store.Stats, error)
+	GetVault(ctx context.Context, sac string) (coverage.Vault, error)
+	LatestIssuerToml(ctx context.Context, issuer string) (coverage.IssuerTomlSnapshot, error)
 }
 
 // NetworkInfo is served at /v1/network so clients can discover contract ids.
@@ -198,6 +200,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/assets/{sac}/reports/export.csv", s.reportExport)
 	mux.HandleFunc("GET /v1/assets/{sac}/coverage/now", s.coverageNow)
 	mux.HandleFunc("GET /v1/assets/{sac}/coverage", s.coverageSeries)
+	mux.HandleFunc("GET /v1/assets/{sac}/vault", s.getAssetVault)
+	mux.HandleFunc("GET /v1/issuers/{issuer}/toml", s.getIssuerToml)
 	mux.HandleFunc("GET /v1/reporters", s.reporters)
 	mux.HandleFunc("GET /v1/changelog", s.changelog)
 	mux.HandleFunc("GET /v1/stats", s.stats)
@@ -326,6 +330,11 @@ type statsJSON struct {
 type reporterJSON struct {
 	Role string `json:"role"`
 	coverage.Reporter
+}
+
+type vaultJSON struct {
+	ReserveBalance string `json:"reserve_balance"`
+	coverage.Vault
 }
 
 type webhookJSON struct {
@@ -967,6 +976,7 @@ func (s *Server) covered(w http.ResponseWriter, r *http.Request) {
 	}
 	maxAge, ok := parseMaxAge(w, r)
 func (s *Server) coverageSeries(w http.ResponseWriter, r *http.Request) {
+func (s *Server) getAssetVault(w http.ResponseWriter, r *http.Request) {
 	sac, ok := parseSAC(w, r)
 	if !ok {
 		return
@@ -976,6 +986,11 @@ func (s *Server) coverageSeries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sp, err := s.Store.LatestSupply(r.Context(), r.PathValue("sac"))
+	v, err := s.Store.GetVault(r.Context(), sac)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, codeVaultNotFound, "vault not found")
+		return
+	}
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -1029,6 +1044,25 @@ func (s *Server) reportExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	supply, err := s.Store.SeriesSupply(r.Context(), sac, from, to)
+	balance := "0"
+	if v.ReserveBalance != nil {
+		balance = v.ReserveBalance.String()
+	}
+	v.UpdatedAt = v.UpdatedAt.UTC()
+	writeJSON(w, http.StatusOK, vaultJSON{ReserveBalance: balance, Vault: v})
+}
+
+func (s *Server) getIssuerToml(w http.ResponseWriter, r *http.Request) {
+	issuer := r.PathValue("issuer")
+	if !strkey.IsValidEd25519PublicKey(issuer) {
+		writeError(w, http.StatusBadRequest, codeInvalidIssuer, "issuer must be a Stellar account public key")
+		return
+	}
+	snap, err := s.Store.LatestIssuerToml(r.Context(), issuer)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, codeIssuerTomlNotFound, "issuer toml not found")
+		return
+	}
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -1137,6 +1171,11 @@ func (s *Server) coverageNow(w http.ResponseWriter, r *http.Request) {
 // @Produce json
 // @Success 200 {object} map[string]any
 // @Router /v1/reporters [get]
+	snap.FetchedAt = snap.FetchedAt.UTC()
+	w.Header().Set("Last-Modified", snap.FetchedAt.Format(http.TimeFormat))
+	writeJSON(w, http.StatusOK, snap)
+}
+
 func (s *Server) reporters(w http.ResponseWriter, r *http.Request) {
 	list, err := s.Store.Reporters(r.Context())
 	if err != nil {
@@ -1954,6 +1993,9 @@ const (
 	codeAPIAuthNotConfigured  = "api_auth_not_configured"
 	codeDBUnavailable         = "db_unavailable"
 	codeProgressUnavailable   = "progress_unavailable"
+	codeVaultNotFound         = "vault_not_found"
+	codeInvalidIssuer         = "invalid_issuer"
+	codeIssuerTomlNotFound    = "issuer_toml_not_found"
 )
 
 // errorEnvelope rewrites the plain-text 404 and 405 that net/http's mux writes

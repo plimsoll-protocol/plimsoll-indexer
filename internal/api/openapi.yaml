@@ -398,6 +398,10 @@ paths:
         rules as coverage() on-chain. A point's coverage is null when no supply
         snapshot or no qualifying report was known then.
       operationId: getCoverageSeries
+  /v1/assets/{sac}/vault:
+    get:
+      summary: Get indexed vault metadata for an asset
+      operationId: getAssetVault
       parameters:
         - name: sac
           in: path
@@ -448,12 +452,64 @@ paths:
                 $ref: '#/components/schemas/CoverageSeries'
         '400':
           description: Invalid sac, min_tier, timestamp, interval, or more than 1000 points
+      responses:
+        '200':
+          description: Vault metadata for the asset
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Vault'
+        '400':
+          description: sac is not a contract strkey
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
           $ref: '#/components/responses/AssetNotFound'
+          description: No vault indexed for the asset
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/issuers/{issuer}/toml:
+    get:
+      summary: Get the latest cached stellar.toml snapshot for an issuer
+      operationId: getIssuerToml
+      parameters:
+        - name: issuer
+          in: path
+          required: true
+          description: Stellar issuer account public key
+          schema:
+            type: string
+            pattern: '^G[A-Z2-7]{55}$'
+            example: "GBIE3ANCRVCBWETUZXWYKRMP27LQVJHX757XXAQUT3LYHVTNFPPPXEY4"
+      responses:
+        '200':
+          description: Latest cached stellar.toml snapshot
+          headers:
+            Last-Modified:
+              description: HTTP-date timestamp when the snapshot was most recently fetched
+              schema:
+                type: string
+                example: "Tue, 24 Nov 2026 15:00:00 GMT"
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssuerTomlSnapshot'
+        '400':
+          description: issuer is not a Stellar account public key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Issuer has not been synced yet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/reporters:
     get:
       summary: List registered reporters, roles, and profile metadata
@@ -1290,6 +1346,9 @@ components:
             webhook_limit_reached, webhook_forbidden, webhooks_not_configured,
             unauthorized, internal_error, db_unavailable and progress_unavailable.
             The router uses
+            webhooks_not_configured, unauthorized, internal_error,
+            db_unavailable, progress_unavailable, vault_not_found,
+            invalid_issuer and issuer_toml_not_found. The router uses
             not_found, method_not_allowed and internal_error.
           example: asset_not_listed
         message:
@@ -1309,3 +1368,53 @@ components:
       required:
         - code
         - message
+    Vault:
+      type: object
+      properties:
+        sac:
+          type: string
+          example: "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
+        vault_address:
+          type: string
+          example: "CC3SUECAJSAC4PBV4QLUII7X5Y4WNVL5YGTBAQ4CHCAH6R3QLRYJUZHQ"
+        reserve_balance:
+          type: string
+          example: "10000000000"
+        threshold_bps:
+          type: integer
+          example: 10000
+        updated_at:
+          type: string
+          format: date-time
+          example: "2026-10-05T12:00:00Z"
+      required:
+        - sac
+        - vault_address
+        - reserve_balance
+        - threshold_bps
+        - updated_at
+    IssuerTomlSnapshot:
+      type: object
+      properties:
+        issuer:
+          type: string
+          example: "GBIE3ANCRVCBWETUZXWYKRMP27LQVJHX757XXAQUT3LYHVTNFPPPXEY4"
+        home_domain:
+          type: string
+          example: "example.money"
+        sha256_hash:
+          type: string
+          example: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        content:
+          type: string
+          example: "VERSION = \"2.7.0\"\n"
+        fetched_at:
+          type: string
+          format: date-time
+          example: "2026-11-24T15:00:00Z"
+      required:
+        - issuer
+        - home_domain
+        - sha256_hash
+        - content
+        - fetched_at
