@@ -47,6 +47,24 @@ func TestLoadMigrationsAllowsVersionReuse(t *testing.T) {
 	}
 	if ms[0].key() != "0001_a" || ms[1].key() != "0001_b" {
 		t.Fatalf("keys = %q, %q", ms[0].key(), ms[1].key())
+// Branches merged in the same release can land two migrations with one version.
+// They must both run, in name order, because each is recorded by its name.
+func TestLoadMigrationsAllowsSharedVersions(t *testing.T) {
+	ms, err := loadMigrations(fstest.MapFS{
+		"0001_initial.sql": {Data: []byte("SELECT 1")},
+		"0002_beta.sql":    {Data: []byte("SELECT 2")},
+		"0002_alpha.sql":   {Data: []byte("SELECT 2")},
+		"0003_last.sql":    {Data: []byte("SELECT 3")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, len(ms))
+	for i, m := range ms {
+		names[i] = m.Name
+	}
+	if !slices.Equal(names, []string{"initial", "alpha", "beta", "last"}) {
+		t.Fatalf("order = %v, want shared versions ordered by name", names)
 	}
 }
 
@@ -65,6 +83,16 @@ func TestLoadMigrationsRejectsMistakes(t *testing.T) {
 		"subdirectory": {fstest.MapFS{"0001_a.sql/x": sql}, `"0001_a.sql" is not named`},
 		"stray file":   {fstest.MapFS{"0001_a.sql": sql, "README.md": sql}, `"README.md" is not named`},
 		"version zero": {fstest.MapFS{"0000_a.sql": sql, "0001_b.sql": sql}, `"0000_a.sql": versions start at 0001`},
+		"gap":            {fstest.MapFS{"0001_a.sql": sql, "0003_c.sql": sql}, "migration 0002 is missing"},
+		"no first":       {fstest.MapFS{"0002_b.sql": sql}, "migration 0001 is missing"},
+		"duplicate name": {fstest.MapFS{"0001_a.sql": sql, "0002_a.sql": sql}, `two migrations are named "a"`},
+		"no number":      {fstest.MapFS{"initial.sql": sql}, `"initial.sql" is not named`},
+		"short number":   {fstest.MapFS{"1_initial.sql": sql}, `"1_initial.sql" is not named`},
+		"not sql":        {fstest.MapFS{"0001_a.txt": sql}, `"0001_a.txt" is not named`},
+		"upper case":     {fstest.MapFS{"0001_Initial.sql": sql}, `"0001_Initial.sql" is not named`},
+		"subdirectory":   {fstest.MapFS{"0001_a.sql/x": sql}, `"0001_a.sql" is not named`},
+		"stray file":     {fstest.MapFS{"0001_a.sql": sql, "README.md": sql}, `"README.md" is not named`},
+		"version zero":   {fstest.MapFS{"0000_a.sql": sql, "0001_b.sql": sql}, `"0000_a.sql": versions start at 0001`},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := loadMigrations(tc.files)

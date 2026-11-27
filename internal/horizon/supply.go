@@ -463,6 +463,8 @@ func backoffDelay(attempt int, retryAfter time.Duration) (time.Duration, error) 
 		return 0, fmt.Errorf("generate retry jitter: %w", err)
 	}
 	return half + time.Duration(jitter.Int64()), nil
+	// Jitter only spreads retries across instances; it is not a secret.
+	return half + time.Duration(rand.Int64N(int64(half)+1)) //nolint:gosec // retry jitter, not a security decision
 }
 
 // wait sleeps for d, returning early with ctx's error if the context ends.
