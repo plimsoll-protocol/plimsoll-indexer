@@ -28,6 +28,12 @@ type testSubscriptionStore struct {
 	deliveries []recordedDelivery
 }
 
+type testSubscriptionStore struct {
+	webhooks []store.Webhook
+	dlq      []store.WebhookDLQ
+	nextID   int64
+}
+
 func (s *testSubscriptionStore) ListWebhooks(context.Context) ([]store.Webhook, error) {
 	return s.webhooks, nil
 }
@@ -35,6 +41,64 @@ func (s *testSubscriptionStore) ListWebhooks(context.Context) ([]store.Webhook, 
 func (s *testSubscriptionStore) RecordWebhookDelivery(_ context.Context, id int64, at time.Time, failure string) error {
 	s.deliveries = append(s.deliveries, recordedDelivery{id: id, at: at, failure: failure})
 	return nil
+}
+
+func (s *testSubscriptionStore) GetWebhook(_ context.Context, id int64) (store.Webhook, bool, error) {
+	for _, w := range s.webhooks {
+		if w.ID == id {
+			return w, true, nil
+		}
+	}
+	return store.Webhook{}, false, nil
+}
+
+func (s *testSubscriptionStore) CreateWebhookDLQ(_ context.Context, webhookID int64, payload []byte, lastError string, attempts int) error {
+	s.nextID++
+	s.dlq = append(s.dlq, store.WebhookDLQ{
+		ID: s.nextID, WebhookID: webhookID, Payload: append([]byte(nil), payload...),
+		LastError: lastError, Attempts: attempts,
+	})
+	return nil
+}
+
+func (s *testSubscriptionStore) ListWebhookDLQ(_ context.Context, webhookID int64, limit int) ([]store.WebhookDLQ, error) {
+	var out []store.WebhookDLQ
+	for _, item := range s.dlq {
+		if item.WebhookID == webhookID && len(out) < limit {
+			out = append(out, item)
+		}
+	}
+	return out, nil
+}
+
+func (s *testSubscriptionStore) GetWebhookDLQ(_ context.Context, webhookID, id int64) (store.WebhookDLQ, bool, error) {
+	for _, item := range s.dlq {
+		if item.WebhookID == webhookID && item.ID == id {
+			return item, true, nil
+		}
+	}
+	return store.WebhookDLQ{}, false, nil
+}
+
+func (s *testSubscriptionStore) UpdateWebhookDLQFailure(_ context.Context, webhookID, id int64, lastError string, attempts int) (bool, error) {
+	for i := range s.dlq {
+		if s.dlq[i].WebhookID == webhookID && s.dlq[i].ID == id {
+			s.dlq[i].LastError = lastError
+			s.dlq[i].Attempts += attempts
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *testSubscriptionStore) DeleteWebhookDLQ(_ context.Context, webhookID, id int64) (bool, error) {
+	for i := range s.dlq {
+		if s.dlq[i].WebhookID == webhookID && s.dlq[i].ID == id {
+			s.dlq = append(s.dlq[:i], s.dlq[i+1:]...)
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func testCodec(t *testing.T) *SecretCodec {
@@ -63,6 +127,7 @@ func TestDispatcherSignatureMatchesDocumentedReference(t *testing.T) {
 		t.Fatal(err)
 	}
 	subs := &testSubscriptionStore{webhooks: []store.Webhook{{
+	dispatcher := NewDispatcher(&testSubscriptionStore{webhooks: []store.Webhook{{
 		ID: 1, URL: server.URL, SecretHash: SecretHash(secret), SecretCiphertext: ciphertext,
 	}}}
 	dispatcher := NewDispatcher(subs, codec)
@@ -151,6 +216,74 @@ func TestKeyIDIsStableAndDoesNotContainTheToken(t *testing.T) {
 	}
 	if KeyID(token) != id || KeyID("another-token") == id {
 		t.Error("KeyID must be stable for one token and different for another")
+	}
+}
+
+func TestDispatcherRetriesAndDeadLettersFailedDelivery(t *testing.T) {
+	const secret = "receiver-secret"
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	codec := testCodec(t)
+	ciphertext, err := codec.Encrypt(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := &testSubscriptionStore{webhooks: []store.Webhook{{
+		ID: 7, URL: server.URL, SecretHash: SecretHash(secret), SecretCiphertext: ciphertext,
+	}}}
+	dispatcher := NewDispatcher(storage, codec)
+	dispatcher.RetryDelay = 0
+	dispatcher.Client = &http.Client{Timeout: time.Second}
+
+	if err := dispatcher.TOMLChanged(context.Background(), "GISSUER", "issuer.example", "old", "new"); err == nil {
+		t.Fatal("expected failed webhook delivery")
+	}
+	if calls != maxRetries+1 {
+		t.Fatalf("delivery attempts = %d, want initial attempt plus %d retries", calls, maxRetries)
+	}
+	if len(storage.dlq) != 1 {
+		t.Fatalf("DLQ contains %d entries, want 1", len(storage.dlq))
+	}
+	if storage.dlq[0].Attempts != maxRetries+1 || storage.dlq[0].LastError == "" {
+		t.Fatalf("DLQ entry = %+v", storage.dlq[0])
+	}
+}
+
+func TestRetryWebhookDLQRemovesSuccessfullyDeliveredEntry(t *testing.T) {
+	const secret = "receiver-secret"
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	codec := testCodec(t)
+	ciphertext, err := codec.Encrypt(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := &testSubscriptionStore{
+		webhooks: []store.Webhook{{
+			ID: 7, URL: server.URL, SecretHash: SecretHash(secret), SecretCiphertext: ciphertext,
+		}},
+		dlq: []store.WebhookDLQ{{ID: 8, WebhookID: 7, Payload: []byte(`{"event":"test"}`), Attempts: 4}},
+	}
+	dispatcher := NewDispatcher(storage, codec)
+	dispatcher.RetryDelay = 0
+	dispatcher.Client = &http.Client{Timeout: time.Second}
+
+	found, err := dispatcher.RetryWebhookDLQ(context.Background(), 7, 8)
+	if err != nil || !found {
+		t.Fatalf("RetryWebhookDLQ() = %v, %v", found, err)
+	}
+	if calls != 1 || len(storage.dlq) != 0 {
+		t.Fatalf("calls=%d, remaining DLQ=%d; want 1 and 0", calls, len(storage.dlq))
 	}
 }
 

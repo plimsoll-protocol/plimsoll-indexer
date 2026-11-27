@@ -450,6 +450,43 @@ func TestReporterMetadataEventKeepsAddressForReconciliation(t *testing.T) {
 	addresses, err := s.AllReporterAddresses(ctx)
 	if err != nil || len(addresses) != 1 || addresses[0] != event.Reporter {
 		t.Fatalf("metadata-only event lost its reporter address: %v, %v", addresses, err)
+	got, found, err := s.GetWebhook(ctx, created.ID)
+	if err != nil || !found || got.ID != created.ID {
+		t.Fatalf("get webhook = %+v, found=%v, err=%v", got, found, err)
+	}
+
+	payload := []byte(`{"event":"issuer_toml_changed"}`)
+	if err := s.CreateWebhookDLQ(ctx, created.ID, payload, "connection refused", 4); err != nil {
+		t.Fatal(err)
+	}
+	dlq, err := s.ListWebhookDLQ(ctx, created.ID, 10)
+	if err != nil || len(dlq) != 1 || string(dlq[0].Payload) != string(payload) ||
+		dlq[0].Attempts != 4 || dlq[0].LastError != "connection refused" {
+		t.Fatalf("listed webhook DLQ = %+v, %v", dlq, err)
+	}
+	dlqEntry, found, err := s.GetWebhookDLQ(ctx, created.ID, dlq[0].ID)
+	if err != nil || !found || dlqEntry.ID != dlq[0].ID {
+		t.Fatalf("get webhook DLQ = %+v, found=%v, err=%v", dlqEntry, found, err)
+	}
+	updated, err := s.UpdateWebhookDLQFailure(ctx, created.ID, dlqEntry.ID, "still unavailable", 4)
+	if err != nil || !updated {
+		t.Fatalf("update webhook DLQ: updated=%v err=%v", updated, err)
+	}
+	dlq, err = s.ListWebhookDLQ(ctx, created.ID, 10)
+	if err != nil || dlq[0].Attempts != 8 || dlq[0].LastError != "still unavailable" {
+		t.Fatalf("updated webhook DLQ = %+v, %v", dlq, err)
+	}
+	deleted, err := s.DeleteWebhook(ctx, created.ID)
+	if err != nil || !deleted {
+		t.Fatalf("delete webhook: deleted=%v err=%v", deleted, err)
+	}
+	dlq, err = s.ListWebhookDLQ(ctx, created.ID, 10)
+	if err != nil || len(dlq) != 0 {
+		t.Fatalf("webhook deletion left DLQ entries %+v, err=%v", dlq, err)
+	}
+	deleted, err = s.DeleteWebhook(ctx, created.ID)
+	if err != nil || deleted {
+		t.Fatalf("delete missing webhook: deleted=%v err=%v", deleted, err)
 	}
 }
 

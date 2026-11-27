@@ -166,7 +166,7 @@ Logs are JSON (`log/slog`). Key messages:
 | info | `indexed reporter events` | The reporter watcher stored a registration or revocation. |
 | info | `replay progress` / `replay complete` | A `replay` run advanced through its ledger range. |
 | info | `issuer stellar.toml changed` | The issuer document hash changed; includes `old_hash` and `new_hash`. |
-| error | `issuer stellar.toml change webhook delivery failed` | A destination could not receive the TOML change event. |
+| error | `issuer stellar.toml change webhook delivery failed` | Delivery exhausted its retries and was saved to the DLQ. Inspect `GET /v1/webhooks/{id}/dlq` and retry with `POST /v1/webhooks/{id}/dlq/{delivery_id}/retry`. |
 
 ## Common procedures
 

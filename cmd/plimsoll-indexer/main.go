@@ -269,6 +269,7 @@ func run(cfg config.Config, build buildinfo.Info, log *slog.Logger) error {
 		Handler: (&api.Server{
 			Store:             db,
 			WebhookStore:      db,
+			WebhookRetryer:    webhookDispatcher,
 			WebhookAdminToken: cfg.WebhookAdminToken,
 			WebhookAPIKeys:    cfg.WebhookAPIKeys,
 			WebhookCodec:      webhookCodec,

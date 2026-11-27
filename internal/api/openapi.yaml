@@ -742,6 +742,7 @@ components:
               description: Returned once; store it securely.
           required: [secret]
     CoverageWebhook:
+    WebhookDLQ:
       type: object
       properties:
         id:
@@ -766,6 +767,18 @@ components:
         - min_bps
         - min_tier
         - created_at
+        payload:
+          type: object
+          description: Original JSON payload sent to the webhook
+        last_error:
+          type: string
+        attempts:
+          type: integer
+          description: Total delivery attempts, including retries
+        failed_at:
+          type: string
+          format: date-time
+      required: [id, payload, last_error, attempts, failed_at]
     ErrorResponse:
       type: object
       description: |

@@ -196,6 +196,28 @@ func (f *fake) Breakdown(_ context.Context, h string) ([]byte, error) {
 func (f *fake) Progress(_ context.Context, name string) (store.Progress, error) {
 	if p, ok := f.progress[name]; ok {
 		return p, nil
+func (f *fake) Progress(context.Context, string) (store.Progress, error) {
+	return store.Progress{
+		Cursor:        "c",
+		ScannedLedger: 42,
+		EventLedger:   40,
+		EventAt:       now.Add(-90 * time.Second),
+	}, nil
+}
+
+type webhookManagerFake struct {
+	webhooks        []store.Webhook
+	dlq             []store.WebhookDLQ
+	retryFound      bool
+	retryErr        error
+	retryWebhookID  int64
+	retryDeliveryID int64
+}
+
+func (f *webhookManagerFake) CreateWebhook(_ context.Context, url, hash string, ciphertext []byte) (store.Webhook, error) {
+	item := store.Webhook{
+		ID: int64(len(f.webhooks) + 1), URL: url, SecretHash: hash,
+		SecretCiphertext: ciphertext, CreatedAt: now,
 	}
 	return store.Progress{}, nil
 }
@@ -211,6 +233,21 @@ func (f *fake) DeleteCoverageWebhook(_ context.Context, id int64) error {
 		if w.ID == id {
 			f.deleted = append(f.deleted, id)
 			return nil
+
+func (f *webhookManagerFake) GetWebhook(_ context.Context, id int64) (store.Webhook, bool, error) {
+	for _, item := range f.webhooks {
+		if item.ID == id {
+			return item, true, nil
+		}
+	}
+	return store.Webhook{}, false, nil
+}
+
+func (f *webhookManagerFake) DeleteWebhook(_ context.Context, id int64) (bool, error) {
+	for i, item := range f.webhooks {
+		if item.ID == id {
+			f.webhooks = append(f.webhooks[:i], f.webhooks[i+1:]...)
+			return true, nil
 		}
 	}
 	return store.ErrNotFound
@@ -223,6 +260,26 @@ func (f *fake) Attestation(_ context.Context, s string) (store.Attestation, erro
 }
 
 func TestHealthAggregatesContractStreamProgress(t *testing.T) {
+func (f *webhookManagerFake) ListWebhookDLQ(_ context.Context, id int64, limit int) ([]store.WebhookDLQ, error) {
+	var out []store.WebhookDLQ
+	for _, item := range f.dlq {
+		if item.WebhookID == id && len(out) < limit {
+			out = append(out, item)
+		}
+	}
+	return out, nil
+}
+
+func (f *webhookManagerFake) RetryWebhookDLQ(_ context.Context, webhookID, deliveryID int64) (bool, error) {
+	f.retryWebhookID, f.retryDeliveryID = webhookID, deliveryID
+	return f.retryFound, f.retryErr
+}
+
+func server() *httptest.Server {
+	return serverWithWebhooks(nil, nil, "")
+}
+
+func serverWithWebhooks(manager WebhookManager, codec *webhook.SecretCodec, token string) *httptest.Server {
 	f := &fake{
 		progress: map[string]store.Progress{
 			store.LegacyIngestCursorName: {
@@ -414,9 +471,11 @@ func serverWithWebhooks(manager WebhookManager, codec *webhook.SecretCodec, toke
 }
 
 func serverWithFake(f Reader, manager WebhookManager, codec *webhook.SecretCodec, token string) *httptest.Server {
+	retryer, _ := manager.(WebhookRetryer)
 	s := &Server{
 		Store:             f,
 		WebhookStore:      manager,
+		WebhookRetryer:    retryer,
 		WebhookCodec:      codec,
 		WebhookAdminToken: token,
 		WebhookAPIKeys:    []string{"owner-token", "other-owner-token"},
@@ -1346,5 +1405,74 @@ func TestMetricsEndpoint(t *testing.T) {
 		if !strings.Contains(body, m) {
 			t.Errorf("expected metric %q in /metrics output", m)
 		}
+	}
+}
+
+func TestWebhookDLQListAndRetryEndpoints(t *testing.T) {
+	manager := &webhookManagerFake{
+		webhooks: []store.Webhook{{ID: 12, URL: "https://receiver.example/hook"}},
+		dlq: []store.WebhookDLQ{{
+			ID: 34, WebhookID: 12, Payload: []byte(`{"event":"issuer_toml_changed"}`),
+			LastError: "webhook returned status 503", Attempts: 4, FailedAt: now,
+		}},
+		retryFound: true,
+	}
+	codec, err := webhook.NewSecretCodec(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := serverWithWebhooks(manager, codec, "admin-token")
+	defer srv.Close()
+
+	request := func(method, path string, authorized bool) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(method, srv.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if authorized {
+			req.Header.Set("Authorization", "Bearer admin-token")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	unauthorized := request(http.MethodGet, "/v1/webhooks/12/dlq", false)
+	unauthorized.Body.Close()
+	if unauthorized.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized DLQ list status = %d, want 401", unauthorized.StatusCode)
+	}
+
+	list := request(http.MethodGet, "/v1/webhooks/12/dlq", true)
+	var listBody struct {
+		Deliveries []struct {
+			ID        int64           `json:"id"`
+			Payload   json.RawMessage `json:"payload"`
+			LastError string          `json:"last_error"`
+			Attempts  int             `json:"attempts"`
+			FailedAt  time.Time       `json:"failed_at"`
+		} `json:"deliveries"`
+	}
+	if err := json.NewDecoder(list.Body).Decode(&listBody); err != nil {
+		list.Body.Close()
+		t.Fatal(err)
+	}
+	list.Body.Close()
+	if list.StatusCode != http.StatusOK || len(listBody.Deliveries) != 1 {
+		t.Fatalf("DLQ list status=%d body=%+v", list.StatusCode, listBody)
+	}
+	entry := listBody.Deliveries[0]
+	if entry.ID != 34 || string(entry.Payload) != `{"event":"issuer_toml_changed"}` ||
+		entry.LastError != "webhook returned status 503" || entry.Attempts != 4 || !entry.FailedAt.Equal(now) {
+		t.Fatalf("DLQ entry = %+v", entry)
+	}
+
+	retry := request(http.MethodPost, "/v1/webhooks/12/dlq/34/retry", true)
+	defer retry.Body.Close()
+	if retry.StatusCode != http.StatusOK || manager.retryWebhookID != 12 || manager.retryDeliveryID != 34 {
+		t.Fatalf("retry status=%d ids=(%d,%d)", retry.StatusCode, manager.retryWebhookID, manager.retryDeliveryID)
 	}
 }
