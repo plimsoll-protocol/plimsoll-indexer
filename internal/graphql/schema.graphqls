@@ -1,0 +1,79 @@
+scalar Time
+
+directive @goField(forceResolver: Boolean, name: String, omittable: Boolean) on FIELD_DEFINITION | INPUT_FIELD_DEFINITION
+
+type Asset {
+  sac: ID!
+  code: String!
+  issuer: String!
+  listedLedger: Int!
+  listedAt: Time!
+  toml: String
+  tomlCheckedAt: Time
+  tomlError: String
+  supply: Supply
+  reports: [Report!]!
+  coverage(minTier: Int): Coverage @goField(forceResolver: true)
+}
+
+type Supply {
+  amount: String!
+  ledger: Int!
+  postedAt: Time!
+  breakdownHash: String!
+  poster: String!
+  txHash: String!
+  source: String!
+}
+
+type Report {
+  tier: String!
+  amount: String!
+  asOf: Time!
+  postedAt: Time!
+  reporter: String!
+  docHash: String!
+  docUri: String!
+  txHash: String!
+  source: String!
+  docCheck: String
+}
+
+type Coverage {
+  bps: Int
+  ratio: String
+  tier: String!
+  supply: String!
+  reserves: String!
+  supplyLedger: Int!
+  supplyPostedAt: Time!
+  reportAsOf: Time!
+  reportAgeSeconds: Int!
+  supplyAgeSeconds: Int!
+  reporter: String!
+  docUri: String!
+}
+
+type Reporter {
+  address: String!
+  role: String!
+  name: String!
+  updatedAt: Time!
+}
+
+type Query {
+  "Every listed asset, optionally filtered to a minimum report tier."
+  assets(minTier: Int = 1): [Asset!]!
+  "One listed asset, or null when the SAC is not listed."
+  asset(sac: ID!): Asset
+  "Supply snapshot history, newest first."
+  supplyHistory(sac: ID!, limit: Int = 100): [Supply!]!
+  "Alias for supplyHistory; snapshots are the stored supply rows."
+  snapshots(sac: ID!, limit: Int = 100): [Supply!]!
+  "Latest report per tier."
+  reports(sac: ID!): [Report!]!
+  "Reserve report history, newest first."
+  reportHistory(sac: ID!, limit: Int = 100): [Report!]!
+  "Active registered reporters."
+  reporters: [Reporter!]!
+}

@@ -365,9 +365,25 @@ func (s *Store) applyDecoded(ctx context.Context, events []any) error {
 	for _, ev := range events {
 		if err := applyEvent(ctx, tx, ev); err != nil {
 			return err
+	// Keep the materialised latest coverage in step with the rows this batch
+	// just wrote. The refresh is inside the transaction, so readers see the
+	// old view until the new rows are committed, never a half-applied batch.
+	if len(events) > 0 {
+		if _, err := tx.Exec(ctx, `REFRESH MATERIALIZED VIEW latest_coverage`); err != nil {
+			return fmt.Errorf("refresh latest_coverage: %w", err)
 		}
 	}
 	return tx.Commit(ctx)
+}
+
+// RefreshLatestCoverage rebuilds the materialised view directly. Ingestion
+// refreshes it itself after each batch; this is for writers outside the event
+// path, such as reconciliation.
+func (s *Store) RefreshLatestCoverage(ctx context.Context) error {
+	if _, err := s.pool.Exec(ctx, `REFRESH MATERIALIZED VIEW latest_coverage`); err != nil {
+		return fmt.Errorf("refresh latest_coverage: %w", err)
+	}
+	return nil
 }
 
 func applyEvent(ctx context.Context, tx pgx.Tx, ev any) error {
@@ -687,6 +703,27 @@ func (s *Store) SupplyHistory(ctx context.Context, sac string, limit int, before
 func (s *Store) LatestSupply(ctx context.Context, sac string) (*coverage.Supply, error) {
 	h, _, err := s.SupplyHistory(ctx, sac, 1, nil)
 	defer measureQuery("latest_supply")()
+	var sp coverage.Supply
+	var amount string
+	var ledger int64
+	err := s.pool.QueryRow(ctx, `
+		SELECT supply_amount::text, supply_ledger, supply_posted_at,
+		       breakdown_hash, poster, supply_tx_hash, supply_source
+		FROM latest_coverage
+		WHERE sac = $1 AND supply_amount IS NOT NULL
+		LIMIT 1`, sac).
+		Scan(&amount, &ledger, &sp.PostedAt, &sp.BreakdownHash, &sp.Poster, &sp.TxHash, &sp.Source)
+	if err == nil {
+		sp.Amount = mustBig(amount)
+		sp.Ledger = uint32(ledger)
+		return &sp, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
+	}
+	// An asset with a snapshot but no asset_listed row (for example data
+	// written before listing) is not in the view; fall back to the table so
+	// the API keeps the same answer it had before the view existed.
 	h, err := s.SupplyHistory(ctx, sac, 1)
 	if err != nil || len(h) == 0 {
 		return nil, err
@@ -888,9 +925,34 @@ func (s *Store) ReportExportPage(ctx context.Context, sac string, from, to *time
 // LatestReports returns the newest report (by as_of) for each tier.
 func (s *Store) LatestReports(ctx context.Context, sac string) (map[uint32]coverage.Report, error) {
 	defer measureQuery("latest_reports")()
+	list, err := s.queryReports(ctx, `
+		SELECT tier, report_amount::text, as_of, report_posted_at, reporter,
+		       doc_hash, doc_uri, report_tx_hash, report_source,
+		       COALESCE(doc_check, '')
+		FROM latest_coverage
+		WHERE sac = $1 AND tier > 0
+		ORDER BY tier`, sac)
 	list, err := s.queryReports(ctx, latestReportsSQL, sac)
 	if err != nil {
 		return nil, err
+	}
+	// An unlisted asset is absent from the view even if reports exist for it.
+	// Fall back to the table so behaviour matches the pre-view API.
+	if len(list) == 0 {
+		var exists bool
+		if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM latest_coverage WHERE sac = $1)`, sac).Scan(&exists); err != nil {
+			return nil, err
+		}
+		if !exists {
+			list, err = s.queryReports(ctx, `
+				SELECT DISTINCT ON (tier) tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source,
+				                           COALESCE(doc_check, '')
+				FROM reserve_reports WHERE sac = $1
+				ORDER BY tier, as_of DESC`, sac)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 	out := make(map[uint32]coverage.Report, len(list))
 	for _, r := range list {
@@ -1640,6 +1702,13 @@ func (s *Store) SaveChainSupply(ctx context.Context, sac string, sp coverage.Sup
 		return false, err
 	}
 	return tag.RowsAffected() > 0, nil
+	added := tag.RowsAffected() > 0
+	if added {
+		if err := s.RefreshLatestCoverage(ctx); err != nil {
+			return false, err
+		}
+	}
+	return added, nil
 }
 
 // SaveChainReport records a report read back from contract state, and reports
@@ -1658,7 +1727,13 @@ func (s *Store) SaveChainReport(ctx context.Context, sac string, r coverage.Repo
 	if err != nil {
 		return false, fmt.Errorf("save chain report: %w", err)
 	}
-	return tag.RowsAffected() > 0, nil
+	added := tag.RowsAffected() > 0
+	if added {
+		if err := s.RefreshLatestCoverage(ctx); err != nil {
+			return false, err
+		}
+	}
+	return added, nil
 }
 
 func chainSupplyID(sac string, ledger uint32) string {
@@ -1667,6 +1742,173 @@ func chainSupplyID(sac string, ledger uint32) string {
 
 func chainReportID(sac string, tier uint32, asOf time.Time) string {
 	return fmt.Sprintf("chain:%s:report:%d:%d", sac, tier, asOf.Unix())
+}
+
+// ---- retention -------------------------------------------------------------
+
+// PruneResult counts the rows a retention pass removed.
+type PruneResult struct {
+	SupplySnapshots int64
+	ReserveReports  int64
+	Breakdowns      int64
+}
+
+// Total is the number of rows deleted across every table.
+func (r PruneResult) Total() int64 {
+	return r.SupplySnapshots + r.ReserveReports + r.Breakdowns
+}
+
+// Prune deletes snapshots, reports and breakdowns posted before cutoff. A
+// breakdown is kept while any surviving snapshot still refers to it, because
+// /v1/breakdowns/{hash} must keep serving the bytes behind a live hash.
+func (s *Store) Prune(ctx context.Context, cutoff time.Time) (PruneResult, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return PruneResult{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var out PruneResult
+	tag, err := tx.Exec(ctx, `DELETE FROM supply_snapshots WHERE posted_at < $1`, cutoff)
+	if err != nil {
+		return out, fmt.Errorf("prune supply snapshots: %w", err)
+	}
+	out.SupplySnapshots = tag.RowsAffected()
+
+	tag, err = tx.Exec(ctx, `DELETE FROM reserve_reports WHERE posted_at < $1`, cutoff)
+	if err != nil {
+		return out, fmt.Errorf("prune reserve reports: %w", err)
+	}
+	out.ReserveReports = tag.RowsAffected()
+
+	tag, err = tx.Exec(ctx, `
+		DELETE FROM breakdowns b
+		WHERE b.created_at < $1
+		  AND NOT EXISTS (SELECT 1 FROM supply_snapshots s WHERE s.breakdown_hash = b.hash)`, cutoff)
+	if err != nil {
+		return out, fmt.Errorf("prune breakdowns: %w", err)
+	}
+	out.Breakdowns = tag.RowsAffected()
+
+	if _, err := tx.Exec(ctx, `REFRESH MATERIALIZED VIEW latest_coverage`); err != nil {
+		return out, fmt.Errorf("refresh latest_coverage after prune: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return out, fmt.Errorf("commit prune: %w", err)
+	}
+	return out, nil
+}
+
+// retentionTables is the allowlist Vacuum accepts. Table names are never taken
+// from user input, and this keeps it that way.
+var retentionTables = map[string]bool{
+	"supply_snapshots": true,
+	"reserve_reports":  true,
+	"breakdowns":       true,
+}
+
+// Vacuum reclaims space in the tables a prune touched. VACUUM cannot run in a
+// transaction, so this is deliberately a separate call after Prune commits.
+func (s *Store) Vacuum(ctx context.Context, tables ...string) error {
+	for _, table := range tables {
+		if !retentionTables[table] {
+			return fmt.Errorf("refusing to vacuum unknown table %q", table)
+		}
+		if _, err := s.pool.Exec(ctx, `VACUUM (ANALYZE) `+pgx.Identifier{table}.Sanitize()); err != nil {
+			return fmt.Errorf("vacuum %s: %w", table, err)
+		}
+	}
+	return nil
+}
+
+// ---- reindex ---------------------------------------------------------------
+
+// ReindexCounts is how many rows a reindex from a ledger would remove.
+type ReindexCounts struct {
+	Assets          int64
+	SupplySnapshots int64
+	ReserveReports  int64
+}
+
+// Total is the number of rows across every table.
+func (c ReindexCounts) Total() int64 {
+	return c.Assets + c.SupplySnapshots + c.ReserveReports
+}
+
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+func countReindexRows(ctx context.Context, q rowQuerier, from uint32) (ReindexCounts, error) {
+	var c ReindexCounts
+	if err := q.QueryRow(ctx, `SELECT count(*) FROM assets WHERE listed_ledger >= $1`, int64(from)).Scan(&c.Assets); err != nil {
+		return c, fmt.Errorf("count assets: %w", err)
+	}
+	if err := q.QueryRow(ctx, `
+		SELECT count(*) FROM supply_snapshots
+		WHERE at_ledger >= $1 OR posted_ledger >= $1`, int64(from)).Scan(&c.SupplySnapshots); err != nil {
+		return c, fmt.Errorf("count supply snapshots: %w", err)
+	}
+	if err := q.QueryRow(ctx, `SELECT count(*) FROM reserve_reports WHERE posted_ledger >= $1`, int64(from)).Scan(&c.ReserveReports); err != nil {
+		return c, fmt.Errorf("count reserve reports: %w", err)
+	}
+	return c, nil
+}
+
+// CountEventsFromLedger reports what DeleteEventsFromLedger would remove,
+// without changing anything. It is what --dry-run prints.
+func (s *Store) CountEventsFromLedger(ctx context.Context, from uint32) (ReindexCounts, error) {
+	return countReindexRows(ctx, s.pool, from)
+}
+
+// DeleteEventsFromLedger discards rows derived from events at or after from:
+// asset listings, supply snapshots and reserve reports. Reporters are current
+// state rather than an event log, so they are left for the replay to update
+// idempotently. The ingest cursor is reset separately with ResetIngestCursor.
+func (s *Store) DeleteEventsFromLedger(ctx context.Context, from uint32) (ReindexCounts, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return ReindexCounts{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var out ReindexCounts
+	tag, err := tx.Exec(ctx, `
+		DELETE FROM supply_snapshots
+		WHERE at_ledger >= $1 OR posted_ledger >= $1`, int64(from))
+	if err != nil {
+		return out, fmt.Errorf("delete supply snapshots: %w", err)
+	}
+	out.SupplySnapshots = tag.RowsAffected()
+
+	tag, err = tx.Exec(ctx, `DELETE FROM reserve_reports WHERE posted_ledger >= $1`, int64(from))
+	if err != nil {
+		return out, fmt.Errorf("delete reserve reports: %w", err)
+	}
+	out.ReserveReports = tag.RowsAffected()
+
+	tag, err = tx.Exec(ctx, `DELETE FROM assets WHERE listed_ledger >= $1`, int64(from))
+	if err != nil {
+		return out, fmt.Errorf("delete assets: %w", err)
+	}
+	out.Assets = tag.RowsAffected()
+
+	if _, err := tx.Exec(ctx, `REFRESH MATERIALIZED VIEW latest_coverage`); err != nil {
+		return out, fmt.Errorf("refresh latest_coverage after reindex delete: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return out, fmt.Errorf("commit reindex delete: %w", err)
+	}
+	return out, nil
+}
+
+// ResetIngestCursor removes the saved cursor so the next ingest starts from
+// the configured StartLedger instead of resuming after the discarded range.
+func (s *Store) ResetIngestCursor(ctx context.Context, name string) error {
+	if _, err := s.pool.Exec(ctx, `DELETE FROM ingest_cursor WHERE name = $1`, name); err != nil {
+		return fmt.Errorf("reset ingest cursor: %w", err)
+	}
+	return nil
 }
 
 // ---- reporter reconciliation -----------------------------------------------

@@ -110,6 +110,10 @@ type Server struct {
 	// WebhookStore, WebhookCodec and WebhookAdminToken manage issuer TOML
 	// change subscriptions at /v1/webhooks. All three must be set; otherwise
 	// those endpoints answer 503.
+	// GraphQL, when set, is mounted at /graphql. It is nil unless
+	// ENABLE_GRAPHQL=true.
+	GraphQL http.Handler
+	Store             Reader
 	WebhookStore      WebhookManager
 	WebhookRetryer    WebhookRetryer
 	WebhookAdminToken string
@@ -181,6 +185,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/changelog", s.changelog)
 	mux.HandleFunc("GET /v1/breakdowns/{hash}", s.breakdown)
 	mux.HandleFunc("GET /v1/events", s.events)
+	if s.GraphQL != nil {
+		mux.Handle("/graphql", s.GraphQL)
+	}
 	mux.HandleFunc("POST /v1/webhooks", s.createWebhook)
 	mux.HandleFunc("GET /v1/webhooks", s.listWebhooks)
 	mux.HandleFunc("GET /v1/webhooks/{id}/dlq", s.listWebhookDLQ)
@@ -1693,6 +1700,8 @@ func (s *Server) cors(next http.Handler) http.Handler {
 				break
 			}
 		}
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 		if r.Method == http.MethodOptions {

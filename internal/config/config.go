@@ -87,6 +87,14 @@ type Config struct {
 	TomlInterval      time.Duration
 	CORSOrigins       []string
 	LogLevel          string
+	// Environment is "production" or "development". Production turns off
+	// GraphQL introspection, which otherwise exposes the whole schema.
+	Environment string
+	// RetentionDays is how long snapshots, reports and breakdowns are kept.
+	// Zero keeps them forever.
+	RetentionDays int
+	// GraphQLEnabled mounts /graphql. It is off by default.
+	GraphQLEnabled bool
 	// KeepAwakeURL is requested every KeepAwakeInterval so a host that sleeps
 	// idle services (Render's free tier) keeps this one, and its poster, up.
 	KeepAwakeURL      string
@@ -164,6 +172,19 @@ func Load() (Config, error) {
 	}
 
 	c := Config{
+		Network:            network,
+		DatabaseURL:        os.Getenv("DATABASE_URL"),
+		Port:               envOr("PORT", "8080"),
+		RPCURL:             envOr("STELLAR_RPC_URL", preset.RPCURL),
+		HorizonURL:         strings.TrimRight(envOr("HORIZON_URL", preset.HorizonURL), "/"),
+		HorizonCheckURL:    strings.TrimRight(os.Getenv("HORIZON_CHECK_URL"), "/"),
+		NetworkPassphrase:  envOr("STELLAR_NETWORK_PASSPHRASE", preset.Passphrase),
+		CoverageLedgerID:   os.Getenv("COVERAGE_LEDGER_ID"),
+		ReporterRegistryID: os.Getenv("REPORTER_REGISTRY_ID"),
+		PosterSecret:       os.Getenv("SUPPLY_POSTER_SECRET"),
+		LogLevel:           envOr("LOG_LEVEL", "info"),
+		Environment:        strings.ToLower(envOr("ENVIRONMENT", envOr("APP_ENV", "development"))),
+		KeepAwakeURL:       keepAwakeURL(os.Getenv("KEEP_AWAKE_URL"), os.Getenv("RENDER_EXTERNAL_URL")),
 		Network:              network,
 		DatabaseURL:          os.Getenv("DATABASE_URL"),
 		Port:                 envOr("PORT", "8080"),
@@ -367,6 +388,22 @@ func Load() (Config, error) {
 		}
 	}
 
+	retention, err := strconv.Atoi(envOr("RETENTION_DAYS", "365"))
+	if err != nil || retention < 0 {
+		errs = append(errs, fmt.Errorf("RETENTION_DAYS must be a non-negative integer, got %q", os.Getenv("RETENTION_DAYS")))
+	} else {
+		c.RetentionDays = retention
+	}
+
+	if v := os.Getenv("ENABLE_GRAPHQL"); v != "" {
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("ENABLE_GRAPHQL: %w", err))
+		} else {
+			c.GraphQLEnabled = enabled
+		}
+	}
+
 	return c, errors.Join(errs...)
 }
 
@@ -404,6 +441,8 @@ func loadPosterSecret() (string, error) {
 	}
 	return strings.TrimRightFunc(string(b), unicode.IsSpace), nil
 }
+// IsProduction reports whether the GraphQL endpoint must hide introspection.
+func (c Config) IsProduction() bool { return c.Environment == "production" }
 
 // keepAwakeURL picks the URL to ping: KEEP_AWAKE_URL if set ("none" turns
 // it off), otherwise Render's RENDER_EXTERNAL_URL plus /healthz, otherwise

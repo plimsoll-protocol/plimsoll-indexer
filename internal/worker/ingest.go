@@ -23,6 +23,10 @@ const (
 	// not move each other's position.
 	reporterCursorName = "reporters"
 	pageLimit          = 200
+	// CursorName is the ingest cursor the indexer resumes from.
+	CursorName = "plimsoll-events"
+	cursorName = CursorName
+	pageLimit  = 200
 )
 
 // EventSource is the RPC surface ingestion needs.
@@ -62,6 +66,10 @@ type Ingester struct {
 	StartLedger            uint32
 	ReporterStaleThreshold time.Duration
 	Log                    *slog.Logger
+	// OnProgress, when set, is called after each page with the ledger the
+	// scan has reached. Reindex uses it to report progress every 1 000
+	// ledgers; normal ingestion leaves it nil.
+	OnProgress func(scannedLedger uint32)
 }
 
 // Run pulls every available page once. Call it on a ticker.
@@ -228,6 +236,9 @@ func (in *Ingester) runStream(ctx context.Context, cursorName string, contractID
 				metrics.EventsIngestedTotal.WithLabelValues("reporter_set").Inc()
 			case soroban.ReporterRevoked:
 				metrics.EventsIngestedTotal.WithLabelValues("reporter_revoked").Inc()
+		if in.OnProgress != nil {
+			if c, err := protocol.ParseCursor(resp.Cursor); err == nil {
+				in.OnProgress(c.Ledger)
 			}
 		}
 		if len(decoded) > 0 {
