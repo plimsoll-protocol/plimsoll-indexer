@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"log/slog"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -630,6 +631,26 @@ func TestPosterSecretBothSet(t *testing.T) {
 	for _, want := range []string{"SUPPLY_POSTER_SECRET", "SUPPLY_POSTER_SECRET_FILE"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error = %q, want it to mention %q", err.Error(), want)
+// TestReportTableListsEveryVariable checks that a valid environment still
+// produces a full four-column table.
+func TestReportTableListsEveryVariable(t *testing.T) {
+	setBase(t)
+	_, report := Validate()
+	if err := report.Err(); err != nil {
+		t.Fatalf("valid environment: %v", err)
+	}
+	table := report.Table()
+	for _, want := range []string{"VARIABLE", "EXPECTED", "VALUE", "ERROR", "DATABASE_URL", "LOG_LEVEL", "RECONCILE_INTERVAL"} {
+		if !strings.Contains(table, want) {
+			t.Errorf("table missing %q:\n%s", want, table)
+		}
+	}
+	for _, f := range report.Fields {
+		if !strings.Contains(table, f.Name) {
+			t.Errorf("table missing variable %s:\n%s", f.Name, table)
+		}
+		if f.Err != nil {
+			t.Errorf("valid variable %s has error %v", f.Name, f.Err)
 		}
 	}
 }
@@ -679,6 +700,118 @@ func TestStringOmitsSecret(t *testing.T) {
 			t.Errorf("Config formatted with %%+v leaks the secret: %s", s)
 		}
 	})
+// TestReportRedactsSecretValues checks that no secret reaches the table.
+func TestReportRedactsSecretValues(t *testing.T) {
+	setBase(t)
+	secrets := []string{
+		"SDI77RAE3QGECMUTGLLQMK47XU4ENI4I364MHOYZJLFLSSOWGOV5BR4B",
+		"admin-token-that-must-not-leak",
+		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		"postgres://plimsoll:s3cret-password@localhost/plimsoll",
+	}
+	t.Setenv("SUPPLY_POSTER_SECRET", secrets[0])
+	t.Setenv("WEBHOOK_ADMIN_TOKEN", secrets[1])
+	t.Setenv("WEBHOOK_ENCRYPTION_KEY", secrets[2])
+	t.Setenv("DATABASE_URL", secrets[3])
+
+	_, report := Validate()
+	if err := report.Err(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	table := report.Table()
+	for _, secret := range secrets {
+		if strings.Contains(table, secret) {
+			t.Errorf("table leaks secret %q:\n%s", secret, table)
+		}
+	}
+	if !strings.Contains(table, "<redacted>") {
+		t.Errorf("table has no <redacted> marker:\n%s", table)
+	}
+}
+
+// TestReportCollectsEveryProblem checks that every invalid variable is
+// reported in one pass, in both the table and the joined error.
+func TestReportCollectsEveryProblem(t *testing.T) {
+	setBase(t)
+	for _, k := range []string{"DATABASE_URL", "COVERAGE_LEDGER_ID", "REPORTER_REGISTRY_ID"} {
+		t.Setenv(k, "")
+	}
+	t.Setenv("PORT", "nope")
+	t.Setenv("INGEST_INTERVAL", "10")
+	t.Setenv("LOG_LEVEL", "verbose")
+	t.Setenv("CORS_ORIGINS", " ")
+	t.Setenv("MAX_FEE_STROOPS", "-1")
+
+	_, report := Validate()
+	if report.OK() {
+		t.Fatal("Validate() = valid report, want errors")
+	}
+	table := report.Table()
+	want := []string{
+		"DATABASE_URL is required",
+		"COVERAGE_LEDGER_ID is required",
+		"REPORTER_REGISTRY_ID is required",
+		"PORT",
+		"INGEST_INTERVAL",
+		"LOG_LEVEL",
+		"CORS_ORIGINS has no origins",
+		"MAX_FEE_STROOPS",
+	}
+	joined := report.Err().Error()
+	for _, w := range want {
+		if !strings.Contains(table, w) {
+			t.Errorf("table missing %q:\n%s", w, table)
+		}
+		if !strings.Contains(joined, w) {
+			t.Errorf("error missing %q: %v", w, report.Err())
+		}
+	}
+}
+
+// TestValidateRejectsBadOptionalValues checks the optional variables are
+// type-checked, not just the required ones.
+func TestValidateRejectsBadOptionalValues(t *testing.T) {
+	cases := []struct {
+		name, value, want string
+	}{
+		{"PORT", "70000", "PORT"},
+		{"STELLAR_RPC_URL", "not-a-url", "STELLAR_RPC_URL"},
+		{"HORIZON_CHECK_URL", "ftp://example.org", "HORIZON_CHECK_URL"},
+		{"KEEP_AWAKE_URL", "localhost:8080", "KEEP_AWAKE_URL"},
+		{"LOG_LEVEL", "verbose", "LOG_LEVEL"},
+		{"RESOURCE_FEE_MARGIN_PCT", "1.5", "RESOURCE_FEE_MARGIN_PCT"},
+		{"CORS_ORIGINS", "app.example.com", "CORS_ORIGINS"},
+		{"START_LEDGER", "-1", "START_LEDGER"},
+		{"INGEST_INTERVAL", "0s", "INGEST_INTERVAL"},
+		{"SUPPLY_POSTER_SECRET", "not-a-seed", "SUPPLY_POSTER_SECRET is not a valid secret seed"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			setBase(t)
+			t.Setenv(c.name, c.value)
+			_, report := Validate()
+			if err := report.Err(); err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("%s=%q: error = %v, want it to contain %q", c.name, c.value, err, c.want)
+			}
+		})
+	}
+}
+
+// TestEnvExampleDocumentsEveryVariable keeps .env.example in step with the
+// variables the indexer actually reads.
+func TestEnvExampleDocumentsEveryVariable(t *testing.T) {
+	setBase(t)
+	_, report := Validate()
+	data, err := os.ReadFile("../../.env.example")
+	if err != nil {
+		t.Fatalf("read .env.example: %v", err)
+	}
+	file := string(data)
+	for _, f := range report.Fields {
+		if !strings.Contains(file, f.Name+"=") {
+			t.Errorf(".env.example does not document %s", f.Name)
+		}
+	}
 }
 
 // TestPostingEnabled verifies the PostingEnabled predicate.
@@ -692,7 +825,7 @@ func TestPostingEnabled(t *testing.T) {
 		t.Error("PostingEnabled() = true with no SUPPLY_POSTER_SECRET, want false")
 	}
 
-	t.Setenv("SUPPLY_POSTER_SECRET", "SCZANGBA5TTPJQS62SL7TURZT5FSZMR3TCZDWNBEBGCMQK3JLYLUVRMJ")
+	t.Setenv("SUPPLY_POSTER_SECRET", "SDI77RAE3QGECMUTGLLQMK47XU4ENI4I364MHOYZJLFLSSOWGOV5BR4B")
 	got, err = Load()
 	if err != nil {
 		t.Fatal(err)

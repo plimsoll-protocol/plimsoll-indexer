@@ -69,6 +69,15 @@ func main() {
 	build := buildinfo.Get()
 	log.Info("starting plimsoll-indexer", "version", build.Version, "commit", build.Commit, "go", build.Go)
 	if err := run(cfg, build, log); err != nil {
+	// Validate the environment before any I/O (database, RPC or listener) so
+	// an operator gets every problem at once in a readable table.
+	cfg, report := config.Validate()
+	if err := report.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid configuration:\n\n%s", report.Table())
+		os.Exit(1)
+	}
+	log := newLogger(cfg.LogLevel)
+	if err := run(cfg, log); err != nil {
 		log.Error("indexer stopped", "err", err)
 	if err := run(cfg, loggers); err != nil {
 		loggers.base.Error("indexer stopped", "err", err)

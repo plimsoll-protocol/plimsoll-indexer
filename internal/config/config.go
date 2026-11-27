@@ -16,6 +16,7 @@ import (
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/secrets"
 	"unicode"
 	"github.com/stellar/go-stellar-sdk/strkey"
+	"github.com/stellar/go-stellar-sdk/keypair"
 )
 
 const (
@@ -145,10 +146,126 @@ func Load() (Config, error) {
 	if err := loadEnvLocal(); err != nil {
 		errs = append(errs, err)
 	}
+// Field is one environment variable's entry in a Report.
+type Field struct {
+	Name     string
+	Type     string // expected type, suffixed with "(required)" when required
+	Value    string // current effective value; "<unset>" or "<redacted>" if hidden
+	Secret   bool   // whether the real value is withheld from Value
+	Required bool
+	Err      error // nil when the value is valid
+}
+
+// Report is the outcome of validating every environment variable the indexer
+// reads. It is built without any I/O, so startup can print it before opening
+// the database or listening on a port.
+type Report struct {
+	Fields []Field
+	errs   []error
+}
+
+// OK reports whether every variable is valid.
+func (r Report) OK() bool { return len(r.errs) == 0 }
+
+// Err joins every validation error. It is nil when all variables are valid.
+func (r Report) Err() error { return errors.Join(r.errs...) }
+
+// Table renders the report as a four-column table: variable, expected type,
+// current value and error. Secret values are shown as "<redacted>".
+func (r Report) Table() string {
+	header := []string{"VARIABLE", "EXPECTED", "VALUE", "ERROR"}
+	rows := make([][]string, 0, len(r.Fields)+1)
+	rows = append(rows, header)
+	for _, f := range r.Fields {
+		message := ""
+		if f.Err != nil {
+			message = f.Err.Error()
+		}
+		rows = append(rows, []string{f.Name, f.Type, f.Value, message})
+	}
+
+	widths := make([]int, len(header))
+	for _, row := range rows {
+		for i, cell := range row {
+			if n := len([]rune(cell)); n > widths[i] {
+				widths[i] = n
+			}
+		}
+	}
+
+	var b strings.Builder
+	write := func(cells []string) {
+		for i, cell := range cells {
+			b.WriteString(cell)
+			if i < len(cells)-1 {
+				b.WriteString(strings.Repeat(" ", widths[i]-len([]rune(cell))+2))
+			}
+		}
+		b.WriteByte('\n')
+	}
+	write(header)
+	rule := make([]string, len(header))
+	for i := range rule {
+		rule[i] = strings.Repeat("-", widths[i])
+	}
+	write(rule)
+	for _, row := range rows[1:] {
+		write(row)
+	}
+	return b.String()
+}
+
+// add records a variable in the report and returns its index, which fail and
+// mark take.
+func (r *Report) add(name, typ, value string, required, secret bool) int {
+	display := value
+	switch {
+	case value == "":
+		display = "<unset>"
+	case secret:
+		display = "<redacted>"
+	}
+	if required {
+		typ += " (required)"
+	}
+	r.Fields = append(r.Fields, Field{
+		Name:     name,
+		Type:     typ,
+		Value:    truncate(display, 48),
+		Secret:   secret,
+		Required: required,
+	})
+	return len(r.Fields) - 1
+}
+
+// fail records err against field i and adds it to the report's error.
+func (r *Report) fail(i int, err error) {
+	r.Fields[i].Err = err
+	r.errs = append(r.errs, err)
+}
+
+// mark records err against field i without adding it to the report's error.
+// Used when one problem concerns several variables and the error message names
+// them all.
+func (r *Report) mark(i int, err error) { r.Fields[i].Err = err }
+
+// Load reads and validates the environment. Missing required values are
+// reported together.
+func Load() (Config, error) {
+	c, report := Validate()
+	return c, report.Err()
+}
+
+// Validate reads the environment and checks every variable the indexer reads.
+// It performs no I/O, so callers can inspect and print the Report before
+// touching the database or network. The returned Config holds every value that
+// could be parsed, even when the report contains errors.
+func Validate() (Config, Report) {
+	var rep Report
+
 	network := strings.ToLower(envOr("NETWORK", "testnet"))
-	preset, ok := Presets[network]
-	if !ok {
-		errs = append(errs, fmt.Errorf("NETWORK %q is not one of testnet, mainnet, standalone", network))
+	preset, knownNetwork := Presets[network]
+	if !knownNetwork {
 		preset = Presets["testnet"]
 	}
 
@@ -216,6 +333,7 @@ func Load() (Config, error) {
 		LogLevelAPI:          levels.API,
 		LogLevelWorker:       levels.Worker,
 		LogLevelIngest:       levels.Ingest,
+		LogLevel:             strings.ToLower(envOr("LOG_LEVEL", "info")),
 		KeepAwakeURL:         keepAwakeURL(os.Getenv("KEEP_AWAKE_URL"), os.Getenv("RENDER_EXTERNAL_URL")),
 		DecimalCheckEnabled:  true,
 	}
@@ -264,20 +382,83 @@ func Load() (Config, error) {
 
 	if len(c.RPCURLs) == 0 || c.RPCURL == "" {
 		errs = append(errs, fmt.Errorf("STELLAR_RPC_URL is required for NETWORK=%s", network))
+	i := rep.add("NETWORK", "enum: testnet | mainnet | standalone", c.Network, false, false)
+	if !knownNetwork {
+		rep.fail(i, fmt.Errorf("NETWORK %q is not one of testnet, mainnet, standalone", c.Network))
 	}
+
+	i = rep.add("DATABASE_URL", "Postgres URL", c.DatabaseURL, true, true)
 	if c.DatabaseURL == "" {
-		errs = append(errs, errors.New("DATABASE_URL is required"))
+		rep.fail(i, errors.New("DATABASE_URL is required"))
 	}
+
+	i = rep.add("PORT", "port (1-65535)", c.Port, false, false)
+	if n, err := strconv.Atoi(c.Port); err != nil || n < 1 || n > 65535 {
+		rep.fail(i, fmt.Errorf("PORT %q is not a port number between 1 and 65535", c.Port))
+	}
+
+	i = rep.add("STELLAR_RPC_URL", "URL", c.RPCURL, false, false)
+	if c.RPCURL == "" {
+		rep.fail(i, fmt.Errorf("STELLAR_RPC_URL is required for NETWORK=%s", c.Network))
+	} else if err := validateURL(c.RPCURL); err != nil {
+		rep.fail(i, fmt.Errorf("STELLAR_RPC_URL: %w", err))
+	}
+
+	i = rep.add("HORIZON_URL", "URL", c.HorizonURL, false, false)
+	if c.HorizonURL == "" {
+		rep.fail(i, errors.New("HORIZON_URL is required"))
+	} else if err := validateURL(c.HorizonURL); err != nil {
+		rep.fail(i, fmt.Errorf("HORIZON_URL: %w", err))
+	}
+
+	i = rep.add("HORIZON_CHECK_URL", "URL; empty disables the cross-check", c.HorizonCheckURL, false, false)
+	if c.HorizonCheckURL != "" {
+		if err := validateURL(c.HorizonCheckURL); err != nil {
+			rep.fail(i, fmt.Errorf("HORIZON_CHECK_URL: %w", err))
+		}
+	}
+
+	i = rep.add("STELLAR_NETWORK_PASSPHRASE", "string", c.NetworkPassphrase, false, false)
+	if c.NetworkPassphrase == "" {
+		rep.fail(i, errors.New("STELLAR_NETWORK_PASSPHRASE is required"))
+	}
+
+	i = rep.add("COVERAGE_LEDGER_ID", "contract ID", c.CoverageLedgerID, true, false)
 	if c.CoverageLedgerID == "" {
-		errs = append(errs, errors.New("COVERAGE_LEDGER_ID is required"))
+		rep.fail(i, errors.New("COVERAGE_LEDGER_ID is required"))
 	}
+
+	i = rep.add("REPORTER_REGISTRY_ID", "contract ID", c.ReporterRegistryID, true, false)
 	if c.ReporterRegistryID == "" {
-		errs = append(errs, errors.New("REPORTER_REGISTRY_ID is required"))
+		rep.fail(i, errors.New("REPORTER_REGISTRY_ID is required"))
 	}
 	// A key without the admin token could never be used, and a token with no
 	// key registers nothing, so refuse both half-configurations.
 	if c.WebhookEncryptionKey != "" && c.WebhookAdminToken == "" {
 		errs = append(errs, errors.New("WEBHOOK_ADMIN_TOKEN and WEBHOOK_ENCRYPTION_KEY must be configured together"))
+
+	startValue := envOr("START_LEDGER", "0")
+	i = rep.add("START_LEDGER", "uint32", startValue, false, false)
+	start, err := strconv.ParseUint(startValue, 10, 32)
+	if err != nil {
+		rep.fail(i, fmt.Errorf("START_LEDGER %q is not a uint32", startValue))
+	} else {
+		c.StartLedger = uint32(start)
+	}
+
+	i = rep.add("SUPPLY_POSTER_SECRET", "Stellar secret seed", c.PosterSecret, false, true)
+	if c.PosterSecret != "" {
+		if _, err := keypair.ParseFull(c.PosterSecret); err != nil {
+			rep.fail(i, errors.New("SUPPLY_POSTER_SECRET is not a valid secret seed"))
+		}
+	}
+
+	adminIdx := rep.add("WEBHOOK_ADMIN_TOKEN", "string", c.WebhookAdminToken, false, true)
+	keyIdx := rep.add("WEBHOOK_ENCRYPTION_KEY", "base64-encoded 32-byte key", c.WebhookEncryptionKey, false, true)
+	if (c.WebhookAdminToken == "") != (c.WebhookEncryptionKey == "") {
+		err := errors.New("WEBHOOK_ADMIN_TOKEN and WEBHOOK_ENCRYPTION_KEY must be configured together")
+		rep.fail(adminIdx, err)
+		rep.mark(keyIdx, err)
 	}
 	if len(c.WebhookAPIKeys) > 0 && c.WebhookAdminToken == "" {
 		errs = append(errs, errors.New("WEBHOOK_API_KEYS requires WEBHOOK_ADMIN_TOKEN and WEBHOOK_ENCRYPTION_KEY"))
@@ -291,7 +472,7 @@ func Load() (Config, error) {
 	if c.WebhookEncryptionKey != "" {
 		key, err := base64.StdEncoding.DecodeString(c.WebhookEncryptionKey)
 		if err != nil || len(key) != 32 {
-			errs = append(errs, errors.New("WEBHOOK_ENCRYPTION_KEY must be base64-encoded 32-byte key"))
+			rep.fail(keyIdx, errors.New("WEBHOOK_ENCRYPTION_KEY must be base64-encoded 32-byte key"))
 		}
 	}
 
@@ -338,9 +519,15 @@ func Load() (Config, error) {
 		{"SHUTDOWN_TIMEOUT", "30s", &c.ShutdownTimeout},
 	}
 	for _, d := range durations {
-		v, err := time.ParseDuration(envOr(d.name, d.def))
+		value := envOr(d.name, d.def)
+		i := rep.add(d.name, "duration", value, false, false)
+		v, err := time.ParseDuration(value)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", d.name, err))
+			rep.fail(i, fmt.Errorf("%s %q is not a duration (e.g. 10s, 15m, 6h)", d.name, value))
+			continue
+		}
+		if v <= 0 {
+			rep.fail(i, fmt.Errorf("%s %q must be positive", d.name, value))
 			continue
 		}
 		if v <= 0 {
@@ -380,9 +567,10 @@ func Load() (Config, error) {
 		}
 	}
 
-	for _, o := range strings.Split(envOr("CORS_ORIGINS", "*"), ",") {
-		if o = strings.TrimSpace(o); o != "" {
-			c.CORSOrigins = append(c.CORSOrigins, o)
+	i = rep.add("KEEP_AWAKE_URL", `URL or "none"`, c.KeepAwakeURL, false, false)
+	if c.KeepAwakeURL != "" {
+		if err := validateURL(c.KeepAwakeURL); err != nil {
+			rep.fail(i, fmt.Errorf("KEEP_AWAKE_URL: %w", err))
 		}
 	}
 
@@ -396,14 +584,17 @@ func Load() (Config, error) {
 		{"POSTER_LOW_BALANCE_STROOPS", &c.PosterLowBalanceStroops},
 	}
 	for _, f := range int64s {
-		if v := os.Getenv(f.name); v != "" {
-			n, err := strconv.ParseInt(v, 10, 64)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("%s: %w", f.name, err))
-				continue
-			}
-			*f.dst = n
+		value := os.Getenv(f.name)
+		i := rep.add(f.name, "non-negative int64", value, false, false)
+		if value == "" {
+			continue
 		}
+		n, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || n < 0 {
+			rep.fail(i, fmt.Errorf("%s %q is not a non-negative int64", f.name, value))
+			continue
+		}
+		*f.dst = n
 	}
 
 	retention, err := strconv.Atoi(envOr("RETENTION_DAYS", "365"))
@@ -423,6 +614,33 @@ func Load() (Config, error) {
 	}
 
 	return c, errors.Join(errs...)
+	corsValue := envOr("CORS_ORIGINS", "*")
+	i = rep.add("CORS_ORIGINS", "comma-separated origins or *", corsValue, false, false)
+	for _, origin := range strings.Split(corsValue, ",") {
+		origin = strings.TrimSpace(origin)
+		if origin == "" {
+			continue
+		}
+		if origin != "*" {
+			if err := validateURL(origin); err != nil {
+				rep.fail(i, fmt.Errorf("CORS_ORIGINS entry %q is not \"*\" or an http(s) origin: %w", origin, err))
+				continue
+			}
+		}
+		c.CORSOrigins = append(c.CORSOrigins, origin)
+	}
+	if len(c.CORSOrigins) == 0 {
+		rep.fail(i, errors.New("CORS_ORIGINS has no origins"))
+	}
+
+	i = rep.add("LOG_LEVEL", "enum: debug | info | warn | error", c.LogLevel, false, false)
+	switch c.LogLevel {
+	case "debug", "info", "warn", "error":
+	default:
+		rep.fail(i, fmt.Errorf("LOG_LEVEL %q is not one of debug, info, warn, error", c.LogLevel))
+	}
+
+	return c, rep
 }
 
 func parseWebhookAPIKeys(raw, adminToken string) ([]string, error) {
@@ -514,6 +732,28 @@ func (c Config) LogValue() slog.Value {
 		slog.Bool("poster_secret_set", c.PosterSecret != ""),
 		slog.Bool("database_password_set", c.DatabasePassword != ""),
 	)
+// validateURL checks that raw is an absolute http(s) URL with a host.
+func validateURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("not a valid URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return errors.New("must be an absolute http:// or https:// URL")
+	}
+	if u.Host == "" {
+		return errors.New("must include a host")
+	}
+	return nil
+}
+
+// truncate shortens s to at most n runes, marking the cut with "...".
+func truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-3]) + "..."
 }
 
 // PostingEnabled reports whether this instance should post supply snapshots.
