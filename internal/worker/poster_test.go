@@ -98,9 +98,19 @@ func (f *fakeBreakdowns) DeleteUnconfirmedBreakdowns(_ context.Context, olderTha
 }
 
 type fakeLedger struct{ seq uint32 }
+// fakeLedger reports seq, advancing by step on each call so a test can model
+// an RPC catching up to Horizon.
+type fakeLedger struct {
+	seq  uint32
+	step uint32
+	read int
+}
 
 func (f *fakeLedger) GetLatestLedger(context.Context) (protocol.GetLatestLedgerResponse, error) {
-	return protocol.GetLatestLedgerResponse{Sequence: f.seq}, nil
+	seq := f.seq
+	f.seq += f.step
+	f.read++
+	return protocol.GetLatestLedgerResponse{Sequence: seq}, nil
 }
 
 // onChainSnapshot builds what get_supply returns for an already posted snapshot.
@@ -130,6 +140,7 @@ func newPoster(h *fakeHorizon, c *fakeContracts, db *fakeBreakdowns) *Poster {
 		RepostAfter: 6 * time.Hour,
 		Log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Now:         func() time.Time { return postedAt },
+		sleep:       func(time.Duration) {},
 	}
 }
 
@@ -206,12 +217,16 @@ func TestPosterPostsFirstSnapshotWhenNothingIsOnChain(t *testing.T) {
 	}
 }
 
-func TestPosterClampsLedgerToTheChainHead(t *testing.T) {
-	// Horizon can be ahead of the ledger the contract executes in, and the
-	// contract rejects a snapshot from the future.
+// Horizon can briefly be ahead of the ledger the RPC has ingested. The poster
+// waits for the RPC to catch up instead of rewriting the snapshot's ledger: the
+// ledger is hashed with the balances, so a rewritten label makes the breakdown
+// unreproducible at the ledger it names.
+func TestPosterWaitsForTheRPCInsteadOfRelabellingTheSnapshot(t *testing.T) {
 	b := testBreakdown("9999000000000", 5_480_000)
 	c := &fakeContracts{supply: xdr.ScVal{Type: xdr.ScValTypeScvVoid}}
 	p := newPoster(&fakeHorizon{breakdown: b}, c, &fakeBreakdowns{})
+	rpc := &fakeLedger{seq: 5_479_998, step: 1}
+	p.RPC = rpc
 
 	if err := p.Run(context.Background()); err != nil {
 		t.Fatal(err)
@@ -220,8 +235,28 @@ func TestPosterClampsLedgerToTheChainHead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ledger != 5_470_000 {
-		t.Errorf("posted at ledger %d, want it clamped to 5470000", ledger)
+	if ledger != 5_480_000 {
+		t.Errorf("posted at ledger %d, want the ledger the balances were read at (5480000)", ledger)
+	}
+	if rpc.read < 3 {
+		t.Errorf("read the rpc head %d times, want it polled until it caught up", rpc.read)
+	}
+}
+
+// If the RPC never reaches the ledger the balances were read at, there is no
+// honest label for the snapshot, so nothing is posted.
+func TestPosterRefusesToPostWhenTheRPCNeverReachesTheSupplyLedger(t *testing.T) {
+	b := testBreakdown("9999000000000", 5_480_000)
+	c := &fakeContracts{supply: xdr.ScVal{Type: xdr.ScValTypeScvVoid}}
+	p := newPoster(&fakeHorizon{breakdown: b}, c, &fakeBreakdowns{})
+	p.RPC = &fakeLedger{seq: 5_470_000}
+
+	err := p.Run(context.Background())
+	if !errors.Is(err, errSupplyLedgerAhead) {
+		t.Fatalf("want errSupplyLedgerAhead, got %v", err)
+	}
+	if len(c.invoked) != 0 {
+		t.Errorf("posted %v; a snapshot cannot be labelled with a ledger it was not read at", c.invoked)
 	}
 }
 
