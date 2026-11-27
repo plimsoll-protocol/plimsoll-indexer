@@ -18,17 +18,17 @@ func APIKeyMiddleware(validator APIKeyValidator, log *slog.Logger, next http.Han
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if validator == nil {
-			writeError(w, http.StatusServiceUnavailable, "API key authentication is not configured")
+			writeError(w, http.StatusServiceUnavailable, codeAuthUnavailable, "API key authentication is not configured")
 			return
 		}
 		valid, err := validator.ValidateAPIKey(r.Context(), r.Header.Get("X-Api-Key"))
 		if err != nil {
 			log.Error("API key validation failed", "err", err)
-			writeError(w, http.StatusInternalServerError, "internal error")
+			writeError(w, http.StatusInternalServerError, codeInternal, "internal error")
 			return
 		}
 		if !valid {
-			writeError(w, http.StatusUnauthorized, "unauthorized")
+			writeError(w, http.StatusUnauthorized, codeUnauthorized, "unauthorized")
 			return
 		}
 		next.ServeHTTP(w, r)

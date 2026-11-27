@@ -253,13 +253,16 @@ func TestParseRetryAfter(t *testing.T) {
 
 func TestBackoffIsCappedAndJittered(t *testing.T) {
 	for attempt := 1; attempt <= 10; attempt++ {
-		d := backoffDelay(attempt, 0)
+		d, err := backoffDelay(attempt, 0)
+		if err != nil {
+			t.Fatalf("backoffDelay(%d): %v", attempt, err)
+		}
 		if d < baseBackoff/2 || d > maxBackoff {
 			t.Errorf("attempt %d: backoff %s outside [%s, %s]", attempt, d, baseBackoff/2, maxBackoff)
 		}
 	}
 	// A Retry-After is passed through, not clamped: the budget decides.
-	if got := backoffDelay(1, time.Hour); got != time.Hour {
-		t.Errorf("Retry-After not honoured: %s", got)
+	if got, err := backoffDelay(1, time.Hour); err != nil || got != time.Hour {
+		t.Errorf("Retry-After not honoured: %s (err %v)", got, err)
 	}
 }

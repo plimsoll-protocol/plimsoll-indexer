@@ -188,6 +188,47 @@ func TestDecodeIgnoresUnknownEvents(t *testing.T) {
 	}
 }
 
+func TestDecodeReporterMetadataUpdated(t *testing.T) {
+	reporter := check(t)(AddressVal(gAddr))
+	displayName := sym("acme_audit")
+	websiteURI := str("https://acme.example")
+	rawHash := xdr.ScBytes([]byte{0xab, 0xcd})
+	contactHash := xdr.ScVal{Type: xdr.ScValTypeScvBytes, Bytes: &rawHash}
+	none := xdr.ScVal{Type: xdr.ScValTypeScvVoid}
+	ev := protocol.EventInfo{
+		ID:       "5",
+		TopicXDR: []string{b64(t, sym("reporter_metadata_updated")), b64(t, reporter)},
+		ValueXDR: b64(t, mapVal(
+			"name", displayName,
+			"website_uri", websiteURI,
+			"contact_hash", contactHash,
+		)),
+	}
+	got, err := Decode(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, ok := got.(ReporterMetadataUpdated)
+	if !ok {
+		t.Fatalf("got %T", got)
+	}
+	if metadata.Reporter != gAddr || metadata.DisplayName == nil || *metadata.DisplayName != "acme_audit" ||
+		metadata.WebsiteURI == nil || *metadata.WebsiteURI != "https://acme.example" ||
+		metadata.ContactHash == nil || *metadata.ContactHash != "abcd" {
+		t.Fatalf("decoded metadata = %+v", metadata)
+	}
+
+	ev.ValueXDR = b64(t, mapVal("name", none, "website_uri", none, "contact_hash", none))
+	got, err = Decode(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata = got.(ReporterMetadataUpdated)
+	if metadata.DisplayName != nil || metadata.WebsiteURI != nil || metadata.ContactHash != nil {
+		t.Fatalf("cleared metadata decoded as %+v", metadata)
+	}
+}
+
 // FuzzAsI128 checks the i128 encoding round-trips for every in-range value
 // and that anything out of range is refused rather than truncated.
 func FuzzAsI128(f *testing.F) {
@@ -235,6 +276,7 @@ func FuzzDecode(f *testing.F) {
 	f.Add(enc(sym("supply_posted")), enc(addr), "", enc(mapVal("amount", amt, "ledger", u32, "breakdown_hash", hash, "poster", issuer)))
 	f.Add(enc(sym("reserve_posted")), enc(addr), enc(u32), enc(mapVal("amount", amt, "as_of", u64(1700000000), "reporter", issuer, "doc_hash", hash, "doc_uri", str("https://x"))))
 	f.Add(enc(sym("reporter_set")), enc(issuer), "", enc(mapVal("role", u32, "name", str("n"))))
+	f.Add(enc(sym("reporter_metadata_updated")), enc(issuer), "", enc(mapVal("name", sym("acme"), "website_uri", str("https://x"), "contact_hash", hash)))
 	f.Add(enc(sym("reporter_revoked")), enc(issuer), "", "")
 	f.Add("", "", "", "")
 	f.Add("not base64!", "AAAA", "AAAA", "AAAA")

@@ -14,7 +14,39 @@ paths:
             type: string
       responses:
         '200':
-          description: OK
+          description: CSV report history, paginated internally
+          headers:
+            Content-Disposition:
+              description: Indicates that the CSV is an attachment
+              schema:
+                type: string
+          content:
+            text/csv:
+              schema:
+                type: string
+                example: |-
+                  ledger,timestamp,reporter,bps,tier,doc_uri
+                  42,2026-10-05T12:00:00Z,G...,10200,issuer_signed,https://example.test/report
+        '400':
+          description: Invalid date parameter, or sac is not a contract strkey
+
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Asset not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/reporters:
+    get:
+      summary: List registered reporters, roles, and profile metadata
+      operationId: listReporters
+      responses:
+        '200':
+          description: List of registered reporters
           content:
             application/json:
               schema:
@@ -58,7 +90,218 @@ components:
       properties:
         reporter:
           type: string
-        tier:
+          example: "GISS..."
+        doc_uri:
+          type: string
+          example: "https://x"
+      required:
+        - bps
+        - ratio
+        - tier
+        - supply
+        - reserves
+        - supply_ledger
+        - supply_posted_at
+        - report_as_of
+        - report_age_seconds
+        - supply_age_seconds
+        - reporter
+        - doc_uri
+    Asset:
+      type: object
+      properties:
+        sac:
+          type: string
+          example: "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
+        code:
+          type: string
+          example: "PUSD"
+        issuer:
+          type: string
+          example: "GISS..."
+        listed_ledger:
+          type: integer
+          example: 50
+        listed_at:
+          type: string
+          format: date-time
+          example: "2026-10-01T00:00:00Z"
+        toml:
+          type: [object, "null"]
+          description: >-
+            The issuer's SEP-1 data. When the asset's stellar.toml lists
+            `attestation_of_reserve`, the object also carries
+            `attestation_hash` (SHA-256 of the document, lower-case hex),
+            `attestation_first_seen_at` (when that version was first observed)
+            and, once an earlier document has been replaced,
+            `attestation_changed_at`.
+          properties:
+            attestation_hash:
+              type: string
+              example: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+            attestation_first_seen_at:
+              type: string
+              format: date-time
+              example: "2026-10-01T09:00:00Z"
+            attestation_changed_at:
+              type: [string, "null"]
+              format: date-time
+        toml_checked_at:
+          type: [string, "null"]
+          format: date-time
+        toml_error:
+          type: [string, "null"]
+        supply:
+          oneOf:
+            - $ref: '#/components/schemas/Supply'
+            - type: "null"
+        reports:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/Report'
+        coverage:
+          oneOf:
+            - $ref: '#/components/schemas/Coverage'
+            - type: "null"
+      required:
+        - sac
+        - code
+        - issuer
+        - listed_ledger
+        - listed_at
+        - toml
+        - toml_checked_at
+        - toml_error
+        - supply
+        - reports
+        - coverage
+    Reporter:
+      type: object
+      properties:
+        role:
+          type: string
+          example: "auditor"
+        address:
+          type: string
+          example: "GAUD..."
+        name:
+          type: string
+          example: "Acme"
+        display_name:
+          type: string
+          example: "Acme Inc."
+        website_uri:
+          type: [string, "null"]
+          format: uri
+          example: "https://acme.example"
+        contact_hash:
+          type: [string, "null"]
+          description: Hash of the reporter's contact details.
+          example: "sha256:..."
+        updated_at:
+          type: string
+          format: date-time
+          example: "2026-10-01T00:00:00Z"
+      required:
+        - role
+        - address
+        - name
+        - display_name
+        - website_uri
+        - contact_hash
+        - updated_at
+    CoverageWebhookRequest:
+      type: object
+      properties:
+        url:
+          type: string
+          format: uri
+          example: "https://integrator.example/plimsoll"
+        sac:
+          type: string
+          example: "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
+        min_bps:
+          type: integer
+          minimum: 1
+          maximum: 10000
+          example: 9500
+        min_tier:
+          type: integer
+          enum: [1, 2, 3]
+          example: 2
+      required:
+        - url
+        - sac
+        - min_bps
+        - min_tier
+    ChangelogEntry:
+      type: object
+      properties:
+        version:
+          type: string
+          example: "1.2.0"
+        date:
+          type: string
+          format: date
+          example: "2026-12-01"
+        changes:
+          type: array
+          description: Breaking changes introduced in this version; empty when there were none.
+          items:
+            $ref: '#/components/schemas/ChangelogChange'
+      required:
+        - version
+        - date
+        - changes
+    ChangelogChange:
+      type: object
+      properties:
+        kind:
+          type: string
+          description: 'What broke: removed_field, renamed_endpoint, new_required_param, and similarly named breakages.'
+          example: "removed_field"
+        detail:
+          type: string
+          description: What a client must change.
+          example: "coverage.ratio was removed; compute it from bps."
+      required:
+        - kind
+        - detail
+    Webhook:
+      type: object
+      properties:
+        id:
+          type: integer
+        url:
+          type: string
+          format: uri
+        created_at:
+          type: string
+          format: date-time
+      required: [id, url, created_at]
+    CreatedWebhook:
+      allOf:
+        - $ref: '#/components/schemas/Webhook'
+        - type: object
+          properties:
+            secret:
+              type: string
+              description: Returned once; store it securely.
+          required: [secret]
+    CoverageWebhook:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 1
+        url:
+          type: string
+          format: uri
+        sac:
+          type: string
+        min_bps:
+          type: integer
+        min_tier:
           type: integer
         last_post_at:
           type: string

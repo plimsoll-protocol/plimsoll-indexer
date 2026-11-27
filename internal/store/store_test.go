@@ -57,7 +57,7 @@ func TestApplyEventsIsIdempotent(t *testing.T) {
 		soroban.ReporterRevoked{Meta: eventMeta("ev-revoked", 14, base.Add(4*time.Minute)), Reporter: "GREP"},
 	}
 
-	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-1", 12, events); err != nil {
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-1", 12, nil, events); err != nil {
 		t.Fatalf("first apply: %v", err)
 	}
 	tables := []string{"assets", "supply_snapshots", "reserve_reports", "reporters", "ingest_cursor"}
@@ -71,7 +71,7 @@ func TestApplyEventsIsIdempotent(t *testing.T) {
 	}
 
 	// The same page delivered twice by a retried RPC call must be a no-op.
-	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-1", 12, events); err != nil {
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-1", 12, nil, events); err != nil {
 		t.Fatalf("second apply: %v", err)
 	}
 	second := tableCounts(t, url, tables...)
@@ -124,7 +124,7 @@ func TestLatestReportsReturnsNewestPerTier(t *testing.T) {
 		report("ev-t2", 2, 980, base.Add(24*time.Hour)),
 		report("ev-t3", 3, 1_000, base.Add(12*time.Hour)),
 	}
-	if err := s.ApplyEvents(ctx, "plimsoll-events", "c", 20, events); err != nil {
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "c", 20, nil, events); err != nil {
 		t.Fatal(err)
 	}
 
@@ -156,6 +156,9 @@ func TestBreakdownBytesRoundTripExactly(t *testing.T) {
 	hash := fmt.Sprintf("%x", sum)
 
 	if err := s.SaveBreakdown(ctx, hash, testSAC, body); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ConfirmBreakdown(ctx, hash); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.Breakdown(ctx, hash)

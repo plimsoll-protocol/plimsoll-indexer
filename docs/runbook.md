@@ -14,6 +14,7 @@ One process (`cmd/plimsoll-indexer`) runs these jobs and an HTTP server on
 | Event ingester | `ingest` | `INGEST_INTERVAL` (10s) | no |
 | State reconciler | `reconcile` | `RECONCILE_INTERVAL` (15m) | no |
 | stellar.toml sync | `toml` | checked every minute, each asset refreshed every `TOML_INTERVAL` (6h) | no |
+| Coverage alerts | `webhooks` | `WEBHOOK_INTERVAL` (1m) | no |
 | Supply poster | `poster` | `POST_INTERVAL` (15m), reposts after `REPOST_AFTER` (6h) | yes, `SUPPLY_POSTER_SECRET` |
 | Keep-awake | `keepawake` | `KEEP_AWAKE_INTERVAL` (10m) | no |
 
@@ -126,6 +127,8 @@ Logs are JSON (`log/slog`). Key messages:
 | warn | `start ledger is outside RPC retention` | `START_LEDGER` is too old and was clamped. |
 | warn | `rpc node is rate limiting; backing off` (`attempt`, `wait`) | The RPC node answered `429 Too Many Requests`. The request is retried after `Retry-After` when the node sends it, otherwise after a delay that doubles per attempt. Frequent entries mean the node's limit is too low for the ingest interval. |
 | warn | `recovered a supply snapshot / reserve report from contract state...` | The reconciler filled a gap. Rows are marked `"source": "chain"` with no `tx_hash`. |
+| info | `coverage below webhook threshold` (`webhook_id`, `sac`, `bps`, `min_bps`) | A registered alert fired. |
+| warn | `webhook delivery failed` (`webhook_id`, `delivery_id`, `status`, `retry_at`) | Delivery will be retried with backoff, at most five attempts in total. |
 | info | `supply posting disabled (SUPPLY_POSTER_SECRET not set)` | Expected on read-only instances. |
 | info | `supply cross-check disabled (HORIZON_CHECK_URL not set)` | The poster signs on one Horizon's word. |
 | info | `issuer stellar.toml changed` | The issuer document hash changed; includes `old_hash` and `new_hash`. |

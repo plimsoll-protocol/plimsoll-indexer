@@ -18,15 +18,18 @@ import (
 
 // readFake answers get_supply, get_report, and get_reporter from fixed maps.
 type readFake struct {
-	supply    xdr.ScVal
-	reports   map[uint32]xdr.ScVal
-	reporters map[string]xdr.ScVal // keyed by reporter address strkey
-	errs      map[string]error
-	reads     []string
+	supply           xdr.ScVal
+	reports          map[uint32]xdr.ScVal
+	reporters        map[string]xdr.ScVal // keyed by reporter address strkey
+	reporterMetadata map[string]xdr.ScVal // keyed by reporter address strkey
+	errs             map[string]error
+	reads            []string
+	readContracts    []string
 }
 
-func (f *readFake) Read(_ context.Context, _, fn string, args []xdr.ScVal) (xdr.ScVal, error) {
+func (f *readFake) Read(_ context.Context, contractID, fn string, args []xdr.ScVal) (xdr.ScVal, error) {
 	f.reads = append(f.reads, fn)
+	f.readContracts = append(f.readContracts, contractID)
 	if err := f.errs[fn]; err != nil {
 		return xdr.ScVal{}, err
 	}
@@ -49,6 +52,17 @@ func (f *readFake) Read(_ context.Context, _, fn string, args []xdr.ScVal) (xdr.
 				return xdr.ScVal{}, err
 			}
 			if v, ok := f.reporters[addr]; ok {
+				return v, nil
+			}
+		}
+		return xdr.ScVal{Type: xdr.ScValTypeScvVoid}, nil
+	case "get_reporter_metadata":
+		if len(args) > 0 {
+			addr, err := soroban.AsAddress(args[0])
+			if err != nil {
+				return xdr.ScVal{}, err
+			}
+			if v, ok := f.reporterMetadata[addr]; ok {
 				return v, nil
 			}
 		}
@@ -141,10 +155,11 @@ func strVal(t *testing.T, s string) xdr.ScVal {
 
 func newReconciler(c contracts, db reconcileStore) *Reconciler {
 	return &Reconciler{
-		Invoker:  c,
-		Store:    db,
-		LedgerID: "CLEDGER",
-		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Invoker:            c,
+		Store:              db,
+		LedgerID:           "CLEDGER",
+		ReporterRegistryID: "CREGISTRY",
+		Log:                slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 }
 
@@ -237,13 +252,41 @@ func onChainReporter(t *testing.T, role uint32, name string) xdr.ScVal {
 	})
 }
 
+func onChainReporterMetadata(t *testing.T, displayName, websiteURI, contactHash *string) xdr.ScVal {
+	t.Helper()
+	optional := func(value *string, encode func(string) xdr.ScVal) xdr.ScVal {
+		if value == nil {
+			return xdr.ScVal{Type: xdr.ScValTypeScvVoid}
+		}
+		return encode(*value)
+	}
+	return mapVal(t, map[string]xdr.ScVal{
+		"name": optional(displayName, func(value string) xdr.ScVal {
+			symbol := xdr.ScSymbol(value)
+			return xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &symbol}
+		}),
+		"website_uri": optional(websiteURI, func(value string) xdr.ScVal {
+			return strVal(t, value)
+		}),
+		"contact_hash": optional(contactHash, func(value string) xdr.ScVal {
+			raw := xdr.ScBytes([]byte(value))
+			return xdr.ScVal{Type: xdr.ScValTypeScvBytes, Bytes: &raw}
+		}),
+	})
+}
+
 // TestReconcileReportersActiveOnChain proves that a known reporter still
 // active on-chain is upserted when its metadata has changed.
 func TestReconcileReportersActiveOnChain(t *testing.T) {
+	displayName, websiteURI := "Acme Audits", "https://acme.example"
+	contactHash := string([]byte{0xab, 0xcd})
 	c := &readFake{
 		supply: xdr.ScVal{Type: xdr.ScValTypeScvVoid},
 		reporters: map[string]xdr.ScVal{
 			testPoster: onChainReporter(t, coverage.RoleAuditor, "Acme Audits"),
+		},
+		reporterMetadata: map[string]xdr.ScVal{
+			testPoster: onChainReporterMetadata(t, &displayName, &websiteURI, &contactHash),
 		},
 	}
 	db := &recStore{
@@ -257,8 +300,17 @@ func TestReconcileReportersActiveOnChain(t *testing.T) {
 	if len(db.savedReporters) != 1 {
 		t.Fatalf("want 1 saved reporter, got %d", len(db.savedReporters))
 	}
+	for i, fn := range c.reads {
+		if fn == "get_reporter" || fn == "get_reporter_metadata" {
+			if c.readContracts[i] != "CREGISTRY" {
+				t.Errorf("%s read from %q, want reporter registry", fn, c.readContracts[i])
+			}
+		}
+	}
 	r := db.savedReporters[0]
-	if r.Address != testPoster || r.Role != coverage.RoleAuditor || r.Name != "Acme Audits" {
+	if r.Address != testPoster || r.Role != coverage.RoleAuditor || r.Name != "Acme Audits" ||
+		r.DisplayName != displayName || r.WebsiteURI == nil || *r.WebsiteURI != websiteURI ||
+		r.ContactHash == nil || *r.ContactHash != "abcd" {
 		t.Errorf("unexpected reporter: %+v", r)
 	}
 	if len(db.inactive) != 0 {
