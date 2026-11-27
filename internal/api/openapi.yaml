@@ -350,6 +350,75 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  /v1/assets/{sac}/coverage:
+    get:
+      summary: Get a time series of coverage at a minimum tier
+      description: >-
+        Each point uses the latest supply snapshot and the best report posted
+        at or before its instant, chosen with the same tier and basis-point
+        rules as coverage() on-chain. A point's coverage is null when no supply
+        snapshot or no qualifying report was known then.
+      operationId: getCoverageSeries
+      parameters:
+        - name: sac
+          in: path
+          required: true
+          description: Stellar Asset Contract (SAC) address
+          schema:
+            type: string
+            pattern: '^C[A-Z2-7]{55}$'
+        - name: from
+          in: query
+          required: false
+          description: Start of the series as an RFC 3339 timestamp (defaults to 24 hours before to)
+          schema:
+            type: string
+            format: date-time
+            example: "2026-11-24T12:00:00Z"
+        - name: to
+          in: query
+          required: false
+          description: End of the series as an RFC 3339 timestamp (defaults to now)
+          schema:
+            type: string
+            format: date-time
+            example: "2026-11-25T12:00:00Z"
+        - name: interval
+          in: query
+          required: false
+          description: Distance between points, from 5m to 7d; at most 1000 points per request
+          schema:
+            type: string
+            pattern: '^[0-9]+(m|h|d)$'
+            default: 1h
+            example: "1h"
+        - name: min_tier
+          in: query
+          required: false
+          description: Minimum tier level (1=transcribed, 2=issuer_signed, 3=auditor_signed)
+          schema:
+            type: integer
+            enum: [1, 2, 3]
+            default: 1
+      responses:
+        '200':
+          description: Coverage time series, oldest point first
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CoverageSeries'
+        '400':
+          description: Invalid sac, min_tier, timestamp, interval, or more than 1000 points
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Asset not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/reporters:
     get:
       summary: List registered reporters, roles, and profile metadata
@@ -597,6 +666,41 @@ components:
         - supply
         - reports
         - coverage
+    CoveragePoint:
+      type: object
+      properties:
+        at:
+          type: string
+          format: date-time
+          example: "2026-11-25T12:00:00Z"
+        coverage:
+          oneOf:
+            - $ref: '#/components/schemas/Coverage'
+            - type: "null"
+      required: [at, coverage]
+    CoverageSeries:
+      type: object
+      properties:
+        sac:
+          type: string
+          example: "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
+        min_tier:
+          type: string
+          example: "transcribed"
+        interval:
+          type: string
+          example: "1h"
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+        points:
+          type: array
+          items:
+            $ref: '#/components/schemas/CoveragePoint'
+      required: [sac, min_tier, interval, from, to, points]
     Reporter:
       type: object
       properties:

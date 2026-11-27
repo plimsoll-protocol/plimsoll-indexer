@@ -683,6 +683,36 @@ func (s *Store) SupplyHistory(ctx context.Context, sac string, limit int, before
 		  AND ($2::bigint IS NULL OR at_ledger < $2)
 		ORDER BY at_ledger DESC, event_id DESC
 		LIMIT $3`, sac, beforeArg, limit+1)
+func (s *Store) SupplyHistory(ctx context.Context, sac string, limit int) ([]coverage.Supply, error) {
+	return s.querySupplies(ctx, `
+		SELECT amount::text, at_ledger, posted_at, breakdown_hash, poster, tx_hash, source
+		FROM supply_snapshots WHERE sac = $1
+		ORDER BY at_ledger DESC LIMIT $2`, sac, limit)
+}
+
+// SeriesSupply returns the snapshots a coverage series needs between from and
+// to: the latest snapshot posted at or before from, plus every snapshot posted
+// after from up to to, oldest first.
+func (s *Store) SeriesSupply(ctx context.Context, sac string, from, to time.Time) ([]coverage.Supply, error) {
+	return s.querySupplies(ctx, `
+		WITH needed AS (
+		    SELECT event_id FROM supply_snapshots
+		    WHERE sac = $1 AND posted_at > $2 AND posted_at <= $3
+		    UNION
+		    SELECT event_id FROM (
+		        SELECT event_id FROM supply_snapshots
+		        WHERE sac = $1 AND posted_at <= $2
+		        ORDER BY posted_at DESC, at_ledger DESC
+		        LIMIT 1
+		    ) latest_before
+		)
+		SELECT amount::text, at_ledger, posted_at, breakdown_hash, poster, tx_hash, source
+		FROM supply_snapshots WHERE event_id IN (SELECT event_id FROM needed)
+		ORDER BY posted_at, at_ledger`, sac, from, to)
+}
+
+func (s *Store) querySupplies(ctx context.Context, sql string, args ...any) ([]coverage.Supply, error) {
+	rows, err := s.pool.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -936,6 +966,27 @@ func (s *Store) ReportExportPage(ctx context.Context, sac string, from, to *time
 		return nil, fmt.Errorf("read report export page: %w", err)
 	}
 	return out, nil
+}
+
+// SeriesReports returns the reports a coverage series needs between from and
+// to: for each tier the best report (by as_of) posted at or before from, plus
+// every report posted after from up to to, oldest first.
+func (s *Store) SeriesReports(ctx context.Context, sac string, from, to time.Time) ([]coverage.Report, error) {
+	return s.queryReports(ctx, `
+		WITH needed AS (
+		    SELECT event_id FROM reserve_reports
+		    WHERE sac = $1 AND posted_at > $2 AND posted_at <= $3
+		    UNION
+		    SELECT event_id FROM (
+		        SELECT DISTINCT ON (tier) event_id FROM reserve_reports
+		        WHERE sac = $1 AND posted_at <= $2
+		        ORDER BY tier, as_of DESC, posted_at DESC
+		    ) latest_before
+		)
+		SELECT tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source,
+		       COALESCE(doc_check, '')
+		FROM reserve_reports WHERE event_id IN (SELECT event_id FROM needed)
+		ORDER BY posted_at, as_of`, sac, from, to)
 }
 
 // LatestReports returns the newest report (by as_of) for each tier.
