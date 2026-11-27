@@ -126,11 +126,6 @@ func (f *fake) Breakdown(_ context.Context, h string) ([]byte, error) {
 	}
 	return nil, store.ErrNotFound
 }
-func (f *fake) Progress(_ context.Context, name string) (store.Progress, error) {
-	if p, ok := f.progress[name]; ok {
-		return p, nil
-	}
-
 func (f *fake) CreateCoverageWebhook(_ context.Context, w coverage.Webhook) (coverage.Webhook, error) {
 	w.ID = int64(len(f.created) + 1)
 	w.CreatedAt = now
@@ -152,7 +147,10 @@ func (f *fake) Attestation(_ context.Context, s string) (store.Attestation, erro
 	}
 	return store.Attestation{}, store.ErrNotFound
 }
-func (f *fake) Progress(context.Context, string) (store.Progress, error) {
+func (f *fake) Progress(_ context.Context, name string) (store.Progress, error) {
+	if p, ok := f.progress[name]; ok {
+		return p, nil
+	}
 	return store.Progress{
 		Cursor:        "c",
 		ScannedLedger: 42,
@@ -771,23 +769,6 @@ func TestReportExportStreamsPagesAndAppliesDateFilters(t *testing.T) {
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/v1/assets/" + sac + "/reports/export.csv?from=2026-10-01&to=2026-10-05")
-
-// adminRequest sends a webhook-administration request and returns the status
-// and decoded body (nil for 204).
-func adminRequest(t *testing.T, srv *httptest.Server, method, path, token, body string) (int, map[string]any) {
-	t.Helper()
-	var r io.Reader
-	if body != "" {
-		r = strings.NewReader(body)
-	}
-	req, err := http.NewRequest(method, srv.URL+path, r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -833,7 +814,28 @@ func makeExportRows(n int) []store.ReportExportRow {
 		}
 	}
 	return rows
+}
 
+// adminRequest sends a webhook-administration request and returns the status
+// and decoded body (nil for 204).
+func adminRequest(t *testing.T, srv *httptest.Server, method, path, token, body string) (int, map[string]any) {
+	t.Helper()
+	var r io.Reader
+	if body != "" {
+		r = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, srv.URL+path, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNoContent {
 		return resp.StatusCode, nil
 	}

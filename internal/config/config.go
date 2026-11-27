@@ -64,20 +64,8 @@ type Config struct {
 	WebhookEncryptionKey string
 	SlackWebhookURL      string
 	DiscordWebhookURL    string
-	HorizonCheckURL    string
-	NetworkPassphrase  string
-	CoverageLedgerID   string
-	ReporterRegistryID string
-	StartLedger        uint32
-	PosterSecret       string
-	// WebhookAdminToken protects webhook administration. It is shared by
-	// issuer TOML change subscriptions and coverage alerts.
-	WebhookAdminToken string
-	// WebhookEncryptionKey encrypts the per-subscription secrets of issuer
-	// TOML change webhooks at rest; WebhookSigningSecret keys the HMAC-SHA256
-	// signature on coverage alert deliveries. Each enables its own feature and
-	// needs WebhookAdminToken.
-	WebhookEncryptionKey string
+	// WebhookSigningSecret keys the HMAC-SHA256 signature on coverage alert
+	// deliveries; it needs WebhookAdminToken.
 	WebhookSigningSecret string
 	WebhookInterval      time.Duration
 	IngestInterval       time.Duration
@@ -172,6 +160,7 @@ func Load() (Config, error) {
 	}
 	if len(c.WebhookAPIKeys) > 0 && c.WebhookAdminToken == "" {
 		errs = append(errs, errors.New("WEBHOOK_API_KEYS requires WEBHOOK_ADMIN_TOKEN and WEBHOOK_ENCRYPTION_KEY"))
+	}
 	if c.WebhookSigningSecret != "" && c.WebhookAdminToken == "" {
 		errs = append(errs, errors.New("WEBHOOK_ADMIN_TOKEN and WEBHOOK_SIGNING_SECRET must be configured together"))
 	}

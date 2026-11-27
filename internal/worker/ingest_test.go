@@ -334,7 +334,7 @@ func (s *eventTrackingStore) Progress(context.Context, string) (store.Progress, 
 	return store.Progress{}, nil
 }
 
-func (s *eventTrackingStore) ApplyEvents(_ context.Context, name, _ string, _ uint32, events []any) error {
+func (s *eventTrackingStore) ApplyEvents(_ context.Context, name, _ string, _ uint32, _ []soroban.RawEvent, events []any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.names[name] = true
@@ -389,6 +389,8 @@ func TestIngesterRunsContractStreamsConcurrentlyWithoutDuplicates(t *testing.T) 
 	}
 	if len(db.eventIDs) != 2 || db.eventIDs["ledger-event"] != 1 || db.eventIDs["registry-event"] != 1 {
 		t.Errorf("stored event IDs = %v, want each stream's event exactly once", db.eventIDs)
+	}
+}
 
 // Run hands the store every event of a page raw, tracked or not, next to the
 // typed rows, so both are written in the page's transaction.

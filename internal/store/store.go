@@ -445,7 +445,11 @@ func (s *Store) LatestSupplies(ctx context.Context, sacs []string) (map[string]*
 		if err := rows.Scan(&sac, &amount, &ledger, &sp.PostedAt, &sp.BreakdownHash, &sp.Poster, &sp.TxHash, &sp.Source); err != nil {
 			return nil, err
 		}
-		sp.Amount = mustBig(amount)
+		n, err := parseAmount(amount)
+		if err != nil {
+			return nil, fmt.Errorf("supply snapshot for %s at ledger %d: %w", sac, ledger, err)
+		}
+		sp.Amount = n
 		sp.Ledger = uint32(ledger)
 		out[sac] = &sp
 	}
@@ -481,7 +485,11 @@ func (s *Store) LatestReportsBySAC(ctx context.Context, sacs []string) (map[stri
 			return nil, err
 		}
 		r.Tier = uint32(tier)
-		r.Amount = mustBig(amount)
+		n, err := parseAmount(amount)
+		if err != nil {
+			return nil, fmt.Errorf("report for %s tier %d: %w", sac, tier, err)
+		}
+		r.Amount = n
 		if out[sac] == nil {
 			out[sac] = make(map[uint32]coverage.Report)
 		}
@@ -585,7 +593,15 @@ func (s *Store) ReportExportPage(ctx context.Context, sac string, from, to *time
 		row.Tier = uint32(tier)
 		row.Cursor.Ledger = ledger
 		if supplyAmount.Valid {
-			bps := coverage.BPS(mustBig(amount), mustBig(supplyAmount.String))
+			reserves, err := parseAmount(amount)
+			if err != nil {
+				return nil, fmt.Errorf("report export reserves: %w", err)
+			}
+			supply, err := parseAmount(supplyAmount.String)
+			if err != nil {
+				return nil, fmt.Errorf("report export supply: %w", err)
+			}
+			bps := coverage.BPS(reserves, supply)
 			row.Bps = &bps
 		}
 		out = append(out, row)
@@ -605,44 +621,6 @@ func (s *Store) LatestReports(ctx context.Context, sac string) (map[uint32]cover
 	out := make(map[uint32]coverage.Report, len(list))
 	for _, r := range list {
 		out[r.Tier] = r
-	}
-	return out, nil
-}
-
-// LatestReportsBySAC returns the newest report for each tier of each requested SAC.
-func (s *Store) LatestReportsBySAC(ctx context.Context, sacs []string) (map[string]map[uint32]coverage.Report, error) {
-	out := make(map[string]map[uint32]coverage.Report)
-	if len(sacs) == 0 {
-		return out, nil
-	}
-	rows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT ON (sac, tier)
-		       sac, tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source,
-		       COALESCE(doc_check, '')
-		FROM reserve_reports
-		WHERE sac = ANY($1)
-		ORDER BY sac, tier, as_of DESC`, sacs)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var sac string
-		var r coverage.Report
-		var tier int16
-		var amount string
-		if err := rows.Scan(&sac, &tier, &amount, &r.AsOf, &r.PostedAt, &r.Reporter, &r.DocHash, &r.DocURI, &r.TxHash, &r.Source, &r.DocCheck); err != nil {
-			return nil, err
-		}
-		r.Tier = uint32(tier)
-		r.Amount = mustBig(amount)
-		if out[sac] == nil {
-			out[sac] = make(map[uint32]coverage.Report)
-		}
-		out[sac][r.Tier] = r
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
 	}
 	return out, nil
 }
