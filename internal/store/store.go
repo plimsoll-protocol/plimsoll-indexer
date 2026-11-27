@@ -859,7 +859,7 @@ func (s *Store) DeleteWebhook(ctx context.Context, id int64, ownerKeyHash string
 		return fmt.Errorf("read webhook owner: %w", err)
 	}
 	// Rows created before owner tracking have no key hash and are admin-only.
-	if storedOwner != ownerKeyHash && !(storedOwner == "" && allowLegacyAdmin) {
+	if storedOwner != ownerKeyHash && (storedOwner != "" || !allowLegacyAdmin) {
 		return ErrForbidden
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM webhooks WHERE id = $1`, id); err != nil {
