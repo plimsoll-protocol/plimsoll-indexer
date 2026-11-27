@@ -242,7 +242,10 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
 		if attempt == maxAttempts {
 			return fmt.Errorf("%s: giving up after %d attempts: %w", path, attempt, err)
 		}
-		wait := backoffDelay(attempt, retryAfter)
+		wait, err := backoffDelay(attempt, retryAfter)
+		if err != nil {
+			return fmt.Errorf("%s: calculate retry backoff: %w", path, err)
+		}
 		if time.Now().Add(wait).After(deadline) {
 			return fmt.Errorf("%s: retry budget of %s exhausted: %w", path, retryBudget, err)
 		}
@@ -321,9 +324,9 @@ func parseRetryAfter(hdr http.Header, now time.Time) time.Duration {
 // budget, rather than retrying early and being rate-limited again. Otherwise it
 // is capped exponential backoff with equal jitter, so instances that were
 // rate-limited together do not all come back at the same instant.
-func backoffDelay(attempt int, retryAfter time.Duration) time.Duration {
+func backoffDelay(attempt int, retryAfter time.Duration) (time.Duration, error) {
 	if retryAfter > 0 {
-		return retryAfter
+		return retryAfter, nil
 	}
 	d := baseBackoff
 	for i := 1; i < attempt && d < maxBackoff; i++ {
@@ -331,13 +334,11 @@ func backoffDelay(attempt int, retryAfter time.Duration) time.Duration {
 	}
 	d = min(d, maxBackoff)
 	half := d / 2
-	n, err := rand.Int(rand.Reader, big.NewInt(int64(half)+1))
+	jitter, err := rand.Int(rand.Reader, big.NewInt(int64(half)+1))
 	if err != nil {
-		// Without a random source, back off by the fixed half instead of
-		// failing the request.
-		return half
+		return 0, fmt.Errorf("generate retry jitter: %w", err)
 	}
-	return half + time.Duration(n.Int64())
+	return half + time.Duration(jitter.Int64()), nil
 }
 
 // wait sleeps for d, returning early with ctx's error if the context ends.

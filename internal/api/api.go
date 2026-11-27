@@ -132,7 +132,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/webhooks/{id}", s.deleteWebhook)
 	mux.HandleFunc("POST /v1/coverage-webhooks", s.createCoverageWebhook)
 	mux.HandleFunc("DELETE /v1/coverage-webhooks/{id}", s.deleteCoverageWebhook)
-	return s.cors(errorEnvelope(mux))
+	return s.compress(s.cors(errorEnvelope(mux)))
+}
+
+func (s *Server) compress(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cw := &compressionWriter{
+			ResponseWriter: w,
+			encoding:       acceptedEncoding(strings.Join(r.Header.Values("Accept-Encoding"), ",")),
+			logger:         s.Log,
+			method:         r.Method,
+		}
+		next.ServeHTTP(cw, r)
+		if err := cw.finish(); err != nil && s.Log != nil {
+			s.Log.Error("write compressed API response", "err", err)
+		}
+	})
 }
 
 // ---- JSON shapes ----------------------------------------------------------
@@ -412,12 +427,12 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]assetJSON, 0, len(assets))
 	for _, a := range assets {
-		built, err := s.assembleWithData(r.Context(), a, supplies[a.SAC], reports[a.SAC], minTier)
+		aj, err := s.assembleWithData(r.Context(), a, supplies[a.SAC], reports[a.SAC], minTier)
 		if err != nil {
 			s.fail(w, err)
 			return
 		}
-		out = append(out, built)
+		out = append(out, aj)
 	}
 	body := map[string]any{"assets": out}
 	if hasNext {
@@ -666,17 +681,17 @@ func (s *Server) coverageNow(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAsset(w, r, sac) {
 		return
 	}
-	supply, err := s.Store.LatestSupply(r.Context(), sac)
+	supplies, err := s.Store.LatestSupplies(r.Context(), []string{sac})
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	reports, err := s.Store.LatestReports(r.Context(), sac)
+	reportsBySAC, err := s.Store.LatestReportsBySAC(r.Context(), []string{sac})
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	res := coverage.Compute(supply, reports, coverage.TierTranscribed)
+	res := coverage.Compute(supplies[sac], reportsBySAC[sac], coverage.TierTranscribed)
 	if res == nil {
 		writeError(w, http.StatusNotFound, codeCoverageNotFound, "no live coverage report")
 		return
@@ -1113,7 +1128,7 @@ func parseDateRange(w http.ResponseWriter, r *http.Request) (*time.Time, *time.T
 		}
 		date, err := time.Parse("2006-01-02", value)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, codeInvalidDateRange, name+" must be a date in YYYY-MM-DD format")
+			writeError(w, http.StatusBadRequest, codeInvalidDate, name+" must be a date in YYYY-MM-DD format")
 			return nil, false
 		}
 		date = date.UTC()
@@ -1191,7 +1206,7 @@ const (
 	codeCoverageNotFound      = "coverage_not_found"
 	codeInvalidMinTier        = "invalid_min_tier"
 	codeInvalidLimit          = "invalid_limit"
-	codeAuthNotConfigured     = "auth_not_configured"
+	codeInvalidDate           = "invalid_date"
 	codeInvalidBody           = "invalid_body"
 	codeInvalidCursor         = "invalid_cursor"
 	codeInvalidDateRange      = "invalid_date_range"
@@ -1202,6 +1217,7 @@ const (
 	codeWebhookForbidden      = "webhook_forbidden"
 	codeWebhooksNotConfigured = "webhooks_not_configured"
 	codeUnauthorized          = "unauthorized"
+	codeAuthUnavailable       = "auth_unavailable"
 	codeInternal              = "internal_error"
 	codeDBUnavailable         = "db_unavailable"
 	codeProgressUnavailable   = "progress_unavailable"

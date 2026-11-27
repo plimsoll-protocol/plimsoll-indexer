@@ -75,6 +75,21 @@ func TestLoadMigrationsRejectsMistakes(t *testing.T) {
 	}
 }
 
+func TestLoadMigrationsGroupsSharedVersionsByName(t *testing.T) {
+	ms, err := loadMigrations(fstest.MapFS{
+		"0001_second.sql": {Data: []byte("SELECT 2")},
+		"0001_first.sql":  {Data: []byte("SELECT 1")},
+		"0002_next.sql":   {Data: []byte("SELECT 3")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ms) != 3 || ms[0].Name != "first" || ms[1].Name != "second" ||
+		ms[0].Version != 1 || ms[1].Version != 1 || ms[2].Version != 2 {
+		t.Fatalf("migrations = %+v", ms)
+	}
+}
+
 // legacySchema is the schema an indexer older than versioned migrations left
 // behind: schema.sql applied directly, with no schema_migrations table.
 func legacySchema(t *testing.T) string {
@@ -132,9 +147,11 @@ func embeddedVersions(t *testing.T) []int {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out := make([]int, len(ms))
+	var out []int
 	for i, m := range ms {
-		out[i] = m.Version
+		if i == 0 || m.Version != ms[i-1].Version {
+			out = append(out, m.Version)
+		}
 	}
 	return out
 }
@@ -197,6 +214,8 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 			execSQL(t, url, `INSERT INTO assets (sac, code, issuer, listed_ledger, listed_at, event_id)
 				VALUES ('CSAC', 'PUSD', 'GISS', 7, now(), 'ev-1')`)
 			execSQL(t, url, `INSERT INTO breakdowns (hash, sac, body) VALUES ('h1', 'CSAC', '{"total":"5"}')`)
+			execSQL(t, url, `INSERT INTO reporters (address, role, name, active, updated_ledger, updated_at)
+				VALUES ('GREPORTER', 1, 'Acme', true, 7, now())`)
 			// The snapshot that h1 backs, so the breakdown is confirmed and served
 			// after the upgrade (the breakdown_confirmation migration).
 			execSQL(t, url, `INSERT INTO supply_snapshots
@@ -221,6 +240,10 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 			}
 			if body, err := s.Breakdown(context.Background(), "h1"); err != nil || string(body) != `{"total":"5"}` {
 				t.Fatalf("existing breakdown after migration: %q, %v", body, err)
+			}
+			reporters, err := s.Reporters(context.Background())
+			if err != nil || len(reporters) != 1 || reporters[0].DisplayName != "Acme" {
+				t.Fatalf("existing reporter after migration: %+v, %v", reporters, err)
 			}
 		})
 	}
@@ -333,5 +356,38 @@ func TestMigrateAppliesInOrderAndRollsBackOnFailure(t *testing.T) {
 	var rows int
 	if err := p.QueryRow(ctx, `SELECT count(*) FROM numbers`).Scan(&rows); err != nil || rows != 1 {
 		t.Fatalf("numbers has %d rows after a second run, want 1 (%v)", rows, err)
+	}
+}
+
+func TestMigrateAppliesNewMigrationWithPreviouslyAppliedVersion(t *testing.T) {
+	ctx := context.Background()
+	url := newDatabase(t)
+	p := testPool(t, url)
+	first := fstest.MapFS{
+		"0001_first.sql": {Data: []byte(`CREATE TABLE first_migration (n INT)`)},
+	}
+	if err := migrate(ctx, p, first); err != nil {
+		t.Fatal(err)
+	}
+
+	combined := fstest.MapFS{
+		"0001_first.sql":  first["0001_first.sql"],
+		"0001_second.sql": {Data: []byte(`CREATE TABLE second_migration (n INT)`)},
+	}
+	if err := migrate(ctx, p, combined); err != nil {
+		t.Fatal(err)
+	}
+	if !tableExists(t, p, "first_migration") || !tableExists(t, p, "second_migration") {
+		t.Fatal("shared-version migrations were not both applied")
+	}
+	var name string
+	if err := p.QueryRow(ctx, `SELECT name FROM schema_migrations WHERE version = 1`).Scan(&name); err != nil {
+		t.Fatal(err)
+	}
+	if name != "first,second" {
+		t.Fatalf("recorded migration names = %q, want %q", name, "first,second")
+	}
+	if err := migrate(ctx, p, combined); err != nil {
+		t.Fatalf("reapply migrations: %v", err)
 	}
 }

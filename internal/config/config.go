@@ -52,28 +52,20 @@ type Config struct {
 	// supply against before signing it on chain. One Horizon is one point of
 	// trust for the only figure this indexer asserts itself. Empty disables the
 	// comparison.
-	HorizonCheckURL    string
-	NetworkPassphrase  string
-	CoverageLedgerID   string
-	ReporterRegistryID string
-	StartLedger        uint32
-	IngestWorkers      int
-	PosterSecret       string
-	// WebhookAdminToken protects webhook administration. It is shared by
-	// issuer TOML change subscriptions and coverage alerts.
-	WebhookAdminToken string
-	// WebhookAPIKeys are the bearer tokens that may register issuer TOML change
-	// webhooks. Each key owns (and can only list and delete) its own endpoints.
-	WebhookAPIKeys []string
-	// WebhookEncryptionKey encrypts the per-subscription secrets of issuer
-	// TOML change webhooks at rest; WebhookSigningSecret keys the HMAC-SHA256
-	// signature on coverage alert deliveries. Each enables its own feature and
-	// needs WebhookAdminToken.
+	HorizonCheckURL      string
+	NetworkPassphrase    string
+	CoverageLedgerID     string
+	ReporterRegistryID   string
+	StartLedger          uint32
+	IngestWorkers        int
+	PosterSecret         string
+	WebhookAdminToken    string
+	WebhookAPIKeys       []string
 	WebhookEncryptionKey string
-	WebhookSigningSecret string
-	WebhookInterval      time.Duration
 	SlackWebhookURL      string
 	DiscordWebhookURL    string
+	WebhookSigningSecret string
+	WebhookInterval      time.Duration
 	IngestInterval       time.Duration
 	PostInterval         time.Duration
 	// ReconcileInterval is how often contract state is read back to repair
