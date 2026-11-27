@@ -9,6 +9,9 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -70,6 +73,7 @@ func TestKeepAwakeURL(t *testing.T) {
 func setBase(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{"NETWORK", "STELLAR_RPC_URL", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE", "WEBHOOK_ADMIN_TOKEN", "WEBHOOK_API_KEYS", "WEBHOOK_ENCRYPTION_KEY", "WEBHOOK_SIGNING_SECRET", "SECRETS_PROVIDER", "SUPPLY_POSTER_SECRET", "SUPPLY_POSTER_SECRET_NAME", "DATABASE_PASSWORD_SECRET_NAME"} {
+	for _, k := range []string{"NETWORK", "STELLAR_RPC_URL", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE", "SUPPLY_POSTER_SECRET", "SUPPLY_POSTER_SECRET_FILE"} {
 		t.Setenv(k, "")
 	}
 	t.Setenv("DATABASE_URL", "postgres://x")
@@ -470,6 +474,99 @@ func TestDecimalCheckEnabled(t *testing.T) {
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "DECIMAL_CHECK_ENABLED") {
 		t.Fatalf("want an invalid boolean error, got %v", err)
 	}
+}
+
+// TestPosterSecretFromFile verifies SUPPLY_POSTER_SECRET_FILE is read and its
+// trailing whitespace trimmed, as a secret mounted by Docker or Kubernetes
+// typically ends in a newline.
+func TestPosterSecretFromFile(t *testing.T) {
+	const secret = "SCZANGBA5TTPJQS62SL7TURZT5FSZMR3TCZDWNBEBGCMQK3JLYLUVRMJ"
+	path := filepath.Join(t.TempDir(), "poster_secret")
+	if err := os.WriteFile(path, []byte(secret+"\n\r\n \t"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	setBase(t)
+	t.Setenv("SUPPLY_POSTER_SECRET_FILE", path)
+	got, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if got.PosterSecret != secret {
+		t.Errorf("PosterSecret = %q, want %q", got.PosterSecret, secret)
+	}
+	if !got.PostingEnabled() {
+		t.Error("PostingEnabled() = false with SUPPLY_POSTER_SECRET_FILE set, want true")
+	}
+}
+
+// TestPosterSecretBothSet verifies that supplying the secret both directly and
+// through a file is a startup error rather than an arbitrary winner.
+func TestPosterSecretBothSet(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "poster_secret")
+	if err := os.WriteFile(path, []byte("SBFILE"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	setBase(t)
+	t.Setenv("SUPPLY_POSTER_SECRET", "SBENV")
+	t.Setenv("SUPPLY_POSTER_SECRET_FILE", path)
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() = nil error with both secret variables set")
+	}
+	for _, want := range []string{"SUPPLY_POSTER_SECRET", "SUPPLY_POSTER_SECRET_FILE"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to mention %q", err.Error(), want)
+		}
+	}
+}
+
+// TestPosterSecretFileMissing verifies that an unreadable secret file is
+// reported at startup.
+func TestPosterSecretFileMissing(t *testing.T) {
+	setBase(t)
+	t.Setenv("SUPPLY_POSTER_SECRET_FILE", filepath.Join(t.TempDir(), "absent"))
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "SUPPLY_POSTER_SECRET_FILE") {
+		t.Fatalf("want secret file error, got %v", err)
+	}
+}
+
+// TestStringOmitsSecret verifies that formatting a Config never reveals the
+// poster secret, whether it came from the environment or a file.
+func TestStringOmitsSecret(t *testing.T) {
+	const secret = "SCZANGBA5TTPJQS62SL7TURZT5FSZMR3TCZDWNBEBGCMQK3JLYLUVRMJ"
+
+	t.Run("environment", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("SUPPLY_POSTER_SECRET", secret)
+		got, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, format := range []string{"%v", "%+v", "%#v"} {
+			if s := fmt.Sprintf(format, got); strings.Contains(s, secret) {
+				t.Errorf("Config formatted with %s leaks the secret: %s", format, s)
+			}
+		}
+	})
+
+	t.Run("file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "poster_secret")
+		if err := os.WriteFile(path, []byte(secret+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		setBase(t)
+		t.Setenv("SUPPLY_POSTER_SECRET_FILE", path)
+		got, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s := fmt.Sprintf("%+v", got); strings.Contains(s, secret) {
+			t.Errorf("Config formatted with %%+v leaks the secret: %s", s)
+		}
+	})
 }
 
 // TestPostingEnabled verifies the PostingEnabled predicate.
