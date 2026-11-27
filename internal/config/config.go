@@ -95,6 +95,7 @@ type Config struct {
 	RetentionDays int
 	// GraphQLEnabled mounts /graphql. It is off by default.
 	GraphQLEnabled bool
+	MetricsEnabled    bool
 	// KeepAwakeURL is requested every KeepAwakeInterval so a host that sleeps
 	// idle services (Render's free tier) keeps this one, and its poster, up.
 	KeepAwakeURL      string
@@ -206,6 +207,7 @@ func Load() (Config, error) {
 		WebhookSigningSecret: os.Getenv("WEBHOOK_SIGNING_SECRET"),
 		LogLevel:             envOr("LOG_LEVEL", "info"),
 		IngestWorkers:        2,
+		MetricsEnabled:       false,
 		KeepAwakeURL:         keepAwakeURL(os.Getenv("KEEP_AWAKE_URL"), os.Getenv("RENDER_EXTERNAL_URL")),
 		DecimalCheckEnabled:  true,
 	}
@@ -223,6 +225,14 @@ func Load() (Config, error) {
 			errs = append(errs, err)
 		} else {
 			c.WebhookAPIKeys = keys
+		}
+	}
+	if value := os.Getenv("METRICS_ENABLED"); value != "" {
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("METRICS_ENABLED: %w", err))
+		} else {
+			c.MetricsEnabled = enabled
 		}
 	}
 

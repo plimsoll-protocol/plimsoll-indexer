@@ -94,6 +94,28 @@ go run ./cmd/plimsoll-indexer replay -from 5034380 -to 5035000 [-dry-run]
 needs no database connection at all. Progress is logged every 1 000 ledgers.
 One command serves both modes: `replay` with no `-from`/`-to` rebuilds from
 `raw_events`, and `replay -from N -to M` re-reads that range from the RPC.
+### Backfilling archived events
+
+Soroban RPC retains only a limited window of events. To recover events outside
+that window, install Stellar Core v23 or later and run the bounded archive
+backfill against the same database as the live indexer:
+
+```bash
+go run ./cmd/plimsoll-indexer backfill --from 5000000 --to 5100000
+```
+
+The command uses the configured network passphrase, the public testnet or
+mainnet history archives, and `stellar-core` from `PATH`. Override the binary
+with `STELLAR_CORE_PATH` or `--stellar-core`. Custom networks need one or more
+HTTPS `--archive-url` values. `--timeout` defaults to 24 hours. Backfill writes
+to its own progress cursor and uses the same event IDs as live ingestion, so
+overlapping ranges are safe to rerun without duplicating events.
+
+A 100,000-ledger range typically takes roughly 30 minutes to two hours on a
+4-vCPU, 8-GB host; archive bandwidth, ledger complexity, and disk speed can
+change this substantially. The bounded Captive Core replay is memory intensive
+(allow at least 3 GB for Core); run a 1,000-ledger sample first and use its
+progress logs to estimate the full range.
 
 ## API
 
@@ -133,6 +155,22 @@ parameter) are recorded by hand in
 [internal/changelog/CHANGELOG.yaml](internal/changelog/CHANGELOG.yaml) and served
 at `GET /v1/changelog`, newest version first. The indexer refuses to start if
 that file is malformed.
+### Prometheus metrics
+
+Set `METRICS_ENABLED=true` to expose `GET /metrics`; it is not registered when
+disabled. The endpoint is unauthenticated, so restrict access at the network
+or reverse-proxy layer when needed.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `plimsoll_ingested_ledger` | Gauge | — | Latest ledger reached by live event ingestion |
+| `plimsoll_ingest_lag_ledgers` | Gauge | — | Gap between latest known and ingested ledger |
+| `plimsoll_supply_posts_attempted_total` | Counter | — | Supply transactions submitted |
+| `plimsoll_supply_posts_succeeded_total` | Counter | — | Supply transactions successfully submitted |
+| `plimsoll_supply_posts_failed_total` | Counter | — | Supply transactions that failed |
+| `plimsoll_supply_post_last_age_seconds` | Gauge | `asset_sac` | Seconds since each asset's last successful supply post |
+| `plimsoll_http_requests_total` | Counter | `method`, `path`, `status` | HTTP request totals by route and status |
+| `plimsoll_http_request_duration_seconds` | Histogram | `method`, `path` | HTTP request latency in seconds |
 
 Coverage in the API uses the same selection and rounding rules as the contract
 (`internal/coverage`), so the API and `coverage()` on-chain agree.

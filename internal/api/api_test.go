@@ -1303,6 +1303,31 @@ func TestVersionEndpoint(t *testing.T) {
 	}
 }
 
+func TestMetricsEndpointIsOptional(t *testing.T) {
+	enabled := &Server{
+		Store:   &fake{},
+		Metrics: metrics.New(),
+		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:     func() time.Time { return now },
+	}
+	response := httptest.NewRecorder()
+	enabled.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Header().Get("Content-Type"), "text/plain") {
+		t.Fatalf("enabled metrics endpoint: status=%d content-type=%q", response.Code, response.Header().Get("Content-Type"))
+	}
+
+	disabledServer := server()
+	defer disabledServer.Close()
+	disabledResponse, err := http.Get(disabledServer.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabledResponse.Body.Close()
+	if disabledResponse.StatusCode != http.StatusNotFound {
+		t.Fatalf("disabled metrics endpoint status = %d, want 404", disabledResponse.StatusCode)
+	}
+}
+
 func TestOpenAPISpec(t *testing.T) {
 	srv := server()
 	defer srv.Close()

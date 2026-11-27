@@ -455,6 +455,22 @@ func applyEvent(ctx context.Context, tx pgx.Tx, ev any) (bool, error) {
 	case soroban.ThresholdsUpdated:
 		// ThresholdsUpdated is acknowledged idempotently; no-op if no schema table yet
 		return nil
+			INSERT INTO reporters (address, role, name, active, updated_ledger, updated_at, updated_event_id)
+			VALUES ($1, $2, $3, true, $4, $5, $6)
+			ON CONFLICT (address) DO UPDATE
+			SET role = EXCLUDED.role, name = EXCLUDED.name, active = true,
+			    updated_ledger = EXCLUDED.updated_ledger, updated_at = EXCLUDED.updated_at,
+			    updated_event_id = EXCLUDED.updated_event_id
+			WHERE (EXCLUDED.updated_ledger, EXCLUDED.updated_event_id) >=
+			      (reporters.updated_ledger, reporters.updated_event_id)`,
+			e.Reporter, int16(e.Role), e.Name, int64(e.Ledger), e.ClosedAt, e.ID)
+	case soroban.ReporterRevoked:
+		_, err = tx.Exec(ctx, `
+			UPDATE reporters SET active = false, updated_ledger = $2, updated_at = $3,
+			    updated_event_id = $4
+			WHERE address = $1
+			  AND (updated_ledger, updated_event_id) <= ($2, $4)`,
+			e.Reporter, int64(e.Ledger), e.ClosedAt, e.ID)
 	}
 	if err != nil {
 		return false, fmt.Errorf("apply %T: %w", ev, err)

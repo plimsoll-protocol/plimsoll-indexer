@@ -60,6 +60,13 @@ type latestLedger interface {
 	GetLatestLedger(ctx context.Context) (protocol.GetLatestLedgerResponse, error)
 }
 
+type posterMetrics interface {
+	SupplyPostAttempted()
+	SupplyPostSucceeded()
+	SupplyPostFailed()
+	RecordLastSupplyPost(assetSAC string, at time.Time)
+}
+
 // Poster computes each listed asset's supply from Horizon and posts it to the
 // coverage ledger when it changed, or when the last post is older than
 // RepostAfter (so is_covered freshness checks keep passing).
@@ -87,6 +94,7 @@ type Poster struct {
 	DecimalCheck bool
 	Log          *slog.Logger
 	Now          func() time.Time
+	Metrics      posterMetrics
 
 	// BalanceChecker, when non-nil, is queried at the start of every Run tick.
 	// If the poster's native XLM balance is below LowBalanceStroops a warning
@@ -268,6 +276,9 @@ func (p *Poster) postOne(ctx context.Context, sac, code, issuer string) error {
 	if err != nil {
 		return err
 	}
+	if last != nil && p.Metrics != nil {
+		p.Metrics.RecordLastSupplyPost(sac, last.Timestamp)
+	}
 	if last != nil {
 		unchanged := last.Amount.Cmp(b.TotalInt()) == 0
 		recent := p.Now().Sub(last.Timestamp) < p.RepostAfter
@@ -326,6 +337,9 @@ func (p *Poster) postOne(ctx context.Context, sac, code, issuer string) error {
 		return err
 	}
 	args := []xdr.ScVal{posterVal, sacVal, amountVal, soroban.U32Val(b.Ledger), hashVal}
+	if p.Metrics != nil {
+		p.Metrics.SupplyPostAttempted()
+	}
 	res, err := p.Invoker.Invoke(ctx, p.LedgerID, "post_supply", args)
 	if err != nil {
 		// The breakdown stays unconfirmed. If the transaction landed after all,
@@ -335,6 +349,14 @@ func (p *Poster) postOne(ctx context.Context, sac, code, issuer string) error {
 	}
 	if err := p.Store.ConfirmBreakdown(ctx, hash); err != nil {
 		return fmt.Errorf("posted supply in %s but could not confirm its breakdown: %w", res.TxHash, err)
+		if p.Metrics != nil {
+			p.Metrics.SupplyPostFailed()
+		}
+		return fmt.Errorf("post_supply: %w", err)
+	}
+	if p.Metrics != nil {
+		p.Metrics.SupplyPostSucceeded()
+		p.Metrics.RecordLastSupplyPost(sac, p.Now())
 	}
 	p.Log.Info("posted supply", "code", code, "amount", b.Total, "at_ledger", b.Ledger, "tx", res.TxHash)
 	return nil

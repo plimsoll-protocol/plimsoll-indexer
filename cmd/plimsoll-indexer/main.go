@@ -28,6 +28,7 @@ import (
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/horizon"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/netclient"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/secrets"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/metrics"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/stellartoml"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
@@ -49,6 +50,8 @@ func main() {
 		os.Exit(runKeygenCommand(os.Args[2:]))
 	if len(os.Args) > 1 && os.Args[1] == "reindex" {
 		os.Exit(runReindexCommand(os.Args[2:]))
+	if len(os.Args) > 1 && os.Args[1] == "backfill" {
+		os.Exit(runBackfillCommand(os.Args[2:]))
 	}
 
 	cfg, err := config.Load()
@@ -116,6 +119,12 @@ func run(cfg config.Config, build buildinfo.Info, log *slog.Logger) error {
 	hz := horizon.NewClient(cfg.HorizonURL)
 	hz.HTTP = netclient.New(20*time.Second, cfg.HTTPKeepAlive)
 
+	var observations *metrics.Metrics
+	if cfg.MetricsEnabled {
+		observations = metrics.New()
+		log.Info("Prometheus metrics enabled", "path", "/metrics")
+	}
+
 	var webhookCodec *webhook.SecretCodec
 	var webhookDispatcher *webhook.Dispatcher
 	if cfg.WebhookEncryptionKey != "" {
@@ -142,6 +151,7 @@ func run(cfg config.Config, build buildinfo.Info, log *slog.Logger) error {
 		StartLedger:            cfg.StartLedger,
 		ReporterStaleThreshold: cfg.ReporterStaleThreshold,
 		Log:                    log.With("job", "ingest"),
+		Metrics:     observations,
 	}
 	// Ingest once before the other jobs start, so they see the listed assets.
 	if err := ingester.Run(ctx); err != nil {
@@ -255,6 +265,15 @@ func run(cfg config.Config, build buildinfo.Info, log *slog.Logger) error {
 			DecimalCheck: cfg.DecimalCheckEnabled,
 			Log:          log.With("job", "poster"),
 			Now:          time.Now,
+			Horizon:     hz,
+			RPC:         rpc,
+			Invoker:     invoker,
+			Store:       db,
+			LedgerID:    cfg.CoverageLedgerID,
+			RepostAfter: cfg.RepostAfter,
+			Log:         log.With("job", "poster"),
+			Now:         time.Now,
+			Metrics:     observations,
 		}
 		// Left nil when no second Horizon is configured: comparing hz against
 		// itself would always agree and prove nothing.
@@ -322,6 +341,10 @@ func run(cfg config.Config, build buildinfo.Info, log *slog.Logger) error {
 			Log:       log.With("component", "api"),
 			Now:       time.Now,
 			Changelog: changes,
+			CORS:    cfg.CORSOrigins,
+			Metrics: observations,
+			Log:     log.With("component", "api"),
+			Now:     time.Now,
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second, // Bounds the time clients can spend sending request bodies.
