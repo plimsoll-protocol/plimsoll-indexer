@@ -47,6 +47,7 @@ values are reported together at startup.
 | `SUPPLY_POSTER_SECRET` | empty | Empty runs read-only. Never log or share it. |
 | `WEBHOOK_ADMIN_TOKEN` | empty | Enables authenticated webhook management when set with `WEBHOOK_ENCRYPTION_KEY`. |
 | `WEBHOOK_API_KEYS` | empty | Optional comma-separated owner API keys; each can delete only its own webhooks. |
+| `SHUTDOWN_TIMEOUT` | `30s` | Maximum time to drain in-flight jobs and stop HTTP connections. |
 | `WEBHOOK_ENCRYPTION_KEY` | empty | Base64-encoded 32-byte key (`openssl rand -base64 32`); keep stable to preserve webhook delivery. |
 
 | `WEBHOOK_ADMIN_TOKEN` | empty | Enables authenticated webhook management for both the issuer TOML subscriptions and the coverage alerts. |

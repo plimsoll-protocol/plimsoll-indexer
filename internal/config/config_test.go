@@ -315,6 +315,8 @@ func TestLoadIngestWorkers(t *testing.T) {
 		t.Errorf("IngestWorkers = %d, want 1", got.IngestWorkers)
 	if got.ReporterStaleThreshold.String() != "720h0m0s" {
 		t.Errorf("ReporterStaleThreshold = %v, want 720h0m0s", got.ReporterStaleThreshold)
+	if got.ShutdownTimeout.String() != "30s" {
+		t.Errorf("ShutdownTimeout = %v, want 30s", got.ShutdownTimeout)
 	}
 }
 
