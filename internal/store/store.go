@@ -351,6 +351,9 @@ func applyEvent(ctx context.Context, tx pgx.Tx, ev any) error {
 			UPDATE reporters SET active = false, updated_ledger = $2, updated_at = $3
 			WHERE address = $1 AND updated_ledger <= $2`,
 			e.Reporter, int64(e.Ledger), e.ClosedAt)
+	case soroban.ThresholdsUpdated:
+		// ThresholdsUpdated is acknowledged idempotently; no-op if no schema table yet
+		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("apply %T: %w", ev, err)

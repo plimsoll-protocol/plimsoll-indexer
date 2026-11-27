@@ -192,6 +192,26 @@ func migrate(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS) error {
 	return nil
 }
 
+// RunMigrations connects to the database, applies any pending migrations under
+// an advisory lock, and commits them in a single transaction.
+func RunMigrations(ctx context.Context, url string) error {
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return fmt.Errorf("parse database url: %w", err)
+	}
+	cfg.ConnConfig.RuntimeParams["timezone"] = "UTC"
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	defer pool.Close()
+
+	if err := pool.Ping(ctx); err != nil {
+		return fmt.Errorf("ping: %w", err)
+	}
+	return migrate(ctx, pool, migrationsFS())
+}
+
 // migrationsFS is the migrations directory compiled into the binary.
 func migrationsFS() fs.FS {
 	sub, err := fs.Sub(embeddedMigrations, "migrations")

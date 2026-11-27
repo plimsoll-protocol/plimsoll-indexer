@@ -37,6 +37,7 @@ var openAPISpec []byte
 type Reader interface {
 	Ping(ctx context.Context) error
 	ListAssets(ctx context.Context) ([]coverage.Asset, error)
+	SearchAssets(ctx context.Context, q string) ([]coverage.Asset, error)
 	GetAsset(ctx context.Context, sac string) (coverage.Asset, error)
 	LatestSupply(ctx context.Context, sac string) (*coverage.Supply, error)
 	LatestSupplies(ctx context.Context, sacs []string) (map[string]*coverage.Supply, error)
@@ -118,6 +119,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /openapi.yaml", s.openAPI)
 	mux.HandleFunc("GET /v1/network", s.network)
 	mux.HandleFunc("GET /v1/assets", s.listAssets)
+	mux.HandleFunc("GET /v1/assets/search", s.searchAssets)
 	mux.HandleFunc("GET /v1/assets/{sac}", s.getAsset)
 	mux.HandleFunc("HEAD /v1/assets/{sac}", s.headAsset)
 	mux.HandleFunc("GET /v1/assets/{sac}/supply", s.supplyHistory)
@@ -444,6 +446,36 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, body)
+}
+
+func (s *Server) searchAssets(w http.ResponseWriter, r *http.Request) {
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if q == "" {
+		writeError(w, http.StatusBadRequest, "query parameter q is required and cannot be empty")
+		return
+	}
+	minTier, ok := parseTier(w, r)
+	if !ok {
+		return
+	}
+	assets, err := s.Store.SearchAssets(r.Context(), q)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	if len(assets) > 20 {
+		assets = assets[:20]
+	}
+	out := make([]assetJSON, 0, len(assets))
+	for _, a := range assets {
+		aj, err := s.assemble(r.Context(), a, minTier)
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		out = append(out, aj)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"assets": out})
 }
 
 func (s *Server) getAsset(w http.ResponseWriter, r *http.Request) {

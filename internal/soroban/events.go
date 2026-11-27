@@ -80,6 +80,10 @@ type ReporterRevoked struct {
 	Reporter string
 }
 
+type ThresholdsUpdated struct {
+	Meta
+}
+
 // Decode turns an RPC event into one of the typed events above. Events this
 // indexer does not track return (nil, nil).
 func Decode(e protocol.EventInfo) (any, error) {
@@ -152,6 +156,8 @@ func Decode(e protocol.EventInfo) (any, error) {
 	case EventReporterRevoked:
 		out := ReporterRevoked{Meta: meta, Reporter: d.topicAddr(1)}
 		return out, d.wrap(e.ID, name)
+	case EventThresholdsUpdated, EventThresholdsUpdated_:
+		return ThresholdsUpdated{Meta: meta}, d.wrap(e.ID, name)
 	default:
 		return nil, nil
 	}

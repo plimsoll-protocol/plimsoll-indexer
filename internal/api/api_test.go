@@ -64,6 +64,20 @@ func (f *fake) Ping(context.Context) error { return nil }
 func (f *fake) ListAssets(context.Context) ([]coverage.Asset, error) {
 	return f.assets, nil
 }
+func (f *fake) SearchAssets(_ context.Context, q string) ([]coverage.Asset, error) {
+	var out []coverage.Asset
+	qLower := strings.ToLower(q)
+	for _, a := range f.assets {
+		if strings.Contains(strings.ToLower(a.Code), qLower) ||
+			strings.Contains(strings.ToLower(a.Issuer), qLower) {
+			out = append(out, a)
+		}
+	}
+	if len(out) > 20 {
+		out = out[:20]
+	}
+	return out, nil
+}
 func (f *fake) GetAsset(_ context.Context, s string) (coverage.Asset, error) {
 	for _, a := range f.assets {
 		if a.SAC == s {
@@ -523,6 +537,22 @@ func TestListAndMisc(t *testing.T) {
 	list := get(t, srv, "/v1/assets", 200)
 	if len(list["assets"].([]any)) != 1 {
 		t.Fatal("expected one asset")
+	}
+
+	// Search endpoint tests
+	get(t, srv, "/v1/assets/search", 400)
+	get(t, srv, "/v1/assets/search?q=", 400)
+	get(t, srv, "/v1/assets/search?q=   ", 400)
+
+	res := get(t, srv, "/v1/assets/search?q=pusd", 200)
+	results := res["assets"].([]any)
+	if len(results) != 1 {
+		t.Fatalf("want 1 search result, got %d", len(results))
+	}
+
+	resNone := get(t, srv, "/v1/assets/search?q=nonexistent", 200)
+	if len(resNone["assets"].([]any)) != 0 {
+		t.Fatalf("want 0 search results, got %d", len(resNone["assets"].([]any)))
 	}
 	get(t, srv, "/v1/assets/CNOPE", 400)
 	rep := get(t, srv, "/v1/reporters", 200)
