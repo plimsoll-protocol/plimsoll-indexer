@@ -163,6 +163,7 @@ progress logs to estimate the full range.
 | `POST /graphql` | Optional GraphQL endpoint. Off unless `ENABLE_GRAPHQL=true`; introspection is disabled when `ENVIRONMENT=production`. |
 | `POST /v1/webhooks`, `GET /v1/webhooks`, `DELETE /v1/webhooks/{id}` | Manage authenticated issuer TOML change subscriptions |
 | `GET /v1/webhooks/{id}/dlq`, `POST /v1/webhooks/{id}/dlq/{delivery_id}/retry` | Inspect and retry failed webhook deliveries |
+| `GET /v1/webhooks/{id}/dlq?limit=100` | Failed webhook deliveries with the latency of each attempt |
 
 Every `4xx` and `5xx` response has the same body:
 `{"code":"asset_not_listed","message":"…"}`, with an optional `details` object.

@@ -25,6 +25,11 @@ type deliveryStore interface {
 }
 
 const maxRetries = 3
+// deliveryRecorder is optional so a read-only store can still be used to
+// enumerate subscriptions; production stores record every attempt.
+type deliveryRecorder interface {
+	RecordWebhookDelivery(context.Context, store.WebhookDelivery) error
+}
 
 type Dispatcher struct {
 	Store  deliveryStore
@@ -95,6 +100,7 @@ func (d *Dispatcher) TOMLChanged(ctx context.Context, issuer, domain, oldHash, n
 		delivered := ""
 		if err := d.deliver(ctx, w, payload); err != nil {
 			delivered = err.Error()
+		if err := d.deliver(ctx, w, payload, "issuer_toml_changed"); err != nil {
 			failures = append(failures, fmt.Errorf("deliver webhook %d: %w", w.ID, err))
 		}
 		// Track the attempt per endpoint even when it failed, so GET
@@ -229,6 +235,7 @@ func (d *Dispatcher) deliverWithRetries(ctx context.Context, w store.Webhook, pa
 }
 
 func (d *Dispatcher) deliver(ctx context.Context, w store.Webhook, payload []byte) error {
+func (d *Dispatcher) deliver(ctx context.Context, w store.Webhook, payload []byte, event string) error {
 	secret, err := d.Codec.Decrypt(w.SecretCiphertext)
 	if err != nil {
 		return err
@@ -242,16 +249,43 @@ func (d *Dispatcher) deliver(ctx context.Context, w store.Webhook, payload []byt
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Plimsoll-Signature-256", Sign(payload, secret))
-	resp, err := d.Client.Do(req)
-	if err != nil {
-		return fmt.Errorf("send webhook request: %w", err)
+
+	attemptedAt := d.Now().UTC()
+	started := time.Now()
+	resp, sendErr := d.Client.Do(req)
+	statusCode := 0
+	var deliveryErr error
+	if sendErr != nil {
+		deliveryErr = fmt.Errorf("send webhook request: %w", sendErr)
+	} else {
+		statusCode = resp.StatusCode
+		_, readErr := io.Copy(io.Discard, io.LimitReader(resp.Body, 4097))
+		resp.Body.Close()
+		switch {
+		case readErr != nil:
+			deliveryErr = fmt.Errorf("read webhook response: %w", readErr)
+		case statusCode < 200 || statusCode >= 300:
+			deliveryErr = fmt.Errorf("webhook returned status %d", statusCode)
+		}
 	}
-	defer resp.Body.Close()
-	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, 4097)); err != nil {
-		return fmt.Errorf("read webhook response: %w", err)
+
+	// Latency covers the whole exchange, including reading the response body,
+	// so it reflects how long the upstream endpoint really took.
+	latency := time.Since(started).Milliseconds()
+	if recorder, ok := d.Store.(deliveryRecorder); ok {
+		record := store.WebhookDelivery{
+			WebhookID:         w.ID,
+			Event:             event,
+			StatusCode:        statusCode,
+			DeliveryLatencyMS: latency,
+			AttemptedAt:       attemptedAt,
+		}
+		if deliveryErr != nil {
+			record.Error = deliveryErr.Error()
+		}
+		if err := recorder.RecordWebhookDelivery(ctx, record); err != nil {
+			deliveryErr = errors.Join(deliveryErr, fmt.Errorf("record webhook delivery: %w", err))
+		}
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("webhook returned status %d", resp.StatusCode)
-	}
-	return nil
+	return deliveryErr
 }

@@ -525,6 +525,50 @@ func TestReporterMetadataEventKeepsAddressForReconciliation(t *testing.T) {
 	}
 }
 
+func TestWebhookDeliveryLatencyPersistence(t *testing.T) {
+	s, _ := openStore(t)
+	ctx := context.Background()
+	at := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+
+	created, err := s.CreateWebhook(ctx, "https://receiver.example/hook", "sha256-hash", []byte{1, 2, 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := s.GetWebhook(ctx, created.ID)
+	if err != nil || !found || got.ID != created.ID || got.URL != created.URL {
+		t.Fatalf("GetWebhook() = %+v, %v, %v", got, found, err)
+	}
+	if _, found, err := s.GetWebhook(ctx, created.ID+1); err != nil || found {
+		t.Fatalf("GetWebhook(missing) found=%v err=%v", found, err)
+	}
+
+	if err := s.RecordWebhookDelivery(ctx, WebhookDelivery{
+		WebhookID: created.ID, Event: "issuer_toml_changed", StatusCode: 204,
+		DeliveryLatencyMS: 12, AttemptedAt: at,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordWebhookDelivery(ctx, WebhookDelivery{
+		WebhookID: created.ID, Event: "issuer_toml_changed", StatusCode: 503,
+		Error: "webhook returned status 503", DeliveryLatencyMS: 912, AttemptedAt: at.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	dlq, err := s.ListWebhookDLQ(ctx, created.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dlq) != 1 {
+		t.Fatalf("DLQ has %d entries, want only the failed attempt", len(dlq))
+	}
+	if dlq[0].WebhookID != created.ID || dlq[0].StatusCode != 503 ||
+		dlq[0].Error != "webhook returned status 503" || dlq[0].DeliveryLatencyMS != 912 ||
+		!dlq[0].AttemptedAt.Equal(at.Add(time.Minute)) {
+		t.Fatalf("DLQ entry = %+v", dlq[0])
+	}
+}
+
 func TestApplyEventsIsIdempotentAcrossReconnect(t *testing.T) {
 	s, _ := openStore(t)
 	ctx := context.Background()

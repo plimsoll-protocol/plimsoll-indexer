@@ -266,6 +266,8 @@ type webhookManagerFake struct {
 	retryErr        error
 	retryWebhookID  int64
 	retryDeliveryID int64
+	webhooks   []store.Webhook
+	deliveries []store.WebhookDelivery
 }
 
 func (f *webhookManagerFake) CreateWebhook(_ context.Context, url, hash string, ciphertext []byte) (store.Webhook, error) {
@@ -295,6 +297,25 @@ func (f *webhookManagerFake) GetWebhook(_ context.Context, id int64) (store.Webh
 		}
 	}
 	return store.Webhook{}, false, nil
+}
+
+func (f *webhookManagerFake) GetWebhook(_ context.Context, id int64) (store.Webhook, bool, error) {
+	for _, item := range f.webhooks {
+		if item.ID == id {
+			return item, true, nil
+		}
+	}
+	return store.Webhook{}, false, nil
+}
+
+func (f *webhookManagerFake) ListWebhookDLQ(_ context.Context, webhookID int64, limit int) ([]store.WebhookDelivery, error) {
+	var out []store.WebhookDelivery
+	for _, item := range f.deliveries {
+		if item.WebhookID == webhookID && item.Error != "" && len(out) < limit {
+			out = append(out, item)
+		}
+	}
+	return out, nil
 }
 
 func (f *webhookManagerFake) DeleteWebhook(_ context.Context, id int64) (bool, error) {
@@ -1658,6 +1679,77 @@ func TestGraphQLRouteIsOptional(t *testing.T) {
 	srv.Close()
 	if !called || resp.StatusCode != http.StatusOK {
 		t.Fatalf("enabled /graphql called=%v status=%d", called, resp.StatusCode)
+func TestWebhookDLQExposesDeliveryLatency(t *testing.T) {
+	manager := &webhookManagerFake{
+		webhooks: []store.Webhook{{ID: 12, URL: "https://receiver.example/hook"}},
+		deliveries: []store.WebhookDelivery{
+			{ID: 34, WebhookID: 12, Event: "issuer_toml_changed", StatusCode: 503,
+				Error: "webhook returned status 503", DeliveryLatencyMS: 912, AttemptedAt: now},
+			{ID: 33, WebhookID: 12, Event: "issuer_toml_changed", StatusCode: 204, AttemptedAt: now},
+		},
+	}
+	codec, err := webhook.NewSecretCodec(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := serverWithWebhooks(manager, codec, "admin-token")
+	defer srv.Close()
+
+	request := func(path string, authorized bool) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, srv.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if authorized {
+			req.Header.Set("Authorization", "Bearer admin-token")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	unauthorized := request("/v1/webhooks/12/dlq", false)
+	unauthorized.Body.Close()
+	if unauthorized.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized DLQ status = %d, want 401", unauthorized.StatusCode)
+	}
+
+	missing := request("/v1/webhooks/99/dlq", true)
+	missing.Body.Close()
+	if missing.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown webhook DLQ status = %d, want 404", missing.StatusCode)
+	}
+
+	resp := request("/v1/webhooks/12/dlq", true)
+	defer resp.Body.Close()
+	var body struct {
+		Deliveries []struct {
+			ID                int64     `json:"id"`
+			WebhookID         int64     `json:"webhook_id"`
+			Event             string    `json:"event"`
+			StatusCode        int       `json:"status_code"`
+			Error             string    `json:"error"`
+			DeliveryLatencyMS int64     `json:"delivery_latency_ms"`
+			AttemptedAt       time.Time `json:"attempted_at"`
+		} `json:"deliveries"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK || len(body.Deliveries) != 1 {
+		t.Fatalf("DLQ status=%d body=%+v", resp.StatusCode, body)
+	}
+	entry := body.Deliveries[0]
+	if entry.ID != 34 || entry.WebhookID != 12 || entry.Event != "issuer_toml_changed" ||
+		entry.StatusCode != 503 || entry.Error == "" || entry.DeliveryLatencyMS != 912 ||
+		!entry.AttemptedAt.Equal(now) {
+		t.Fatalf("DLQ entry = %+v", entry)
+	}
+}
+
 func TestWebhookSecretReturnedOnlyAtCreation(t *testing.T) {
 	manager := &webhookManagerFake{}
 	codec, err := webhook.NewSecretCodec(base64.StdEncoding.EncodeToString(make([]byte, 32)))
