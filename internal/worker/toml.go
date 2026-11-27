@@ -49,6 +49,8 @@ type TomlSync struct {
 	// MaxAge is how long a lookup result is kept before it is refreshed.
 	MaxAge time.Duration
 	Log    *slog.Logger
+	// Now returns the current time. Tests inject a fixed clock.
+	Now func() time.Time
 }
 
 func (t *TomlSync) Run(ctx context.Context) error {
@@ -56,7 +58,7 @@ func (t *TomlSync) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list assets: %w", err)
 	}
-	now := time.Now().UTC()
+	now := t.Now().UTC()
 	for _, a := range assets {
 		if a.TomlCheckedAt != nil && now.Sub(*a.TomlCheckedAt) < t.MaxAge {
 			continue

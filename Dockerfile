@@ -5,7 +5,15 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/plimsoll-indexer ./cmd/plimsoll-indexer
+# Version and commit are embedded so /v1/version and the startup log identify
+# the deploy. Build scripts override them with --build-arg.
+ARG VERSION=dev
+ARG COMMIT=unknown
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
+    -ldflags="-s -w \
+      -X github.com/plimsoll-protocol/plimsoll-indexer/internal/buildinfo.Version=${VERSION} \
+      -X github.com/plimsoll-protocol/plimsoll-indexer/internal/buildinfo.Commit=${COMMIT}" \
+    -o /out/plimsoll-indexer ./cmd/plimsoll-indexer
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /out/plimsoll-indexer /plimsoll-indexer

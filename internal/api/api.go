@@ -118,6 +118,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /openapi.yaml", s.openAPI)
 	mux.HandleFunc("GET /v1/network", s.network)
+	mux.HandleFunc("GET /v1/version", s.version)
 	mux.HandleFunc("GET /v1/assets", s.listAssets)
 	mux.HandleFunc("GET /v1/assets/search", s.searchAssets)
 	mux.HandleFunc("GET /v1/assets/{sac}", s.getAsset)
@@ -355,6 +356,10 @@ func (s *Server) openAPI(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) network(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.Network)
+}
+
+func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, s.Build)
 }
 
 func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
@@ -1188,17 +1193,23 @@ func parseDateRange(w http.ResponseWriter, r *http.Request) (*time.Time, *time.T
 
 func (s *Server) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
+		// A wildcard answer is identical for every origin, so a cache may reuse
+		// it. A restricted answer depends on the request's origin, and must say
+		// so even when the origin is refused: otherwise a cache can store the
+		// refused response (which has no Access-Control-Allow-Origin) and serve
+		// it to an allowed origin.
+		wildcard := false
 		for _, allowed := range s.CORS {
-			if allowed == "*" || allowed == origin {
-				w.Header().Set("Access-Control-Allow-Origin", allowed)
-				w.Header().Set("Vary", "Origin")
+			if allowed == "*" {
+				wildcard = true
 				break
 			}
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Headers", corsAllowHeaders)
+			w.Header().Set("Access-Control-Max-Age", corsMaxAge)
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}

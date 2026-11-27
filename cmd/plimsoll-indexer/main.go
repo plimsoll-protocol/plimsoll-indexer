@@ -49,13 +49,15 @@ func main() {
 		log.Error("invalid configuration", "err", err)
 		os.Exit(1)
 	}
-	if err := run(cfg, log); err != nil {
+	build := buildinfo.Get()
+	log.Info("starting plimsoll-indexer", "version", build.Version, "commit", build.Commit, "go", build.Go)
+	if err := run(cfg, build, log); err != nil {
 		log.Error("indexer stopped", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(cfg config.Config, log *slog.Logger) error {
+func run(cfg config.Config, build buildinfo.Info, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

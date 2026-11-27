@@ -21,7 +21,11 @@ jobs:
       - name: Test
         run: go test -race ./...
       - name: Build
-        run: go build -o bin/plimsoll-indexer ./cmd/plimsoll-indexer
+        run: |
+          go build -trimpath \
+            -ldflags="-X github.com/plimsoll-protocol/plimsoll-indexer/internal/buildinfo.Version=${GITHUB_REF_NAME} \
+              -X github.com/plimsoll-protocol/plimsoll-indexer/internal/buildinfo.Commit=${GITHUB_SHA}" \
+            -o bin/plimsoll-indexer ./cmd/plimsoll-indexer
 
   lint:
     name: lint
