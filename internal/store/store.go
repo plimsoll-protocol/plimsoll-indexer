@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -36,6 +37,17 @@ var ErrWebhookLimit = errors.New("webhook endpoint limit reached")
 
 type Store struct {
 	pool *pgxpool.Pool
+
+	// Publisher receives events newly written by ApplyEvents, after the
+	// transaction that stored them commits, so live API streams see data that
+	// is already readable through the REST endpoints. Nil publishes nothing.
+	Publisher Publisher
+}
+
+// Publisher is the fan-out surface ingestion needs. It must not block: the
+// ingest loop calls it once per page.
+type Publisher interface {
+	Publish(events []any)
 }
 
 type Webhook struct {
@@ -162,9 +174,16 @@ func (s *Store) ApplyEvents(ctx context.Context, name, cursor string, ledger uin
 			return err
 		}
 	}
+	// Only events this transaction actually wrote are published: a replayed
+	// page after a reconnect must not re-send events subscribers already saw.
+	written := make([]any, 0, len(events))
 	for _, ev := range events {
-		if err := applyEvent(ctx, tx, ev); err != nil {
+		inserted, err := applyEvent(ctx, tx, ev)
+		if err != nil {
 			return err
+		}
+		if inserted {
+			written = append(written, ev)
 		}
 	}
 	// GREATEST keeps the recorded event position monotonic, so a page that
@@ -198,7 +217,13 @@ func (s *Store) ApplyEvents(ctx context.Context, name, cursor string, ledger uin
 	if err != nil {
 		return fmt.Errorf("save cursor: %w", err)
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	if s.Publisher != nil && len(written) > 0 {
+		s.Publisher.Publish(written)
+	}
+	return nil
 }
 
 func saveRawEvent(ctx context.Context, tx pgx.Tx, r soroban.RawEvent) error {
@@ -313,16 +338,20 @@ func (s *Store) applyDecoded(ctx context.Context, events []any) error {
 }
 
 func applyEvent(ctx context.Context, tx pgx.Tx, ev any) error {
+// applyEvent writes one decoded event and reports whether it was new, so a
+// re-ingested page is not fanned out a second time.
+func applyEvent(ctx context.Context, tx pgx.Tx, ev any) (bool, error) {
+	var tag pgconn.CommandTag
 	var err error
 	switch e := ev.(type) {
 	case soroban.AssetListed:
-		_, err = tx.Exec(ctx, `
+		tag, err = tx.Exec(ctx, `
 			INSERT INTO assets (sac, code, issuer, listed_ledger, listed_at, event_id)
 			VALUES ($1, $2, $3, $4, $5, $6)
 			ON CONFLICT (sac) DO NOTHING`,
 			e.SAC, e.Code, e.Issuer, int64(e.Ledger), e.ClosedAt, e.ID)
 	case soroban.SupplyPosted:
-		_, err = tx.Exec(ctx, `
+		tag, err = tx.Exec(ctx, `
 			INSERT INTO supply_snapshots
 			  (event_id, sac, amount, at_ledger, breakdown_hash, poster, posted_ledger, posted_at, tx_hash, source)
 			VALUES ($1, $2, $3::numeric, $4, $5, $6, $7, $8, $9, 'event')
@@ -333,7 +362,7 @@ func applyEvent(ctx context.Context, tx pgx.Tx, ev any) error {
 			err = confirmBreakdown(ctx, tx, e.SAC, e.BreakdownHash)
 		}
 	case soroban.ReservePosted:
-		_, err = tx.Exec(ctx, `
+		tag, err = tx.Exec(ctx, `
 			INSERT INTO reserve_reports
 			  (event_id, sac, tier, amount, as_of, reporter, doc_hash, doc_uri, posted_ledger, posted_at, tx_hash, source)
 			VALUES ($1, $2, $3, $4::numeric, $5, $6, $7, $8, $9, $10, $11, 'event')
@@ -347,6 +376,9 @@ func applyEvent(ctx context.Context, tx pgx.Tx, ev any) error {
 		_, err = tx.Exec(ctx, `
 			INSERT INTO reporters (address, role, name, display_name, active, updated_ledger, updated_at)
 			VALUES ($1, $2, $3, NULL, true, $4, $5)
+		tag, err = tx.Exec(ctx, `
+			INSERT INTO reporters (address, role, name, active, updated_ledger, updated_at)
+			VALUES ($1, $2, $3, true, $4, $5)
 			ON CONFLICT (address) DO UPDATE
 			SET role = EXCLUDED.role, name = EXCLUDED.name, active = true,
 			    updated_ledger = EXCLUDED.updated_ledger, updated_at = EXCLUDED.updated_at
@@ -367,7 +399,7 @@ func applyEvent(ctx context.Context, tx pgx.Tx, ev any) error {
 			    updated_at = EXCLUDED.updated_at`,
 			e.Reporter, e.DisplayName, e.WebsiteURI, e.ContactHash, int64(e.Ledger), e.ClosedAt)
 	case soroban.ReporterRevoked:
-		_, err = tx.Exec(ctx, `
+		tag, err = tx.Exec(ctx, `
 			UPDATE reporters SET active = false, updated_ledger = $2, updated_at = $3
 			WHERE address = $1 AND updated_ledger <= $2`,
 			e.Reporter, int64(e.Ledger), e.ClosedAt)
@@ -376,9 +408,137 @@ func applyEvent(ctx context.Context, tx pgx.Tx, ev any) error {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("apply %T: %w", ev, err)
+		return false, fmt.Errorf("apply %T: %w", ev, err)
 	}
-	return nil
+	return tag.RowsAffected() > 0, nil
+}
+
+// ---- event replay ---------------------------------------------------------
+
+// replayLimit bounds one EventsSince call. The stream asks for a batch and
+// calls again until it has caught up.
+const replayLimit = 1000
+
+// EventsSince returns the events stored after eventID in chain order, oldest
+// first. It backs Last-Event-ID resume: a reconnecting stream replays what it
+// missed from the same rows the REST endpoints read.
+//
+// Rows the reconciler recovered from contract state are skipped: they carry
+// synthetic ids instead of the id the chain assigned the event, so they never
+// landed as an event a subscriber could have seen. An empty eventID returns
+// nothing; an unknown one returns whatever sorts after it, which for a cursor
+// older than the stored history is the whole history.
+func (s *Store) EventsSince(ctx context.Context, eventID string, limit int) ([]any, error) {
+	if eventID == "" {
+		return nil, nil
+	}
+	if limit <= 0 || limit > replayLimit {
+		limit = replayLimit
+	}
+
+	type replayable struct {
+		id string
+		ev any
+	}
+	found := make([]replayable, 0, limit)
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT event_id, sac, code, issuer, listed_ledger, listed_at
+		FROM assets WHERE event_id > $1
+		ORDER BY event_id COLLATE "C" LIMIT $2`, eventID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query asset events: %w", err)
+	}
+	for rows.Next() {
+		var e soroban.AssetListed
+		var ledger int64
+		if err := rows.Scan(&e.ID, &e.SAC, &e.Code, &e.Issuer, &ledger, &e.ClosedAt); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan asset event: %w", err)
+		}
+		e.Ledger = uint32(ledger)
+		// Live frames carry the RPC's UTC timestamps; replayed ones must match
+		// them byte-for-byte, so drop whatever zone pgx decoded.
+		e.ClosedAt = e.ClosedAt.UTC()
+		found = append(found, replayable{id: e.ID, ev: e})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read asset events: %w", err)
+	}
+
+	rows, err = s.pool.Query(ctx, `
+		SELECT event_id, sac, amount::text, at_ledger, breakdown_hash, poster,
+		       posted_ledger, posted_at, tx_hash
+		FROM supply_snapshots
+		WHERE event_id > $1 AND source = 'event'
+		ORDER BY event_id COLLATE "C" LIMIT $2`, eventID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query supply events: %w", err)
+	}
+	for rows.Next() {
+		var e soroban.SupplyPosted
+		var amount string
+		var atLedger, postedLedger int64
+		if err := rows.Scan(&e.ID, &e.SAC, &amount, &atLedger, &e.BreakdownHash, &e.Poster,
+			&postedLedger, &e.ClosedAt, &e.TxHash); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan supply event: %w", err)
+		}
+		e.Amount = mustBig(amount)
+		e.AtLedger = uint32(atLedger)
+		e.Ledger = uint32(postedLedger)
+		e.ClosedAt = e.ClosedAt.UTC()
+		found = append(found, replayable{id: e.ID, ev: e})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read supply events: %w", err)
+	}
+
+	rows, err = s.pool.Query(ctx, `
+		SELECT event_id, sac, tier, amount::text, as_of, reporter, doc_hash, doc_uri,
+		       posted_ledger, posted_at, tx_hash
+		FROM reserve_reports
+		WHERE event_id > $1 AND source = 'event'
+		ORDER BY event_id COLLATE "C" LIMIT $2`, eventID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query reserve events: %w", err)
+	}
+	for rows.Next() {
+		var e soroban.ReservePosted
+		var tier int16
+		var amount string
+		var postedLedger int64
+		if err := rows.Scan(&e.ID, &e.SAC, &tier, &amount, &e.AsOf, &e.Reporter, &e.DocHash,
+			&e.DocURI, &postedLedger, &e.ClosedAt, &e.TxHash); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan reserve event: %w", err)
+		}
+		e.Tier = uint32(tier)
+		e.Amount = mustBig(amount)
+		e.Ledger = uint32(postedLedger)
+		e.ClosedAt = e.ClosedAt.UTC()
+		e.AsOf = e.AsOf.UTC()
+		found = append(found, replayable{id: e.ID, ev: e})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read reserve events: %w", err)
+	}
+
+	// Merge the per-table pages. Event ids are zero-padded TOIDs, so byte
+	// order is chain order; sorting the merged set keeps one table's page from
+	// being sent before another's.
+	sort.Slice(found, func(i, j int) bool { return found[i].id < found[j].id })
+	if len(found) > limit {
+		found = found[:limit]
+	}
+	out := make([]any, len(found))
+	for i, r := range found {
+		out[i] = r.ev
+	}
+	return out, nil
 }
 
 // ---- reads ----------------------------------------------------------------

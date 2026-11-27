@@ -26,6 +26,7 @@ import (
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/changelog"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/events"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/webhook"
 )
@@ -50,6 +51,8 @@ type Reader interface {
 	Breakdown(ctx context.Context, hash string) ([]byte, error)
 	Attestation(ctx context.Context, sac string) (store.Attestation, error)
 	Progress(ctx context.Context, name string) (store.Progress, error)
+	// EventsSince backs Last-Event-ID resume from stored events.
+	EventsSince(ctx context.Context, after string, limit int) ([]any, error)
 }
 
 // CoverageWebhookStore is what the API needs to manage coverage threshold
@@ -101,6 +104,20 @@ type Server struct {
 	// Changelog is the breaking-change history served at /v1/changelog. It is
 	// loaded from the hand-maintained CHANGELOG.yaml at start-up.
 	Changelog []changelog.Entry
+	Network           NetworkInfo
+	CORS              []string
+	Log               *slog.Logger
+	Now               func() time.Time
+
+	// Events is the live broadcaster fed by ingestion. Nil answers 503.
+	Events *events.Hub
+	// EventHeartbeat is how often an idle stream gets a keepalive comment;
+	// EventWriteTimeout bounds one socket write. Both have defaults.
+	EventHeartbeat    time.Duration
+	EventWriteTimeout time.Duration
+	// Done, when closed, ends streaming handlers so graceful shutdown does
+	// not wait on connections that never go idle.
+	Done <-chan struct{}
 }
 
 // WebhookManager manages the endpoints of one API key. apiKey is the
@@ -130,6 +147,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/reporters", s.reporters)
 	mux.HandleFunc("GET /v1/changelog", s.changelog)
 	mux.HandleFunc("GET /v1/breakdowns/{hash}", s.breakdown)
+	mux.HandleFunc("GET /v1/events", s.events)
 	mux.HandleFunc("POST /v1/webhooks", s.createWebhook)
 	mux.HandleFunc("GET /v1/webhooks", s.listWebhooks)
 	mux.HandleFunc("DELETE /v1/webhooks/{id}", s.deleteWebhook)
