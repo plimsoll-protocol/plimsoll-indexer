@@ -224,6 +224,7 @@ func TestReporterSetPersistsDisplayNameAndPreservesMetadata(t *testing.T) {
 	s, _ := openStore(t)
 	ctx := context.Background()
 	at := time.Date(2026, 11, 25, 5, 0, 0, 0, time.UTC)
+	displayName, websiteURI, contactHash := "Acme Inc.", "https://acme.example", "aabbcc"
 
 	registered := soroban.ReporterSet{
 		Meta:     soroban.Meta{ID: "reporter-set-1", Ledger: 100, ClosedAt: at},
@@ -234,19 +235,24 @@ func TestReporterSetPersistsDisplayNameAndPreservesMetadata(t *testing.T) {
 	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-1", 100, []any{registered}); err != nil {
 		t.Fatalf("apply registration: %v", err)
 	}
-	if _, err := s.pool.Exec(ctx, `
-		UPDATE reporters SET website_uri = $2, contact_hash = $3 WHERE address = $1`,
-		registered.Reporter, "https://acme.example", "sha256:contact"); err != nil {
-		t.Fatal(err)
+	metadataEvent := soroban.ReporterMetadataUpdated{
+		Meta:        soroban.Meta{ID: "reporter-metadata-1", Ledger: 101, ClosedAt: at.Add(time.Minute)},
+		Reporter:    registered.Reporter,
+		DisplayName: &displayName,
+		WebsiteURI:  &websiteURI,
+		ContactHash: &contactHash,
+	}
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-2", 101, []any{metadataEvent}); err != nil {
+		t.Fatalf("apply reporter metadata: %v", err)
 	}
 
 	updated := registered
 	updated.ID = "reporter-set-2"
-	updated.Ledger = 101
-	updated.ClosedAt = at.Add(time.Minute)
+	updated.Ledger = 102
+	updated.ClosedAt = at.Add(2 * time.Minute)
 	updated.Role = coverage.RoleTranscriber
 	updated.Name = "Acme Updated"
-	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-2", 101, []any{updated}); err != nil {
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-3", 102, []any{updated}); err != nil {
 		t.Fatalf("apply update: %v", err)
 	}
 
@@ -258,11 +264,52 @@ func TestReporterSetPersistsDisplayNameAndPreservesMetadata(t *testing.T) {
 		t.Fatalf("got %d reporters, want 1", len(reporters))
 	}
 	got := reporters[0]
-	if got.Name != "Acme Updated" || got.DisplayName != "Acme Updated" ||
+	if got.Name != "Acme Updated" || got.DisplayName != displayName ||
 		got.Role != coverage.RoleTranscriber || got.WebsiteURI == nil ||
-		*got.WebsiteURI != "https://acme.example" || got.ContactHash == nil ||
-		*got.ContactHash != "sha256:contact" {
+		*got.WebsiteURI != websiteURI || got.ContactHash == nil ||
+		*got.ContactHash != contactHash {
 		t.Fatalf("reporter metadata after update = %+v", got)
+	}
+
+	if _, err := s.SaveChainReporter(ctx, coverage.Reporter{
+		Address: registered.Reporter, Role: updated.Role, Name: updated.Name,
+		DisplayName: displayName, WebsiteURI: &websiteURI, ContactHash: &contactHash,
+	}); err != nil {
+		t.Fatalf("save reporter state: %v", err)
+	}
+	if _, err := s.SaveChainReporter(ctx, coverage.Reporter{
+		Address: registered.Reporter, Role: updated.Role, Name: updated.Name,
+	}); err != nil {
+		t.Fatalf("clear reporter state metadata: %v", err)
+	}
+	reporters, err = s.Reporters(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reporters[0].DisplayName != updated.Name || reporters[0].WebsiteURI != nil || reporters[0].ContactHash != nil {
+		t.Fatalf("reporter metadata after chain clear = %+v", reporters[0])
+	}
+}
+
+func TestReporterMetadataEventKeepsAddressForReconciliation(t *testing.T) {
+	s, _ := openStore(t)
+	ctx := context.Background()
+	displayName := "Acme Inc."
+	event := soroban.ReporterMetadataUpdated{
+		Meta:        soroban.Meta{ID: "reporter-metadata-only", Ledger: 100, ClosedAt: time.Now().UTC()},
+		Reporter:    "GREPORTER",
+		DisplayName: &displayName,
+	}
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-metadata-only", 100, []any{event}); err != nil {
+		t.Fatal(err)
+	}
+	reporters, err := s.Reporters(ctx)
+	if err != nil || len(reporters) != 0 {
+		t.Fatalf("metadata-only event exposed an incomplete reporter: %+v, %v", reporters, err)
+	}
+	addresses, err := s.AllReporterAddresses(ctx)
+	if err != nil || len(addresses) != 1 || addresses[0] != event.Reporter {
+		t.Fatalf("metadata-only event lost its reporter address: %v, %v", addresses, err)
 	}
 }
 

@@ -1,6 +1,7 @@
 package soroban
 
 import (
+	"fmt"
 	"math/big"
 	"time"
 
@@ -12,6 +13,12 @@ import (
 type ReporterState struct {
 	Role uint32
 	Name string
+}
+
+type ReporterMetadataState struct {
+	DisplayName *string
+	WebsiteURI  *string
+	ContactHash *string
 }
 
 // DecodeReporterState reads what get_reporter returns. A reporter that has
@@ -33,6 +40,43 @@ func DecodeReporterState(v xdr.ScVal) (*ReporterState, error) {
 		return nil, err
 	}
 	return &ReporterState{Role: role, Name: name}, nil
+}
+
+// DecodeReporterMetadata reads what get_reporter_metadata returns. A reporter
+// with no published metadata decodes to (nil, nil).
+func DecodeReporterMetadata(v xdr.ScVal) (*ReporterMetadataState, error) {
+	if v.Type == xdr.ScValTypeScvVoid {
+		return nil, nil
+	}
+	f, err := Fields(v)
+	if err != nil {
+		return nil, err
+	}
+	name, err := optionalMetadataField(f, "name", AsSymbol)
+	if err != nil {
+		return nil, err
+	}
+	websiteURI, err := optionalMetadataField(f, "website_uri", AsString)
+	if err != nil {
+		return nil, err
+	}
+	contactHash, err := optionalMetadataField(f, "contact_hash", AsHex)
+	if err != nil {
+		return nil, err
+	}
+	return &ReporterMetadataState{
+		DisplayName: name,
+		WebsiteURI:  websiteURI,
+		ContactHash: contactHash,
+	}, nil
+}
+
+func optionalMetadataField(fields map[string]xdr.ScVal, name string, decode func(xdr.ScVal) (string, error)) (*string, error) {
+	value, ok := fields[name]
+	if !ok {
+		return nil, fmt.Errorf("missing field %q", name)
+	}
+	return decodeOptionalString(value, decode)
 }
 
 // SupplyState is the coverage ledger's current snapshot for one asset, as

@@ -45,10 +45,11 @@ type reconcileStore interface {
 // Reading is simulation, which needs no key and costs nothing, so this runs on
 // any instance whether or not it can sign.
 type Reconciler struct {
-	Invoker  contractReader
-	Store    reconcileStore
-	LedgerID string
-	Log      *slog.Logger
+	Invoker            contractReader
+	Store              reconcileStore
+	LedgerID           string
+	ReporterRegistryID string
+	Log                *slog.Logger
 }
 
 // Tiers are checked in full because a report can be posted at any of them.
@@ -173,7 +174,7 @@ func (rc *Reconciler) reconcileReporters(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("reporter %s: %w", addr, err))
 			continue
 		}
-		res, err := rc.Invoker.Read(ctx, rc.LedgerID, "get_reporter", []xdr.ScVal{addrVal})
+		res, err := rc.Invoker.Read(ctx, rc.ReporterRegistryID, "get_reporter", []xdr.ScVal{addrVal})
 		if err != nil {
 			errs = append(errs, fmt.Errorf("get_reporter %s: %w", addr, err))
 			continue
@@ -184,12 +185,29 @@ func (rc *Reconciler) reconcileReporters(ctx context.Context) error {
 			continue
 		}
 		if state != nil {
-			added, err := rc.Store.SaveChainReporter(ctx, coverage.Reporter{
-				Address:     addr,
-				Role:        state.Role,
-				Name:        state.Name,
-				DisplayName: state.Name,
-			})
+			metadataVal, err := rc.Invoker.Read(ctx, rc.ReporterRegistryID, "get_reporter_metadata", []xdr.ScVal{addrVal})
+			if err != nil {
+				errs = append(errs, fmt.Errorf("get_reporter_metadata %s: %w", addr, err))
+				continue
+			}
+			metadata, err := soroban.DecodeReporterMetadata(metadataVal)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("decode get_reporter_metadata %s: %w", addr, err))
+				continue
+			}
+			reporter := coverage.Reporter{
+				Address: addr,
+				Role:    state.Role,
+				Name:    state.Name,
+			}
+			if metadata != nil {
+				if metadata.DisplayName != nil {
+					reporter.DisplayName = *metadata.DisplayName
+				}
+				reporter.WebsiteURI = metadata.WebsiteURI
+				reporter.ContactHash = metadata.ContactHash
+			}
+			added, err := rc.Store.SaveChainReporter(ctx, reporter)
 			if err != nil {
 				errs = append(errs, err)
 				continue

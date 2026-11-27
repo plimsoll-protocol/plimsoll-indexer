@@ -168,11 +168,25 @@ func applyEvent(ctx context.Context, tx pgx.Tx, ev any) error {
 	case soroban.ReporterSet:
 		_, err = tx.Exec(ctx, `
 			INSERT INTO reporters (address, role, name, display_name, active, updated_ledger, updated_at)
-			VALUES ($1, $2, $3, $3, true, $4, $5)
+			VALUES ($1, $2, $3, NULL, true, $4, $5)
 			ON CONFLICT (address) DO UPDATE
-			SET role = EXCLUDED.role, name = EXCLUDED.name, display_name = EXCLUDED.display_name, active = true,
+			SET role = EXCLUDED.role, name = EXCLUDED.name, active = true,
 			    updated_ledger = EXCLUDED.updated_ledger, updated_at = EXCLUDED.updated_at`,
 			e.Reporter, int16(e.Role), e.Name, int64(e.Ledger), e.ClosedAt)
+	case soroban.ReporterMetadataUpdated:
+		// An inactive placeholder lets reconciliation recover registration details
+		// when the corresponding reporter_set event has aged out of RPC retention.
+		_, err = tx.Exec(ctx, `
+			INSERT INTO reporters
+			  (address, role, name, display_name, website_uri, contact_hash, active, updated_ledger, updated_at)
+			VALUES ($1, 0, '', $2, $3, $4, false, $5, $6)
+			ON CONFLICT (address) DO UPDATE
+			SET display_name = EXCLUDED.display_name,
+			    website_uri = EXCLUDED.website_uri,
+			    contact_hash = EXCLUDED.contact_hash,
+			    updated_ledger = EXCLUDED.updated_ledger,
+			    updated_at = EXCLUDED.updated_at`,
+			e.Reporter, e.DisplayName, e.WebsiteURI, e.ContactHash, int64(e.Ledger), e.ClosedAt)
 	case soroban.ReporterRevoked:
 		_, err = tx.Exec(ctx, `
 			UPDATE reporters SET active = false, updated_ledger = $2, updated_at = $3
@@ -303,7 +317,7 @@ func (s *Store) queryReports(ctx context.Context, sql string, args ...any) ([]co
 
 func (s *Store) Reporters(ctx context.Context) ([]coverage.Reporter, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT address, role, name, display_name, website_uri, contact_hash, updated_at FROM reporters
+		SELECT address, role, name, COALESCE(display_name, name), website_uri, contact_hash, updated_at FROM reporters
 		WHERE active ORDER BY role, name`)
 	if err != nil {
 		return nil, err
@@ -564,25 +578,30 @@ func (s *Store) ReportReporterAddresses(ctx context.Context) ([]string, error) {
 }
 
 // SaveChainReporter upserts a reporter read back from the registry contract.
-// It returns true when the row was new or changed (role, name, or active status).
+// It returns true when any stored registry field changed.
 // updated_ledger is set to 0 because the reconciler reads current state without
 // knowing which specific ledger set it.
 func (s *Store) SaveChainReporter(ctx context.Context, r coverage.Reporter) (bool, error) {
-	displayName := r.DisplayName
-	if displayName == "" {
-		displayName = r.Name
+	var displayName *string
+	if r.DisplayName != "" {
+		displayName = &r.DisplayName
 	}
 	tag, err := s.pool.Exec(ctx, `
-		INSERT INTO reporters (address, role, name, display_name, active, updated_ledger, updated_at)
-		VALUES ($1, $2, $3, $4, true, 0, now())
+		INSERT INTO reporters
+		  (address, role, name, display_name, website_uri, contact_hash, active, updated_ledger, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, true, 0, now())
 		ON CONFLICT (address) DO UPDATE
-		SET role = EXCLUDED.role, name = EXCLUDED.name, display_name = EXCLUDED.display_name, active = true,
+		SET role = EXCLUDED.role, name = EXCLUDED.name,
+		    display_name = EXCLUDED.display_name, website_uri = EXCLUDED.website_uri,
+		    contact_hash = EXCLUDED.contact_hash, active = true,
 		    updated_at = now()
 		WHERE reporters.active = false
 		   OR reporters.role <> EXCLUDED.role
 		   OR reporters.name <> EXCLUDED.name
-		   OR reporters.display_name <> EXCLUDED.display_name`,
-		r.Address, int16(r.Role), r.Name, displayName)
+		   OR reporters.display_name IS DISTINCT FROM EXCLUDED.display_name
+		   OR reporters.website_uri IS DISTINCT FROM EXCLUDED.website_uri
+		   OR reporters.contact_hash IS DISTINCT FROM EXCLUDED.contact_hash`,
+		r.Address, int16(r.Role), r.Name, displayName, r.WebsiteURI, r.ContactHash)
 	if err != nil {
 		return false, fmt.Errorf("save chain reporter: %w", err)
 	}

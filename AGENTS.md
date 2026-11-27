@@ -36,6 +36,7 @@ internal/api/           HTTP handlers (Go 1.22 mux patterns)
 | `supply_posted` | sym, sac | amount i128, ledger u32, breakdown_hash bytes, poster |
 | `reserve_posted` | sym, sac, tier u32 | amount i128, as_of u64, reporter, doc_hash bytes, doc_uri string |
 | `reporter_set` | sym, reporter | role u32, name string |
+| `reporter_metadata_updated` | sym, reporter | name symbol?, website_uri string?, contact_hash bytes? |
 | `reporter_revoked` | sym, reporter | — |
 
 ## Rules that matter
