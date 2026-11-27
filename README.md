@@ -194,6 +194,9 @@ or reverse-proxy layer when needed.
 | `plimsoll_supply_post_last_age_seconds` | Gauge | `asset_sac` | Seconds since each asset's last successful supply post |
 | `plimsoll_http_requests_total` | Counter | `method`, `path`, `status` | HTTP request totals by route and status |
 | `plimsoll_http_request_duration_seconds` | Histogram | `method`, `path` | HTTP request latency in seconds |
+`/v1/assets/{sac}`, `/v1/network` and `/v1/breakdowns/{hash}` return an `ETag`;
+send it back as `If-None-Match` and the API answers `304 Not Modified` with no
+body while the representation is unchanged.
 
 Coverage in the API uses the same selection and rounding rules as the contract
 (`internal/coverage`), so the API and `coverage()` on-chain agree.

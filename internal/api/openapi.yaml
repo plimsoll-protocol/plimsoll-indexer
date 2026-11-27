@@ -61,6 +61,9 @@ paths:
       responses:
         '200':
           description: Network discovery parameters
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
           content:
             application/json:
               schema:
@@ -76,6 +79,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/BuildInfo'
+        '304':
+          $ref: '#/components/responses/NotModified'
   /v1/assets:
     get:
       summary: List all tracked assets with coverage and reports
@@ -202,6 +207,39 @@ paths:
           in: query
           required: false
           description: Maximum age of the supply snapshot and report, as a Go duration
+      responses:
+        '200':
+          description: Asset details and current status
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Asset'
+        '304':
+          $ref: '#/components/responses/NotModified'
+        '400':
+          description: Invalid request parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Asset not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/assets/{sac}/supply:
+    get:
+      summary: Get historical supply snapshots for an asset
+      operationId: getSupplyHistory
+      parameters:
+        - name: sac
+          in: path
+          required: true
+          description: Stellar Asset Contract (SAC) address
           schema:
             type: string
             example: "24h"
@@ -554,6 +592,90 @@ paths:
                   status:
                     type: integer
 components:
+                  webhooks:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Webhook'
+                required: [webhooks]
+        '401':
+          description: Missing or invalid administrator token
+        '503':
+          description: Webhook management is not configured
+  /v1/webhooks/{id}:
+    delete:
+      summary: Delete a registered webhook
+      operationId: deleteWebhook
+      security:
+        - WebhookAdminAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        '204':
+          description: Webhook deleted
+        '400':
+          description: Invalid webhook ID
+        '401':
+          description: Missing or invalid administrator token
+        '404':
+          description: Webhook not found
+  /v1/breakdowns/{hash}:
+    get:
+      summary: Get raw supply breakdown by hash
+      operationId: getBreakdown
+      parameters:
+        - name: hash
+          in: path
+          required: true
+          description: SHA-256 breakdown hash, 64 hex characters
+          schema:
+            type: string
+            pattern: '^[0-9a-fA-F]{64}$'
+      responses:
+        '200':
+          description: Raw JSON breakdown served verbatim
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                type: object
+        '304':
+          $ref: '#/components/responses/NotModified'
+        '400':
+          description: Hash is not 64 hex characters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Breakdown hash not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+components:
+  securitySchemes:
+    WebhookAdminAuth:
+      type: http
+      scheme: bearer
+  headers:
+    ETag:
+      description: Validator for the response body. Send it back in If-None-Match and the server answers 304 Not Modified while the body is unchanged.
+      schema:
+        type: string
+        example: '"3f7a9c0d8b1e4a6c2d5f8e0b3a7c9d1e"'
+  responses:
+    NotModified:
+      description: The client's cached copy is still current; the body is empty.
+      headers:
+        ETag:
+          $ref: '#/components/headers/ETag'
   schemas:
     BuildInfo:
       type: object
