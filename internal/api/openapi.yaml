@@ -266,6 +266,13 @@ paths:
       responses:
         '200':
           description: Supply history snapshots
+          headers:
+            X-Total-Count:
+              description: Total number of matching supply snapshots, before applying limit.
+              schema:
+                type: integer
+                format: int64
+                minimum: 0
           content:
             application/json:
               schema:
@@ -324,6 +331,14 @@ paths:
       responses:
         '200':
           description: Covered assets
+          description: Reserve report history
+          headers:
+            X-Total-Count:
+              description: Total number of matching reserve reports, before applying limit.
+              schema:
+                type: integer
+                format: int64
+                minimum: 0
           content:
             application/json:
               schema:
