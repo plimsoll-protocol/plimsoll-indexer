@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
 )
 
@@ -222,5 +223,96 @@ func TestPoolConfigRejectsBadURL(t *testing.T) {
 		t.Fatal("poolConfig on a malformed URL = nil error, want error")
 	} else if !strings.Contains(err.Error(), "parse database url") {
 		t.Errorf("error = %q, want it to name the failure", err)
+func TestListIssuersPageOrdersByAssetCount(t *testing.T) {
+	s, _ := openStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+
+	events := []any{
+		soroban.AssetListed{Meta: eventMeta("ev-issuer-a", 10, base), SAC: "CSAC1", Code: "AAA", Issuer: "GISS"},
+		soroban.AssetListed{Meta: eventMeta("ev-issuer-b", 11, base), SAC: "CSAC2", Code: "BBB", Issuer: "GISS"},
+		soroban.AssetListed{Meta: eventMeta("ev-issuer-c", 12, base), SAC: "CSAC3", Code: "CCC", Issuer: "GAUD"},
+	}
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "c", 12, nil, events); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := s.ListIssuersPage(ctx, 1, -1, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 || first[0].Address != "GISS" || len(first[0].Assets) != 2 {
+		t.Fatalf("first page = %+v, want GISS with two assets", first)
+	}
+	if first[0].Assets[0].Code != "AAA" || first[0].Assets[1].Code != "BBB" {
+		t.Errorf("GISS assets = %+v, want them in code order", first[0].Assets)
+	}
+
+	second, err := s.ListIssuersPage(ctx, 1, len(first[0].Assets), first[0].Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != 1 || second[0].Address != "GAUD" || len(second[0].Assets) != 1 {
+		t.Fatalf("second page = %+v, want GAUD with one asset", second)
+	}
+
+	empty, err := s.ListIssuersPage(ctx, 1, len(second[0].Assets), second[0].Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("page after the last issuer = %+v, want none", empty)
+	}
+}
+
+func TestReportersSoftDeleteKeepsTheRow(t *testing.T) {
+	s, url := openStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+
+	set := soroban.ReporterSet{Meta: eventMeta("ev-reporter-set", 10, base), Reporter: "GREP", Role: 2, Name: "Reporter"}
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "c1", 10, nil, []any{set}); err != nil {
+		t.Fatal(err)
+	}
+	live, err := s.Reporters(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(live) != 1 || live[0].Address != "GREP" || live[0].DeletedAt != nil {
+		t.Fatalf("live reporters = %+v, want GREP with no deleted_at", live)
+	}
+
+	revokedAt := base.Add(time.Minute)
+	revoke := soroban.ReporterRevoked{Meta: eventMeta("ev-reporter-revoked", 11, revokedAt), Reporter: "GREP"}
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "c2", 11, nil, []any{revoke}); err != nil {
+		t.Fatal(err)
+	}
+	if live, err = s.Reporters(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(live) != 0 {
+		t.Fatalf("live reporters = %+v, want the revoked reporter hidden by default", live)
+	}
+	all, err := s.Reporters(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 || all[0].DeletedAt == nil || !all[0].DeletedAt.Equal(revokedAt) {
+		t.Fatalf("reporters with deleted = %+v, want GREP deleted at %v", all, revokedAt)
+	}
+	if counts := tableCounts(t, url, "reporters"); counts["reporters"] != 1 {
+		t.Fatalf("reporters table has %d rows, want the soft-deleted row kept", counts["reporters"])
+	}
+
+	// Re-registering the address brings the reporter back.
+	again := soroban.ReporterSet{Meta: eventMeta("ev-reporter-back", 12, base.Add(2*time.Minute)), Reporter: "GREP", Role: 3, Name: "Reporter"}
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "c3", 12, nil, []any{again}); err != nil {
+		t.Fatal(err)
+	}
+	if live, err = s.Reporters(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(live) != 1 || live[0].DeletedAt != nil || live[0].Role != coverage.RoleSupplyPoster {
+		t.Fatalf("live reporters after re-registration = %+v, want GREP live again as a supply poster", live)
 	}
 }
