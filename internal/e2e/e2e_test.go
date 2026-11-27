@@ -169,6 +169,10 @@ func (m *memStore) ApplyEvents(_ context.Context, _, cursor string, ledger uint3
 	return nil
 }
 
+func (*memStore) LatestReporterReports(context.Context) ([]store.ReporterLatestReport, error) {
+	return nil, nil
+}
+
 // The contracts are not deployed to a fresh quickstart network, so this checks
 // the ingest loop against real RPC: it must start from the live ledger, page
 // without error and advance its cursor with nothing to decode.

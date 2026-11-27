@@ -129,6 +129,12 @@ func run(cfg config.Config, build buildinfo.Info, log *slog.Logger) error {
 		StartLedger: cfg.StartLedger,
 		Workers:     cfg.IngestWorkers,
 		Log:         log.With("job", "ingest"),
+		RPC:                    rpc,
+		Store:                  db,
+		ContractIDs:            []string{cfg.CoverageLedgerID, cfg.ReporterRegistryID},
+		StartLedger:            cfg.StartLedger,
+		ReporterStaleThreshold: cfg.ReporterStaleThreshold,
+		Log:                    log.With("job", "ingest"),
 	}
 	// Ingest once before the other jobs start, so they see the listed assets.
 	if err := ingester.Run(ctx); err != nil {

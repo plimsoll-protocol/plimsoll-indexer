@@ -43,6 +43,8 @@ values are reported together at startup.
 | `SECRETS_PROVIDER` | `env` | `env`, `ssm` (AWS Systems Manager Parameter Store) or `gcp` (GCP Secret Manager). |
 | `SUPPLY_POSTER_SECRET_NAME` | empty | SSM parameter or GCP secret holding the poster secret. Empty keeps `SUPPLY_POSTER_SECRET`. |
 | `DATABASE_PASSWORD_SECRET_NAME` | empty | SSM parameter or GCP secret holding the database password. Empty keeps the password in `DATABASE_URL`. |
+| `REPORTER_STALE_THRESHOLD` | `720h` | Warn once per ingest cycle when an active reporter's newest report `as_of` is older than this duration. `0` disables the check. |
+| `SUPPLY_POSTER_SECRET` | empty | Empty runs read-only. Never log or share it. |
 | `WEBHOOK_ADMIN_TOKEN` | empty | Enables authenticated webhook management when set with `WEBHOOK_ENCRYPTION_KEY`. |
 | `WEBHOOK_API_KEYS` | empty | Optional comma-separated owner API keys; each can delete only its own webhooks. |
 | `WEBHOOK_ENCRYPTION_KEY` | empty | Base64-encoded 32-byte key (`openssl rand -base64 32`); keep stable to preserve webhook delivery. |
@@ -152,6 +154,7 @@ Logs are JSON (`log/slog`). Key messages:
 | warn | `ingest cursor is older than RPC retention...` | Ingestion was down longer than RPC's ~7 days. Events in the gap are gone from RPC; the reconciler repairs the latest state. |
 | warn | `start ledger is outside RPC retention` | `START_LEDGER` is too old and was clamped. |
 | warn | `rpc node is rate limiting; backing off` (`attempt`, `wait`) | The RPC node answered `429 Too Many Requests`. The request is retried after `Retry-After` when the node sends it, otherwise after a delay that doubles per attempt. Frequent entries mean the node's limit is too low for the ingest interval. |
+| warn | `reporter report is stale` (`reporter`, `age`) | An active reporter's latest report date is older than `REPORTER_STALE_THRESHOLD`. |
 | warn | `recovered a supply snapshot / reserve report from contract state...` | The reconciler filled a gap. Rows are marked `"source": "chain"` with no `tx_hash`. |
 | info | `coverage below webhook threshold` (`webhook_id`, `sac`, `bps`, `min_bps`) | A registered alert fired. |
 | warn | `webhook delivery failed` (`webhook_id`, `delivery_id`, `status`, `retry_at`) | Delivery will be retried with backoff, at most five attempts in total. |
