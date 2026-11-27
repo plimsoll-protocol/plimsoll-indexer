@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 
@@ -29,20 +30,26 @@ func (r compressionReader) ListAssets(context.Context) ([]coverage.Asset, error)
 func (compressionReader) GetAsset(context.Context, string) (coverage.Asset, error) {
 	return coverage.Asset{}, store.ErrNotFound
 }
-func (compressionReader) LatestSupply(context.Context, string) (*coverage.Supply, error) {
-	return nil, nil
+func (compressionReader) LatestSupplies(context.Context, []string) (map[string]*coverage.Supply, error) {
+	return map[string]*coverage.Supply{}, nil
 }
 func (compressionReader) SupplyHistory(context.Context, string, int) ([]coverage.Supply, error) {
 	return nil, nil
 }
-func (compressionReader) LatestReports(context.Context, string) (map[uint32]coverage.Report, error) {
-	return map[uint32]coverage.Report{}, nil
+func (compressionReader) LatestReportsBySAC(context.Context, []string) (map[string]map[uint32]coverage.Report, error) {
+	return map[string]map[uint32]coverage.Report{}, nil
 }
 func (compressionReader) ReportHistory(context.Context, string, int) ([]coverage.Report, error) {
 	return nil, nil
 }
+func (compressionReader) ReportExportPage(context.Context, string, *time.Time, *time.Time, *store.ReportExportCursor, int) ([]store.ReportExportRow, error) {
+	return nil, nil
+}
 func (compressionReader) Reporters(context.Context) ([]coverage.Reporter, error) {
 	return nil, nil
+}
+func (compressionReader) Attestation(context.Context, string) (store.Attestation, error) {
+	return store.Attestation{}, store.ErrNotFound
 }
 func (compressionReader) Breakdown(context.Context, string) ([]byte, error) {
 	return nil, store.ErrNotFound

@@ -22,9 +22,10 @@ func (tomlTestHorizon) HomeDomain(context.Context, string) (string, error) {
 }
 
 type tomlTestStore struct {
-	assets  []coverage.Asset
-	hashes  map[string]string
-	changed int
+	assets       []coverage.Asset
+	hashes       map[string]string
+	changed      int
+	attestations []string
 }
 
 func (s *tomlTestStore) ListAssets(context.Context) ([]coverage.Asset, error) {
@@ -32,6 +33,11 @@ func (s *tomlTestStore) ListAssets(context.Context) ([]coverage.Asset, error) {
 }
 
 func (s *tomlTestStore) SaveToml(context.Context, string, []byte, string, time.Time) error {
+	return nil
+}
+
+func (s *tomlTestStore) RecordAttestation(_ context.Context, sac, url, hash string, _ time.Time) error {
+	s.attestations = append(s.attestations, sac+" "+url+" "+hash)
 	return nil
 }
 

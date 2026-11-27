@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -40,7 +41,6 @@ func TestLoadMigrationsRejectsMistakes(t *testing.T) {
 	}{
 		"gap":          {fstest.MapFS{"0001_a.sql": sql, "0003_c.sql": sql}, "migration 0002 is missing"},
 		"no first":     {fstest.MapFS{"0002_b.sql": sql}, "migration 0001 is missing"},
-		"duplicate":    {fstest.MapFS{"0001_a.sql": sql, "0001_b.sql": sql}, "two migrations have version 0001"},
 		"no number":    {fstest.MapFS{"initial.sql": sql}, `"initial.sql" is not named`},
 		"short number": {fstest.MapFS{"1_initial.sql": sql}, `"1_initial.sql" is not named`},
 		"not sql":      {fstest.MapFS{"0001_a.txt": sql}, `"0001_a.txt" is not named`},
@@ -55,6 +55,21 @@ func TestLoadMigrationsRejectsMistakes(t *testing.T) {
 				t.Fatalf("err = %v, want it to contain %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestLoadMigrationsGroupsSharedVersionsByName(t *testing.T) {
+	ms, err := loadMigrations(fstest.MapFS{
+		"0001_second.sql": {Data: []byte("SELECT 2")},
+		"0001_first.sql":  {Data: []byte("SELECT 1")},
+		"0002_next.sql":   {Data: []byte("SELECT 3")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ms) != 3 || ms[0].Name != "first" || ms[1].Name != "second" ||
+		ms[0].Version != 1 || ms[1].Version != 1 || ms[2].Version != 2 {
+		t.Fatalf("migrations = %+v", ms)
 	}
 }
 
@@ -107,6 +122,23 @@ func schemaOf(t *testing.T, url string) []string {
 	return out
 }
 
+// embeddedVersions is every migration version compiled into the binary, in
+// order: what a database is at once Open has run.
+func embeddedVersions(t *testing.T) []int {
+	t.Helper()
+	ms, err := loadMigrations(migrationsFS())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []int
+	for i, m := range ms {
+		if i == 0 || m.Version != ms[i-1].Version {
+			out = append(out, m.Version)
+		}
+	}
+	return out
+}
+
 func appliedVersions(t *testing.T, url string) []int {
 	t.Helper()
 	ctx := context.Background()
@@ -151,8 +183,8 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 	if len(want) == 0 {
 		t.Fatal("fresh database has no schema")
 	}
-	if got := appliedVersions(t, fresh); len(got) != 4 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 {
-		t.Fatalf("fresh database recorded %v, want [1 2 3 4]", got)
+	if got, want := appliedVersions(t, fresh), embeddedVersions(t); !slices.Equal(got, want) {
+		t.Fatalf("fresh database recorded %v, want %v", got, want)
 	}
 
 	for name, schema := range map[string]string{
@@ -167,6 +199,11 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 			execSQL(t, url, `INSERT INTO breakdowns (hash, sac, body) VALUES ('h1', 'CSAC', '{"total":"5"}')`)
 			execSQL(t, url, `INSERT INTO reporters (address, role, name, active, updated_ledger, updated_at)
 				VALUES ('GREPORTER', 1, 'Acme', true, 7, now())`)
+			// The snapshot that h1 backs, so the breakdown is confirmed and served
+			// after the upgrade (the breakdown_confirmation migration).
+			execSQL(t, url, `INSERT INTO supply_snapshots
+				(event_id, sac, amount, at_ledger, breakdown_hash, poster, posted_ledger, posted_at, tx_hash)
+				VALUES ('ev-h1', 'CSAC', 5, 7, 'h1', 'GPOSTER', 8, now(), 'tx-h1')`)
 
 			s, err := Open(context.Background(), url)
 			if err != nil {
@@ -177,8 +214,8 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 			if d := schemaDiff(want, schemaOf(t, url)); len(d) > 0 {
 				t.Fatalf("schema differs from a fresh database:\n%s", strings.Join(d, "\n"))
 			}
-			if got := appliedVersions(t, url); len(got) != 4 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 {
-				t.Fatalf("recorded %v, want [1 2 3 4]", got)
+			if got, want := appliedVersions(t, url), embeddedVersions(t); !slices.Equal(got, want) {
+				t.Fatalf("recorded %v, want %v", got, want)
 			}
 			a, err := s.GetAsset(context.Background(), "CSAC")
 			if err != nil || a.Code != "PUSD" {
@@ -203,8 +240,8 @@ func TestReopeningAppliesNothingTwice(t *testing.T) {
 		t.Fatal(err)
 	}
 	s2.Close()
-	if got := appliedVersions(t, url); len(got) != 4 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 {
-		t.Fatalf("recorded %v, want [1 2 3 4]", got)
+	if got, want := appliedVersions(t, url), embeddedVersions(t); !slices.Equal(got, want) {
+		t.Fatalf("recorded %v, want %v", got, want)
 	}
 }
 
@@ -236,8 +273,8 @@ func TestConcurrentStartsDoNotRace(t *testing.T) {
 	for err := range errs {
 		t.Errorf("concurrent open: %v", err)
 	}
-	if got := appliedVersions(t, url); len(got) != 4 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 {
-		t.Fatalf("recorded %v, want [1 2 3 4]", got)
+	if got, want := appliedVersions(t, url), embeddedVersions(t); !slices.Equal(got, want) {
+		t.Fatalf("recorded %v, want %v", got, want)
 	}
 }
 
@@ -302,5 +339,38 @@ func TestMigrateAppliesInOrderAndRollsBackOnFailure(t *testing.T) {
 	var rows int
 	if err := p.QueryRow(ctx, `SELECT count(*) FROM numbers`).Scan(&rows); err != nil || rows != 1 {
 		t.Fatalf("numbers has %d rows after a second run, want 1 (%v)", rows, err)
+	}
+}
+
+func TestMigrateAppliesNewMigrationWithPreviouslyAppliedVersion(t *testing.T) {
+	ctx := context.Background()
+	url := newDatabase(t)
+	p := testPool(t, url)
+	first := fstest.MapFS{
+		"0001_first.sql": {Data: []byte(`CREATE TABLE first_migration (n INT)`)},
+	}
+	if err := migrate(ctx, p, first); err != nil {
+		t.Fatal(err)
+	}
+
+	combined := fstest.MapFS{
+		"0001_first.sql":  first["0001_first.sql"],
+		"0001_second.sql": {Data: []byte(`CREATE TABLE second_migration (n INT)`)},
+	}
+	if err := migrate(ctx, p, combined); err != nil {
+		t.Fatal(err)
+	}
+	if !tableExists(t, p, "first_migration") || !tableExists(t, p, "second_migration") {
+		t.Fatal("shared-version migrations were not both applied")
+	}
+	var name string
+	if err := p.QueryRow(ctx, `SELECT name FROM schema_migrations WHERE version = 1`).Scan(&name); err != nil {
+		t.Fatal(err)
+	}
+	if name != "first,second" {
+		t.Fatalf("recorded migration names = %q, want %q", name, "first,second")
+	}
+	if err := migrate(ctx, p, combined); err != nil {
+		t.Fatalf("reapply migrations: %v", err)
 	}
 }

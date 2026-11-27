@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -122,7 +121,11 @@ func Parse(domain string, body []byte, code, issuer string) (Info, error) {
 	info.OrgURL = doc.Documentation.OrgURL
 	for i := range doc.Currencies {
 		c := doc.Currencies[i]
-		if strings.EqualFold(c.Code, code) && c.Issuer == issuer {
+		// Asset codes are case-sensitive: usdc and USDC from one issuer are
+		// different assets, so a case-insensitive match here could attach one
+		// asset's attestation_of_reserve to another. This also has to agree
+		// with the SDK's findCurrency, which compares exactly.
+		if c.Code == code && c.Issuer == issuer {
 			info.Currency = &c
 			break
 		}
