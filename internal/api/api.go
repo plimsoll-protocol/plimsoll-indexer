@@ -668,7 +668,7 @@ func (s *Server) supplyHistory(w http.ResponseWriter, r *http.Request) {
 	for i := range list {
 		out = append(out, toSupply(&list[i]))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"supply": out})
+	writeJSON(w, http.StatusOK, map[string]any{"supply": out, "next_before": nextBefore})
 }
 
 func (s *Server) reportHistory(w http.ResponseWriter, r *http.Request) {
@@ -692,7 +692,34 @@ func (s *Server) reportHistory(w http.ResponseWriter, r *http.Request) {
 	for _, rep := range list {
 		out = append(out, toReport(rep))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"reports": out})
+	writeJSON(w, http.StatusOK, map[string]any{"reports": out, "next_before": nextBefore})
+}
+
+func (s *Server) covered(w http.ResponseWriter, r *http.Request) {
+	minBps, ok := parseMinBps(w, r)
+	if !ok {
+		return
+	}
+	maxAge, ok := parseMaxAge(w, r)
+	if !ok {
+		return
+	}
+	minTier, ok := parseTier(w, r)
+	if !ok {
+		return
+	}
+	sp, err := s.Store.LatestSupply(r.Context(), r.PathValue("sac"))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	reports, err := s.Store.LatestReports(r.Context(), r.PathValue("sac"))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	covered, reason := coverage.CoverageStatus(sp, reports, minTier, s.Now(), minBps, maxAge)
+	writeJSON(w, http.StatusOK, map[string]any{"covered": covered, "reason": reason})
 }
 
 const reportExportPageSize = 500

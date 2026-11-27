@@ -117,10 +117,12 @@ func (f *fake) LatestReportsBySAC(_ context.Context, sacs []string) (map[string]
 	}
 	return out, nil
 }
-func (f *fake) ReportHistory(_ context.Context, s string, _ int) ([]coverage.Report, error) {
-	var out []coverage.Report
-	for _, r := range f.reports[s] {
-		out = append(out, r)
+func (f *fake) LatestReports(_ context.Context, s string) (map[uint32]coverage.Report, error) {
+	out := make(map[uint32]coverage.Report)
+	for _, rep := range f.reports[s] {
+		if cur, ok := out[rep.Tier]; !ok || rep.AsOf.After(cur.AsOf) {
+			out[rep.Tier] = rep.Report
+		}
 	}
 	return out, nil
 }
@@ -330,14 +332,26 @@ func server() *httptest.Server {
 func newFake() *fake {
 	f := &fake{
 		assets: []coverage.Asset{{SAC: sac, Code: "PUSD", Issuer: "GISS"}},
-		supply: map[string]*coverage.Supply{
-			sac: {Amount: big.NewInt(1_000_0000000), Ledger: 100, PostedAt: now.Add(-time.Hour)},
+		supply: map[string][]coverage.Supply{
+			sac: {
+				{Amount: big.NewInt(1_000_0000000), Ledger: 100, PostedAt: supplyNow},
+				{Amount: big.NewInt(9_00000000), Ledger: 90, PostedAt: supplyNow.Add(-time.Hour)},
+				{Amount: big.NewInt(8_00000000), Ledger: 80, PostedAt: supplyNow.Add(-2 * time.Hour)},
+				{Amount: big.NewInt(7_00000000), Ledger: 70, PostedAt: supplyNow.Add(-3 * time.Hour)},
+			},
 		},
-		reports: map[string]map[uint32]coverage.Report{
-			sac: {coverage.TierIssuerSigned: {
-				Tier: coverage.TierIssuerSigned, Amount: big.NewInt(1_020_0000000),
-				AsOf: now.Add(-2 * time.Hour), Reporter: "GISS", DocURI: "https://x",
-			}},
+		reports: map[string][]fakeReport{
+			sac: {
+				{Report: coverage.Report{Tier: coverage.TierIssuerSigned, Amount: big.NewInt(1_020_0000000),
+					AsOf: now.Add(-2 * time.Hour), PostedAt: now.Add(-2 * time.Hour), Reporter: "GISS", DocURI: "https://x"},
+					PostedLedger: 50},
+				{Report: coverage.Report{Tier: coverage.TierIssuerSigned, Amount: big.NewInt(1_010_0000000),
+					AsOf: now.Add(-4 * time.Hour), PostedAt: now.Add(-4 * time.Hour), Reporter: "GISS", DocURI: "https://x"},
+					PostedLedger: 40},
+				{Report: coverage.Report{Tier: coverage.TierTranscribed, Amount: big.NewInt(1_005_0000000),
+					AsOf: now.Add(-6 * time.Hour), PostedAt: now.Add(-6 * time.Hour), Reporter: "GISS", DocURI: "https://x"},
+					PostedLedger: 30},
+			},
 		},
 		bodies: map[string][]byte{breakdownHash: []byte(`{"total":"1"}`)},
 		progress: map[string]store.Progress{

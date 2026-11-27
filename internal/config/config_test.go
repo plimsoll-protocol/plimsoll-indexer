@@ -70,6 +70,8 @@ func TestKeepAwakeURL(t *testing.T) {
 	}
 }
 
+const testContract = "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
+
 func setBase(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{"NETWORK", "STELLAR_RPC_URL", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE", "WEBHOOK_ADMIN_TOKEN", "WEBHOOK_API_KEYS", "WEBHOOK_ENCRYPTION_KEY", "WEBHOOK_SIGNING_SECRET", "SECRETS_PROVIDER", "SUPPLY_POSTER_SECRET", "SUPPLY_POSTER_SECRET_NAME", "DATABASE_PASSWORD_SECRET_NAME"} {
@@ -77,8 +79,8 @@ func setBase(t *testing.T) {
 		t.Setenv(k, "")
 	}
 	t.Setenv("DATABASE_URL", "postgres://x")
-	t.Setenv("COVERAGE_LEDGER_ID", "C1")
-	t.Setenv("REPORTER_REGISTRY_ID", "C2")
+	t.Setenv("COVERAGE_LEDGER_ID", testContract)
+	t.Setenv("REPORTER_REGISTRY_ID", testContract)
 }
 
 func TestWebhookConfigurationMustBeComplete(t *testing.T) {

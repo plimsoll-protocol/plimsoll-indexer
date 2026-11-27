@@ -208,3 +208,26 @@ func (r *Result) Covered(now time.Time, minBps uint32, maxAge time.Duration) boo
 	fresh := func(t time.Time) bool { return now.Sub(t) <= maxAge }
 	return fresh(r.SupplyPostedAt) && fresh(r.ReportAsOf) && r.Bps >= minBps
 }
+
+// CoverageStatus mirrors is_covered and returns the verdict plus a reason:
+// no_supply, no_report, stale_supply, stale_report, under_backed, covered.
+func CoverageStatus(supply *Supply, latestPerTier map[uint32]Report, minTier uint32, now time.Time, minBps uint32, maxAge time.Duration) (bool, string) {
+	if supply == nil {
+		return false, "no_supply"
+	}
+	r, ok := Best(latestPerTier, minTier)
+	if !ok {
+		return false, "no_report"
+	}
+	fresh := func(t time.Time) bool { return now.Sub(t) <= maxAge }
+	if !fresh(supply.PostedAt) {
+		return false, "stale_supply"
+	}
+	if !fresh(r.AsOf) {
+		return false, "stale_report"
+	}
+	if BPS(r.Amount, supply.Amount) < minBps {
+		return false, "under_backed"
+	}
+	return true, "covered"
+}

@@ -604,13 +604,20 @@ func (s *Store) GetAsset(ctx context.Context, sac string) (coverage.Asset, error
 	return a, err
 }
 
-func (s *Store) SupplyHistory(ctx context.Context, sac string, limit int) ([]coverage.Supply, error) {
+func (s *Store) SupplyHistory(ctx context.Context, sac string, limit int, before *uint32) ([]coverage.Supply, *uint32, error) {
+	var beforeArg any
+	if before != nil {
+		v := int64(*before)
+		beforeArg = &v
+	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT amount::text, at_ledger, posted_at, breakdown_hash, poster, tx_hash, source
 		FROM supply_snapshots WHERE sac = $1
-		ORDER BY at_ledger DESC LIMIT $2`, sac, limit)
+		  AND ($2::bigint IS NULL OR at_ledger < $2)
+		ORDER BY at_ledger DESC, event_id DESC
+		LIMIT $3`, sac, beforeArg, limit+1)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
 	var out []coverage.Supply
@@ -619,7 +626,7 @@ func (s *Store) SupplyHistory(ctx context.Context, sac string, limit int) ([]cov
 		var amount string
 		var ledger int64
 		if err := rows.Scan(&amount, &ledger, &sp.PostedAt, &sp.BreakdownHash, &sp.Poster, &sp.TxHash, &sp.Source); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		n, err := parseAmount(amount)
 		if err != nil {
@@ -629,12 +636,21 @@ func (s *Store) SupplyHistory(ctx context.Context, sac string, limit int) ([]cov
 		sp.Ledger = uint32(ledger)
 		out = append(out, sp)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	var nextBefore *uint32
+	if len(out) == limit+1 {
+		out = out[:limit]
+		v := out[limit-1].Ledger
+		nextBefore = &v
+	}
+	return out, nextBefore, nil
 }
 
 // LatestSupply returns nil when nothing has been posted.
 func (s *Store) LatestSupply(ctx context.Context, sac string) (*coverage.Supply, error) {
-	h, err := s.SupplyHistory(ctx, sac, 1)
+	h, _, err := s.SupplyHistory(ctx, sac, 1, nil)
 	if err != nil || len(h) == 0 {
 		return nil, err
 	}
