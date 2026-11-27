@@ -62,12 +62,14 @@ type Reader interface {
 	LatestSupply(ctx context.Context, sac string) (*coverage.Supply, error)
 	LatestSupplies(ctx context.Context, sacs []string) (map[string]*coverage.Supply, error)
 	SupplyHistory(ctx context.Context, sac string, limit int) ([]coverage.Supply, error)
+	SupplyHistoryCount(ctx context.Context, sac string) (int64, error)
 	LatestReports(ctx context.Context, sac string) (map[uint32]coverage.Report, error)
 	LatestReportsBySAC(ctx context.Context, sacs []string) (map[string]map[uint32]coverage.Report, error)
 	ReportHistory(ctx context.Context, sac string, limit int) ([]coverage.Report, error)
 	ReportExportPage(ctx context.Context, sac string, from, to *time.Time, after *store.ReportExportCursor, limit int) ([]store.ReportExportRow, error)
 	SeriesSupply(ctx context.Context, sac string, from, to time.Time) ([]coverage.Supply, error)
 	SeriesReports(ctx context.Context, sac string, from, to time.Time) ([]coverage.Report, error)
+	ReportHistoryCount(ctx context.Context, sac string) (int64, error)
 	Reporters(ctx context.Context) ([]coverage.Reporter, error)
 	Disputes(ctx context.Context, sac, status string, limit, offset int) ([]coverage.Dispute, error)
 	Breakdown(ctx context.Context, hash string) ([]byte, error)
@@ -940,6 +942,11 @@ func (s *Server) supplyHistory(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAsset(w, r, sac) {
 		return
 	}
+	total, err := s.Store.SupplyHistoryCount(r.Context(), sac)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
 	list, err := s.Store.SupplyHistory(r.Context(), sac, limit)
 	if err != nil {
 		s.fail(w, err)
@@ -950,6 +957,8 @@ func (s *Server) supplyHistory(w http.ResponseWriter, r *http.Request) {
 		out = append(out, toSupply(&list[i]))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"supply": out, "next_before": nextBefore})
+	w.Header().Set("X-Total-Count", strconv.FormatInt(total, 10))
+	writeJSON(w, http.StatusOK, map[string]any{"supply": out})
 }
 
 // @Summary Get historical reserve reports for an asset
@@ -970,6 +979,11 @@ func (s *Server) reportHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.requireAsset(w, r, sac) {
+		return
+	}
+	total, err := s.Store.ReportHistoryCount(r.Context(), sac)
+	if err != nil {
+		s.fail(w, err)
 		return
 	}
 	list, err := s.Store.ReportHistory(r.Context(), sac, limit)
@@ -1189,6 +1203,8 @@ func (s *Server) coverageNow(w http.ResponseWriter, r *http.Request) {
 	snap.FetchedAt = snap.FetchedAt.UTC()
 	w.Header().Set("Last-Modified", snap.FetchedAt.Format(http.TimeFormat))
 	writeJSON(w, http.StatusOK, snap)
+	w.Header().Set("X-Total-Count", strconv.FormatInt(total, 10))
+	writeJSON(w, http.StatusOK, map[string]any{"reports": out})
 }
 
 func (s *Server) reporters(w http.ResponseWriter, r *http.Request) {
@@ -1992,6 +2008,7 @@ func (s *Server) cors(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Expose-Headers", "X-Total-Count")
 		if r.Method == http.MethodOptions {
 			w.Header().Set("Access-Control-Allow-Headers", corsAllowHeaders)
 			w.Header().Set("Access-Control-Max-Age", corsMaxAge)

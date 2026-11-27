@@ -758,6 +758,14 @@ func (s *Store) querySupplies(ctx context.Context, sql string, args ...any) ([]c
 	return out, nextBefore, nil
 }
 
+func (s *Store) SupplyHistoryCount(ctx context.Context, sac string) (int64, error) {
+	var total int64
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM supply_snapshots WHERE sac = $1`, sac).Scan(&total); err != nil {
+		return 0, fmt.Errorf("count supply history: %w", err)
+	}
+	return total, nil
+}
+
 // LatestSupply returns nil when nothing has been posted.
 func (s *Store) LatestSupply(ctx context.Context, sac string) (*coverage.Supply, error) {
 	h, _, err := s.SupplyHistory(ctx, sac, 1, nil)
@@ -881,6 +889,14 @@ const reportHistorySQL = `
 
 func (s *Store) ReportHistory(ctx context.Context, sac string, limit int) ([]coverage.Report, error) {
 	return s.queryReports(ctx, reportHistorySQL, sac, limit)
+}
+
+func (s *Store) ReportHistoryCount(ctx context.Context, sac string) (int64, error) {
+	var total int64
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM reserve_reports WHERE sac = $1`, sac).Scan(&total); err != nil {
+		return 0, fmt.Errorf("count report history: %w", err)
+	}
+	return total, nil
 }
 
 // latestReportsSQL asks for one report per tier, each the newest by as_of.
