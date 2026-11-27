@@ -2118,6 +2118,155 @@ func TestMetricsEndpoint(t *testing.T) {
 	// Ensure vec metrics have at least one sample so they appear in /metrics output
 	metrics.DBQueryDuration.WithLabelValues("ping").Observe(0.001)
 	metrics.EventsIngestedTotal.WithLabelValues("asset_listed").Inc()
+// issuersFixture has three issuers: GISS with two fully reserved assets, GAUD
+// with one asset at 90% and GBARE with an asset that has no coverage at all.
+func issuersFixture() *fake {
+	return &fake{
+		assets: []coverage.Asset{
+			{SAC: "CSAC2", Code: "PUSD2", Issuer: "GISS", ListedLedger: 2, ListedAt: now},
+			{SAC: "CSAC1", Code: "PUSD", Issuer: "GISS", ListedLedger: 1, ListedAt: now},
+			{SAC: "CSAC3", Code: "AUD", Issuer: "GAUD", ListedLedger: 3, ListedAt: now},
+			{SAC: "CSAC4", Code: "BARE", Issuer: "GBARE", ListedLedger: 4, ListedAt: now},
+		},
+		supply: map[string]*coverage.Supply{
+			"CSAC1": {Amount: big.NewInt(1_000), Ledger: 5, PostedAt: now},
+			"CSAC2": {Amount: big.NewInt(1_000), Ledger: 5, PostedAt: now},
+			"CSAC3": {Amount: big.NewInt(1_000), Ledger: 5, PostedAt: now},
+		},
+		reports: map[string]map[uint32]coverage.Report{
+			"CSAC1": {coverage.TierAuditorSigned: {
+				Tier: coverage.TierAuditorSigned, Amount: big.NewInt(1_000), AsOf: now, Reporter: "GAUD",
+			}},
+			"CSAC2": {coverage.TierTranscribed: {
+				Tier: coverage.TierTranscribed, Amount: big.NewInt(1_200), AsOf: now, Reporter: "GREP",
+			}},
+			"CSAC3": {coverage.TierIssuerSigned: {
+				Tier: coverage.TierIssuerSigned, Amount: big.NewInt(900), AsOf: now, Reporter: "GISS",
+			}},
+		},
+	}
+}
+
+func TestListIssuersGroupsAssetsAndSortsByCount(t *testing.T) {
+	srv := serverFor(issuersFixture())
+	defer srv.Close()
+
+	body := get(t, srv, "/v1/issuers", 200)
+	issuers := body["issuers"].([]any)
+	if len(issuers) != 3 {
+		t.Fatalf("got %d issuers, want 3: %+v", len(issuers), issuers)
+	}
+	if body["next_cursor"] != nil {
+		t.Errorf("next_cursor = %v, want none while everything fits on one page", body["next_cursor"])
+	}
+
+	giss := issuers[0].(map[string]any)
+	if giss["issuer"] != "GISS" || giss["asset_count"].(float64) != 2 || giss["covered"] != true {
+		t.Fatalf("first issuer = %+v, want GISS with 2 covered assets", giss)
+	}
+	assets := giss["assets"].([]any)
+	if len(assets) != 2 {
+		t.Fatalf("GISS assets = %+v, want 2", assets)
+	}
+	pusd := assets[0].(map[string]any)
+	if pusd["code"] != "PUSD" || pusd["sac"] != "CSAC1" {
+		t.Errorf("first asset = %+v, want PUSD first in code order", pusd)
+	}
+	cov := pusd["coverage"].(map[string]any)
+	if cov["bps"].(float64) != 10_000 || cov["tier"] != "auditor_signed" || cov["covered"] != true {
+		t.Errorf("PUSD coverage = %+v, want 10000 bps auditor_signed and covered", cov)
+	}
+
+	// GAUD and GBARE both have one asset, so the tie is broken by address.
+	if got := issuers[1].(map[string]any)["issuer"]; got != "GAUD" {
+		t.Errorf("second issuer = %v, want GAUD", got)
+	}
+	bare := issuers[2].(map[string]any)
+	if bare["issuer"] != "GBARE" || bare["covered"] != false {
+		t.Errorf("third issuer = %+v, want an uncovered GBARE", bare)
+	}
+	bareAsset := bare["assets"].([]any)[0].(map[string]any)
+	if bareAsset["coverage"] != nil {
+		t.Errorf("BARE coverage = %v, want null without a supply snapshot", bareAsset["coverage"])
+	}
+}
+
+func TestListIssuersFiltersByCovered(t *testing.T) {
+	srv := serverFor(issuersFixture())
+	defer srv.Close()
+
+	covered := get(t, srv, "/v1/issuers?covered=true", 200)["issuers"].([]any)
+	if len(covered) != 1 || covered[0].(map[string]any)["issuer"] != "GISS" {
+		t.Fatalf("covered=true returned %+v, want only GISS", covered)
+	}
+	uncovered := get(t, srv, "/v1/issuers?covered=false", 200)["issuers"].([]any)
+	if len(uncovered) != 2 {
+		t.Fatalf("covered=false returned %+v, want GAUD and GBARE", uncovered)
+	}
+	if got := uncovered[0].(map[string]any)["issuer"]; got != "GAUD" {
+		t.Errorf("first uncovered issuer = %v, want GAUD", got)
+	}
+	if got := uncovered[1].(map[string]any)["issuer"]; got != "GBARE" {
+		t.Errorf("second uncovered issuer = %v, want GBARE", got)
+	}
+}
+
+func TestListIssuersPaginates(t *testing.T) {
+	srv := serverFor(issuersFixture())
+	defer srv.Close()
+
+	first := get(t, srv, "/v1/issuers?limit=1", 200)
+	if got := first["issuers"].([]any); len(got) != 1 || got[0].(map[string]any)["issuer"] != "GISS" {
+		t.Fatalf("first page = %+v, want only GISS", got)
+	}
+	cursor, ok := first["next_cursor"].(string)
+	if !ok || cursor == "" {
+		t.Fatalf("first page has no next_cursor: %+v", first)
+	}
+
+	second := get(t, srv, "/v1/issuers?limit=1&cursor="+cursor, 200)
+	if got := second["issuers"].([]any); len(got) != 1 || got[0].(map[string]any)["issuer"] != "GAUD" {
+		t.Fatalf("second page = %+v, want only GAUD", got)
+	}
+	cursor, ok = second["next_cursor"].(string)
+	if !ok || cursor == "" {
+		t.Fatalf("second page has no next_cursor: %+v", second)
+	}
+
+	last := get(t, srv, "/v1/issuers?limit=1&cursor="+cursor, 200)
+	if got := last["issuers"].([]any); len(got) != 1 || got[0].(map[string]any)["issuer"] != "GBARE" {
+		t.Fatalf("last page = %+v, want only GBARE", got)
+	}
+	if last["next_cursor"] != nil {
+		t.Errorf("last page still has next_cursor %v", last["next_cursor"])
+	}
+}
+
+func TestListIssuersRejectsInvalidParameters(t *testing.T) {
+	srv := serverFor(&fake{})
+	defer srv.Close()
+
+	if body := get(t, srv, "/v1/issuers?covered=maybe", 400); body["code"] != "invalid_covered" {
+		t.Errorf("covered=maybe: %+v", body)
+	}
+	if body := get(t, srv, "/v1/issuers?cursor=nope", 400); body["code"] != "invalid_cursor" {
+		t.Errorf("cursor=nope: %+v", body)
+	}
+	if body := get(t, srv, "/v1/issuers?limit=0", 400); body["code"] != "invalid_limit" {
+		t.Errorf("limit=0: %+v", body)
+	}
+}
+
+func TestMetricsEndpointServesPrometheusText(t *testing.T) {
+	registry := metrics.NewRegistry()
+	registry.NewGauge("plimsoll_rpc_ledger_drift_ledgers", "Difference in ledgers.").Set(4)
+	srv := httptest.NewServer((&Server{
+		Store:   &fake{},
+		Metrics: registry,
+		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:     func() time.Time { return now },
+	}).Handler())
+	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/metrics")
 	if err != nil {
@@ -2342,5 +2491,50 @@ func TestGetIssuerToml(t *testing.T) {
 	specResp.Body.Close()
 	if !strings.Contains(string(spec), "/v1/issuers/{issuer}/toml:") {
 		t.Fatal("openapi spec missing /v1/issuers/{issuer}/toml path")
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/plain") {
+		t.Errorf("Content-Type = %q, want the Prometheus text format", got)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "plimsoll_rpc_ledger_drift_ledgers 4") {
+		t.Errorf("body = %q", string(body))
+	}
+}
+
+func TestMetricsEndpointIsAbsentWithoutARegistry(t *testing.T) {
+	srv := serverFor(&fake{})
+	defer srv.Close()
+
+	if body := get(t, srv, "/metrics", 404); body["code"] != "not_found" {
+		t.Errorf("body = %+v, want a not_found error", body)
+	}
+}
+
+func TestReportersIncludeDeleted(t *testing.T) {
+	srv := serverFor(&fake{})
+	defer srv.Close()
+
+	live := get(t, srv, "/v1/reporters", 200)["reporters"].([]any)
+	if len(live) != 1 || live[0].(map[string]any)["address"] != "GAUD" {
+		t.Fatalf("reporters = %+v, want only the live reporter", live)
+	}
+	if _, ok := live[0].(map[string]any)["deleted_at"]; !ok {
+		t.Errorf("live reporter has no deleted_at field: %+v", live[0])
+	}
+
+	all := get(t, srv, "/v1/reporters?include_deleted=true", 200)["reporters"].([]any)
+	if len(all) != 2 || all[1].(map[string]any)["address"] != "GONE" {
+		t.Fatalf("reporters = %+v, want the soft-deleted reporter too", all)
+	}
+	if all[1].(map[string]any)["deleted_at"] == nil {
+		t.Errorf("soft-deleted reporter has no deleted_at: %+v", all[1])
+	}
+
+	if body := get(t, srv, "/v1/reporters?include_deleted=maybe", 400); body["code"] != "invalid_include_deleted" {
+		t.Errorf("include_deleted=maybe: %+v", body)
 	}
 }

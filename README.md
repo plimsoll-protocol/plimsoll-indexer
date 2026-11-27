@@ -144,6 +144,7 @@ progress logs to estimate the full range.
 | Method and path | Returns |
 | --- | --- |
 | `GET /healthz` | `{status, ingested_to_ledger, last_event_ledger, last_event_at, last_event_age_seconds}` |
+| `GET /metrics` | Prometheus gauges: `plimsoll_rpc_last_seen_ledger` per RPC endpoint and `plimsoll_rpc_ledger_drift_ledgers`, the spread between them |
 | `GET /v1/network` | Contract ids, RPC and Horizon URLs |
 | `GET /v1/assets?limit=50&cursor=<opaque>&min_tier=1` | Paginated assets (default limit 50, maximum 200) with latest supply, latest report per tier, coverage and stellar.toml data. Responses include `next_cursor` while another page exists. |
 | `GET /v1/assets/{sac}?min_tier=1` | One asset, same shape |
@@ -154,6 +155,8 @@ progress logs to estimate the full range.
 | `GET /v1/assets/{sac}/coverage?from=&to=&interval=1h&min_tier=1` | Coverage time series. Each point uses the latest supply snapshot and the best report posted at or before it, selected and rounded by the same rules as `coverage()` on-chain. `from` and `to` are RFC 3339 timestamps (default: the last 24 hours); `interval` runs from `5m` to `7d`; a request returns at most 1,000 points. |
 | `GET /v1/reporters` | Active registered reporters |
 | `GET /v1/reporters?tier=auditor_signed&active=true&sort=score&order=desc&limit=100&offset=0` | Every registered reporter, active or revoked unless `active` is given, with the strongest reserve-report tier they have posted, their asset and report counts, and the registry's nullable `reputation_score` and `expires_at`. Sorts by `name`, `address`, `tier`, `score`, `expiry` or `updated_at`; pages with `next_offset`. |
+| `GET /v1/reporters?include_deleted=true` | Registered reporters. De-registered reporters are soft-deleted and left out unless `include_deleted=true`, which also reports their `deleted_at` |
+| `GET /v1/issuers?limit=50&covered=true&cursor=<opaque>` | Issuers derived from the listed assets, most assets first, each with its assets and their live coverage. `covered=true` keeps only issuers whose assets all carry a live figure at 100% or more (default limit 50, maximum 200). |
 | `GET /v1/changelog` | Breaking API changes per released version, newest first |
 | `GET /v1/breakdowns/{hash}` | Exact bytes of a supply breakdown that backs an on-chain snapshot |
 | `POST /v1/webhooks`, `GET /v1/webhooks`, `DELETE /v1/webhooks/{id}` | Manage authenticated issuer TOML change subscriptions. One API key may register up to 10 endpoints; every event fans out to all of them, and `GET /v1/webhooks` reports delivery state per endpoint. |

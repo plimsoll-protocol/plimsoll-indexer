@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"fmt"
 	"os"
@@ -1091,5 +1092,49 @@ func TestParseLogLevel(t *testing.T) {
 		if got := ParseLogLevel(tc.in); got != tc.want {
 			t.Errorf("ParseLogLevel(%q) = %v, want %v", tc.in, got, tc.want)
 		}
+func TestRPCEndpointsListTheConfiguredURLFirst(t *testing.T) {
+	setBase(t)
+	t.Setenv("STELLAR_RPC_URL", "https://primary.example")
+	t.Setenv("STELLAR_RPC_URLS", " https://second.example , https://primary.example ,")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if want := []string{"https://primary.example", "https://second.example"}; !slices.Equal(cfg.RPCURLs, want) {
+		t.Errorf("RPCURLs = %v, want %v", cfg.RPCURLs, want)
+	}
+}
+
+func TestRPCEndpointsRejectNonHTTPURLs(t *testing.T) {
+	setBase(t)
+	t.Setenv("STELLAR_RPC_URLS", "ftp://nope.example")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "STELLAR_RPC_URLS") {
+		t.Fatalf("want an error naming STELLAR_RPC_URLS, got %v", err)
+	}
+}
+
+func TestMaxRPCDriftLedgers(t *testing.T) {
+	setBase(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MaxRPCDriftLedgers != 10 {
+		t.Errorf("MaxRPCDriftLedgers = %d, want the default 10", cfg.MaxRPCDriftLedgers)
+	}
+
+	t.Setenv("MAX_RPC_DRIFT_LEDGERS", "25")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MaxRPCDriftLedgers != 25 {
+		t.Errorf("MaxRPCDriftLedgers = %d, want 25", cfg.MaxRPCDriftLedgers)
+	}
+
+	t.Setenv("MAX_RPC_DRIFT_LEDGERS", "-1")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "MAX_RPC_DRIFT_LEDGERS") {
+		t.Fatalf("want an error naming MAX_RPC_DRIFT_LEDGERS, got %v", err)
 	}
 }

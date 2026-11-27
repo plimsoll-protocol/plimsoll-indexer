@@ -72,6 +72,7 @@ type Reader interface {
 	ReportHistoryCount(ctx context.Context, sac string) (int64, error)
 	Reporters(ctx context.Context) ([]coverage.Reporter, error)
 	Disputes(ctx context.Context, sac, status string, limit, offset int) ([]coverage.Dispute, error)
+	Reporters(ctx context.Context, includeDeleted bool) ([]coverage.Reporter, error)
 	Breakdown(ctx context.Context, hash string) ([]byte, error)
 	Attestation(ctx context.Context, sac string) (store.Attestation, error)
 	AuditHistory(ctx context.Context, sac string, after *store.AuditCursor, limit int) ([]store.AuditEvent, error)
@@ -98,6 +99,20 @@ type assetCursor struct {
 	Stats(ctx context.Context, dayStart time.Time) (store.Stats, error)
 	GetVault(ctx context.Context, sac string) (coverage.Vault, error)
 	LatestIssuerToml(ctx context.Context, issuer string) (coverage.IssuerTomlSnapshot, error)
+}
+
+// issuerCursor is the keyset of GET /v1/issuers: the asset count and address of
+// the last issuer served, so the next page resumes after it.
+type issuerCursor struct {
+	Version    int    `json:"v"`
+	AssetCount int    `json:"asset_count"`
+	Issuer     string `json:"issuer"`
+}
+
+// issuerPageReader is a store that can page issuers itself. A store that cannot
+// is asked for every asset and the page is grouped here.
+type issuerPageReader interface {
+	ListIssuersPage(ctx context.Context, limit, afterCount int, afterAddress string) ([]store.Issuer, error)
 }
 
 // NetworkInfo is served at /v1/network so clients can discover contract ids.
@@ -152,6 +167,10 @@ type Server struct {
 	// Done, when closed, ends streaming handlers so graceful shutdown does
 	// not wait on connections that never go idle.
 	Done <-chan struct{}
+
+	// Metrics publishes the indexer's gauges at /metrics in the Prometheus
+	// text format. Nil leaves that endpoint answering 404.
+	Metrics *metrics.Registry
 }
 
 // WebhookManager manages the endpoints of one API key. apiKey is the
@@ -214,6 +233,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/issuers/{issuer}/toml", s.getIssuerToml)
 	mux.HandleFunc("GET /v1/assets/{sac}/audit", s.auditHistory)
 	mux.HandleFunc("GET /v1/reporters", s.reporters)
+	mux.HandleFunc("GET /v1/issuers", s.listIssuers)
 	mux.HandleFunc("GET /v1/changelog", s.changelog)
 	mux.HandleFunc("GET /v1/stats", s.stats)
 	mux.HandleFunc("GET /v1/breakdowns/{hash}", s.breakdown)
@@ -348,6 +368,33 @@ type reporterJSON struct {
 type vaultJSON struct {
 	ReserveBalance string `json:"reserve_balance"`
 	coverage.Vault
+// issuerJSON is one issuer in GET /v1/issuers. Covered is true only when every
+// listed asset has a live coverage figure and all of them are at 100% or more,
+// which is what ?covered=true filters on.
+type issuerJSON struct {
+	Issuer     string            `json:"issuer"`
+	AssetCount int               `json:"asset_count"`
+	Covered    bool              `json:"covered"`
+	Assets     []issuerAssetJSON `json:"assets"`
+}
+
+// issuerAssetJSON is one asset of an issuer. Coverage is null until the asset
+// has a supply snapshot and a qualifying report.
+type issuerAssetJSON struct {
+	SAC      string              `json:"sac"`
+	Code     string              `json:"code"`
+	ListedAt time.Time           `json:"listed_at"`
+	Coverage *issuerCoverageJSON `json:"coverage"`
+}
+
+// issuerCoverageJSON is the live coverage figure of one asset, with the same
+// bps-is-null-when-nothing-is-owed rule as the asset document.
+type issuerCoverageJSON struct {
+	Bps      *uint32   `json:"bps"`
+	Tier     string    `json:"tier"`
+	AsOf     time.Time `json:"as_of"`
+	Reporter string    `json:"reporter"`
+	Covered  bool      `json:"covered"`
 }
 
 type webhookJSON struct {
@@ -545,6 +592,20 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 // @Produce application/yaml
 // @Success 200 {string} string "OpenAPI YAML specification"
 // @Router /openapi.yaml [get]
+// metrics serves the Prometheus gauges the workers publish, such as the ledger
+// each RPC endpoint reports and the drift between them.
+func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
+	if s.Metrics == nil {
+		writeError(w, http.StatusNotFound, codeNotFound, "metrics are not enabled")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if err := s.Metrics.WritePrometheus(w); err != nil && s.Log != nil {
+		s.Log.Error("write metrics", "err", err)
+	}
+}
+
 func (s *Server) openAPI(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/yaml")
 	w.WriteHeader(http.StatusOK)
@@ -723,6 +784,42 @@ func (s *Server) searchAssets(w http.ResponseWriter, r *http.Request) {
 	out := make([]assetJSON, 0, len(assets))
 	for _, a := range assets {
 		aj, err := s.assemble(r.Context(), a, minTier)
+// issuerScanLimit caps how many issuers one request walks while a filter is
+// applied, so a filtered page cannot scan the whole table.
+const issuerScanLimit = 1000
+
+// fullyReservedBps is the coverage at which an asset's reserves match its
+// supply in full, on the same scale as the contract's is_covered.
+const fullyReservedBps = 10_000
+
+// listIssuers serves the issuers behind the listed assets, most assets first,
+// optionally only those whose assets are all fully reserved.
+func (s *Server) listIssuers(w http.ResponseWriter, r *http.Request) {
+	limit, ok := parseAssetLimit(w, r)
+	if !ok {
+		return
+	}
+	covered, ok := parseOptionalBool(w, r, "covered", codeInvalidCovered)
+	if !ok {
+		return
+	}
+	cursor, ok := parseIssuerCursor(w, r)
+	if !ok {
+		return
+	}
+	afterCount, afterAddress := -1, ""
+	if cursor != nil {
+		afterCount, afterAddress = cursor.AssetCount, cursor.Issuer
+	}
+
+	out := make([]issuerJSON, 0, limit)
+	var lastIncluded *issuerCursor
+	lastScanned := issuerCursor{Version: 1, AssetCount: afterCount, Issuer: afterAddress}
+	more := false
+	pageFull := false
+	scanned := 0
+	for scanned < issuerScanLimit {
+		page, err := s.issuerPage(r.Context(), limit+1, afterCount, afterAddress)
 		if err != nil {
 			s.fail(w, err)
 			return
@@ -742,6 +839,160 @@ func (s *Server) searchAssets(w http.ResponseWriter, r *http.Request) {
 // @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Router /v1/assets/{sac} [get]
+		pageFull = len(page) == limit+1
+		if len(page) == 0 {
+			break
+		}
+		entries, err := s.issuerEntries(r.Context(), page)
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		stopped := false
+		for i, entry := range entries {
+			pos := issuerCursor{Version: 1, AssetCount: len(page[i].Assets), Issuer: page[i].Address}
+			lastScanned = pos
+			scanned++
+			if covered != nil && entry.Covered != *covered {
+				continue
+			}
+			if len(out) == limit {
+				more = true
+				stopped = true
+				break
+			}
+			out = append(out, entry)
+			included := pos
+			lastIncluded = &included
+		}
+		if stopped || !pageFull {
+			break
+		}
+		afterCount, afterAddress = lastScanned.AssetCount, lastScanned.Issuer
+	}
+	if !more && pageFull && scanned >= issuerScanLimit {
+		more = true
+	}
+
+	body := map[string]any{"issuers": out}
+	switch {
+	case more && lastIncluded != nil:
+		body["next_cursor"] = encodeIssuerCursor(*lastIncluded)
+	case more:
+		body["next_cursor"] = encodeIssuerCursor(lastScanned)
+	}
+	writeJSON(w, http.StatusOK, body)
+}
+
+// issuerPage returns one store page of issuers, grouped here when the store
+// cannot page them itself.
+func (s *Server) issuerPage(ctx context.Context, limit, afterCount int, afterAddress string) ([]store.Issuer, error) {
+	if pageStore, ok := s.Store.(issuerPageReader); ok {
+		return pageStore.ListIssuersPage(ctx, limit, afterCount, afterAddress)
+	}
+	all, err := s.Store.ListAssets(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return pageIssuers(groupIssuers(all), limit, afterCount, afterAddress), nil
+}
+
+// issuerEntries adds the coverage figures behind one page of issuers.
+func (s *Server) issuerEntries(ctx context.Context, page []store.Issuer) ([]issuerJSON, error) {
+	sacs := make([]string, 0, len(page))
+	for _, iss := range page {
+		for _, a := range iss.Assets {
+			sacs = append(sacs, a.SAC)
+		}
+	}
+	supplies, err := s.Store.LatestSupplies(ctx, sacs)
+	if err != nil {
+		return nil, err
+	}
+	reports, err := s.Store.LatestReportsBySAC(ctx, sacs)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]issuerJSON, 0, len(page))
+	for _, iss := range page {
+		entry := issuerJSON{
+			Issuer:     iss.Address,
+			AssetCount: len(iss.Assets),
+			Covered:    len(iss.Assets) > 0,
+			Assets:     make([]issuerAssetJSON, 0, len(iss.Assets)),
+		}
+		for _, a := range iss.Assets {
+			asset := issuerAssetJSON{SAC: a.SAC, Code: a.Code, ListedAt: a.ListedAt.UTC()}
+			if res := coverage.Compute(supplies[a.SAC], reports[a.SAC], coverage.TierTranscribed); res != nil {
+				cov := &issuerCoverageJSON{
+					Tier:     coverage.TierName(res.Tier),
+					AsOf:     res.ReportAsOf.UTC(),
+					Reporter: res.ReportReporter,
+					Covered:  res.Bps >= fullyReservedBps,
+				}
+				if !res.NothingIsOwed {
+					bps := res.Bps
+					cov.Bps = &bps
+				}
+				asset.Coverage = cov
+			}
+			if asset.Coverage == nil || !asset.Coverage.Covered {
+				entry.Covered = false
+			}
+			entry.Assets = append(entry.Assets, asset)
+		}
+		out = append(out, entry)
+	}
+	return out, nil
+}
+
+// groupIssuers collects assets by issuer, most assets first and ties broken by
+// address, with each issuer's assets in code order.
+func groupIssuers(assets []coverage.Asset) []store.Issuer {
+	index := make(map[string]int, len(assets))
+	var out []store.Issuer
+	for _, a := range assets {
+		i, ok := index[a.Issuer]
+		if !ok {
+			i = len(out)
+			index[a.Issuer] = i
+			out = append(out, store.Issuer{Address: a.Issuer})
+		}
+		out[i].Assets = append(out[i].Assets, a)
+	}
+	for i := range out {
+		sort.Slice(out[i].Assets, func(x, y int) bool {
+			if out[i].Assets[x].Code != out[i].Assets[y].Code {
+				return out[i].Assets[x].Code < out[i].Assets[y].Code
+			}
+			return out[i].Assets[x].SAC < out[i].Assets[y].SAC
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if len(out[i].Assets) != len(out[j].Assets) {
+			return len(out[i].Assets) > len(out[j].Assets)
+		}
+		return out[i].Address < out[j].Address
+	})
+	return out
+}
+
+// pageIssuers applies the issuer ordering's keyset to a grouped list.
+func pageIssuers(issuers []store.Issuer, limit, afterCount int, afterAddress string) []store.Issuer {
+	out := make([]store.Issuer, 0, limit)
+	for _, iss := range issuers {
+		n := len(iss.Assets)
+		if afterCount >= 0 && (n > afterCount || (n == afterCount && iss.Address <= afterAddress)) {
+			continue
+		}
+		if len(out) == limit {
+			break
+		}
+		out = append(out, iss)
+	}
+	return out
+}
+
 func (s *Server) getAsset(w http.ResponseWriter, r *http.Request) {
 	// Go 1.22+'s ServeMux rejects a literal GET /v1/assets/covered alongside
 	// HEAD /v1/assets/{sac}: the literal is more specific by path but less
@@ -1286,6 +1537,11 @@ func (s *Server) reporters(w http.ResponseWriter, r *http.Request) {
 	}
 
 	list, err := s.Store.Reporters(r.Context())
+	includeDeleted, ok := parseOptionalBool(w, r, "include_deleted", codeInvalidIncludeDeleted)
+	if !ok {
+		return
+	}
+	list, err := s.Store.Reporters(r.Context(), includeDeleted != nil && *includeDeleted)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -1991,6 +2247,52 @@ func parseAssetCursor(w http.ResponseWriter, r *http.Request) (*assetCursor, boo
 }
 
 func encodeAssetCursor(cursor assetCursor) string {
+	raw, _ := json.Marshal(cursor)
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+// parseOptionalBool reads a boolean query parameter, returning nil when it is
+// absent so callers can tell "not asked" from "asked for false".
+func parseOptionalBool(w http.ResponseWriter, r *http.Request, name, code string) (*bool, bool) {
+	v := r.URL.Query().Get(name)
+	if v == "" {
+		return nil, true
+	}
+	value, err := strconv.ParseBool(v)
+	if err != nil {
+		writeErrorDetails(w, http.StatusBadRequest, code,
+			name+" must be true or false", map[string]any{"parameter": name, "value": v})
+		return nil, false
+	}
+	return &value, true
+}
+
+func parseIssuerCursor(w http.ResponseWriter, r *http.Request) (*issuerCursor, bool) {
+	v := r.URL.Query().Get("cursor")
+	if v == "" {
+		return nil, true
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(v)
+	if err != nil || base64.RawURLEncoding.EncodeToString(raw) != v {
+		writeError(w, http.StatusBadRequest, codeInvalidCursor, "invalid cursor")
+		return nil, false
+	}
+	var cursor issuerCursor
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cursor); err != nil || cursor.Version != 1 || cursor.AssetCount < 1 || cursor.Issuer == "" {
+		writeError(w, http.StatusBadRequest, codeInvalidCursor, "invalid cursor")
+		return nil, false
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		writeError(w, http.StatusBadRequest, codeInvalidCursor, "invalid cursor")
+		return nil, false
+	}
+	return &cursor, true
+}
+
+func encodeIssuerCursor(cursor issuerCursor) string {
 	raw, _ := json.Marshal(cursor)
 	return base64.RawURLEncoding.EncodeToString(raw)
 }
