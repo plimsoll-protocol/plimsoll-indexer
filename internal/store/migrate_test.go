@@ -33,6 +33,23 @@ func TestLoadMigrations(t *testing.T) {
 	}
 }
 
+// TestLoadMigrationsAllowsVersionReuse pins the rule that a version number may
+// name more than one migration, ordered by description: releases merged on the
+// same day each added a 0005.
+func TestLoadMigrationsAllowsVersionReuse(t *testing.T) {
+	sql := &fstest.MapFile{Data: []byte("SELECT 1")}
+	ms, err := loadMigrations(fstest.MapFS{"0001_b.sql": sql, "0001_a.sql": sql})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ms) != 2 || ms[0].Name != "a" || ms[1].Name != "b" {
+		t.Fatalf("migrations = %+v", ms)
+	}
+	if ms[0].key() != "0001_a" || ms[1].key() != "0001_b" {
+		t.Fatalf("keys = %q, %q", ms[0].key(), ms[1].key())
+	}
+}
+
 func TestLoadMigrationsRejectsMistakes(t *testing.T) {
 	sql := &fstest.MapFile{Data: []byte("SELECT 1")}
 	for name, tc := range map[string]struct {

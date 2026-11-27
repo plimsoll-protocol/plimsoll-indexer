@@ -282,6 +282,84 @@ func TestWebhookPersistence(t *testing.T) {
 	}
 }
 
+// TestWebhookPerKeyLimitAndDeliveryCounters covers the multi-endpoint rules:
+// one key holds at most MaxWebhooksPerKey endpoints, each key sees only its
+// own, and every delivery attempt is counted against the endpoint it went to.
+func TestWebhookPerKeyLimitAndDeliveryCounters(t *testing.T) {
+	s, _ := openStore(t)
+	ctx := context.Background()
+	ciphertext := []byte{1, 2, 3, 4}
+
+	var created Webhook
+	for i := range MaxWebhooksPerKey {
+		w, err := s.CreateWebhook(ctx, fmt.Sprintf("https://receiver.example/%d", i), "hash", ciphertext, "key-one")
+		if err != nil {
+			t.Fatalf("create endpoint %d: %v", i, err)
+		}
+		created = w
+	}
+	if _, err := s.CreateWebhook(ctx, "https://receiver.example/over", "hash", ciphertext, "key-one"); !errors.Is(err, ErrWebhookLimit) {
+		t.Fatalf("create past the limit: err=%v, want ErrWebhookLimit", err)
+	}
+	// The limit is per key: another key starts with its own quota.
+	if _, err := s.CreateWebhook(ctx, "https://receiver.example/other", "hash", ciphertext, "key-two"); err != nil {
+		t.Fatalf("create for a second key: %v", err)
+	}
+
+	mine, err := s.ListWebhooksForKey(ctx, "key-one")
+	if err != nil || len(mine) != MaxWebhooksPerKey {
+		t.Fatalf("key-one lists %d endpoints (%v), want %d", len(mine), err, MaxWebhooksPerKey)
+	}
+	theirs, err := s.ListWebhooksForKey(ctx, "key-two")
+	if err != nil || len(theirs) != 1 || theirs[0].OwnerKeyHash != "key-two" {
+		t.Fatalf("key-two lists %+v (%v), want only its own endpoint", theirs, err)
+	}
+	// The dispatcher still sees every endpoint.
+	if all, err := s.ListWebhooks(ctx); err != nil || len(all) != MaxWebhooksPerKey+1 {
+		t.Fatalf("all endpoints = %d (%v), want %d", len(all), err, MaxWebhooksPerKey+1)
+	}
+
+	at := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	if err := s.RecordWebhookDelivery(ctx, created.ID, at, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordWebhookDelivery(ctx, created.ID, at.Add(time.Minute), "webhook returned status 500"); err != nil {
+		t.Fatal(err)
+	}
+	mine, err = s.ListWebhooksForKey(ctx, "key-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Webhook
+	for _, w := range mine {
+		if w.ID == created.ID {
+			got = w
+		}
+	}
+	failedAt := at.Add(time.Minute)
+	if got.Deliveries != 2 || got.Failures != 1 || got.LastDeliveryStatus != "failed" ||
+		got.LastDeliveryError != "webhook returned status 500" ||
+		got.LastDeliveryAt == nil || !got.LastDeliveryAt.Equal(failedAt) {
+		t.Fatalf("delivery state = %+v, want two attempts and one failure", got)
+	}
+	// A later success updates the status and clears the error, not the counts.
+	if err := s.RecordWebhookDelivery(ctx, created.ID, at.Add(2*time.Minute), ""); err != nil {
+		t.Fatal(err)
+	}
+	mine, err = s.ListWebhooksForKey(ctx, "key-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range mine {
+		if w.ID == created.ID {
+			got = w
+		}
+	}
+	if got.Deliveries != 3 || got.Failures != 1 || got.LastDeliveryStatus != "delivered" || got.LastDeliveryError != "" {
+		t.Fatalf("delivery state after success = %+v", got)
+	}
+}
+
 func TestReporterSetPersistsDisplayNameAndPreservesMetadata(t *testing.T) {
 	s, _ := openStore(t)
 	ctx := context.Background()

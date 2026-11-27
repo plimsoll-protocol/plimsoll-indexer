@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestEnvExampleDocumentsLoadVariables(t *testing.T) {
@@ -221,6 +222,12 @@ func TestLoadDefaults(t *testing.T) {
 	if got.KeepAwakeInterval.String() != "10m0s" {
 		t.Errorf("KeepAwakeInterval = %v, want 10m0s", got.KeepAwakeInterval)
 	}
+	if got.ReporterInterval.String() != "5s" {
+		t.Errorf("ReporterInterval = %v, want 5s", got.ReporterInterval)
+	}
+	if got.HTTPKeepAlive != 90*time.Second {
+		t.Errorf("HTTPKeepAlive = %v, want 90s", got.HTTPKeepAlive)
+	}
 	if got.IngestWorkers != 2 {
 		t.Errorf("IngestWorkers = %d, want 2", got.IngestWorkers)
 	}
@@ -302,6 +309,8 @@ func TestLoadBadDurations(t *testing.T) {
 		"TOML_INTERVAL",
 		"WEBHOOK_INTERVAL",
 		"KEEP_AWAKE_INTERVAL",
+		"REPORTER_INTERVAL",
+		"HTTP_KEEPALIVE_TIMEOUT",
 	}
 	for _, v := range durationVars {
 		t.Run(v, func(t *testing.T) {

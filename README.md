@@ -19,6 +19,7 @@ One Go binary with five jobs and an HTTP API:
 | --- | --- |
 | **Supply poster** | For every listed asset, sums Horizon's per-bucket holdings (trustlines in every auth state, claimable balances, liquidity pools, contract balances) and calls `post_supply` on the coverage ledger with the total and the SHA-256 of the breakdown. Posts when supply changes, or every `REPOST_AFTER` so freshness checks keep passing. Whether a post is due is read from the coverage ledger itself, so a stalled event ingest cannot make it repost on every tick. |
 | **Event ingester** | Reads `asset_listed`, `supply_posted`, `reserve_posted`, `reporter_set`, `reporter_metadata_updated` and `reporter_revoked` from Soroban RPC into Postgres, keeping history past RPC's ~7-day retention. |
+| **Reporter watcher** | Reads `reporter_set` and `reporter_revoked` from the registry contract on its own cursor every `REPORTER_INTERVAL` (5s, about one ledger), so a new registration appears at `/v1/reporters` immediately instead of waiting for the next ingest or reconcile pass. |
 | **State reconciler** | Reads each listed asset's `get_supply` and `get_report` back from the coverage ledger and reporter profile data from the reporter registry, storing anything newer than ingestion has. RPC serves only about seven days of events, so a longer ingestion gap cannot be repaired from events; the contracts always hold the latest figure. Recovered rows are marked `"source": "chain"` and carry no `tx_hash`. Reading is simulation, so it needs no key and runs even on an instance that cannot sign. |
 | **stellar.toml sync** | Resolves each issuer's `home_domain`, reads its SEP-1 `stellar.toml`, and stores the matching `[[CURRENCIES]]` entry, including `attestation_of_reserve`. Successful fetches are SHA-256 tracked per issuer; changes are logged and can be delivered to registered webhooks. The linked attestation document is downloaded under the same size, time and SSRF limits as reserve documents, hashed, and kept as version history; the asset response exposes `toml.attestation_hash`, `toml.attestation_first_seen_at` and `toml.attestation_changed_at`. |
 | **Coverage alerts** | Posts a signed alert to each registered integrator URL when an asset's coverage falls below the registration's `min_bps`, selecting reports of at least `min_tier`. One alert per crossing, re-armed when coverage recovers; failed deliveries are retried with exponential backoff, at most 5 attempts in total. |
@@ -73,6 +74,22 @@ are, so it is safe on a live database, and on an empty one that holds only
 `raw_events` it rebuilds `assets`, `supply_snapshots`, `reserve_reports` and
 `reporters`. The ingest cursor is not touched.
 
+### Replaying a ledger range
+
+Re-ingest a range from the RPC without deleting anything. Rows are keyed by
+event id, so the command is idempotent and leaves the ingest cursor where it
+was; run it beside a live indexer. This is what recovers events the indexer
+missed or dropped before a fix:
+
+```bash
+go run ./cmd/plimsoll-indexer replay -from 5034380 -to 5035000 [-dry-run]
+```
+
+`-dry-run` logs what the range contains without writing to the database, and
+needs no database connection at all. Progress is logged every 1 000 ledgers.
+One command serves both modes: `replay` with no `-from`/`-to` rebuilds from
+`raw_events`, and `replay -from N -to M` re-reads that range from the RPC.
+
 ## API
 
 | Method and path | Returns |
@@ -88,10 +105,9 @@ are, so it is safe on a live database, and on an empty one that holds only
 | `GET /v1/reporters` | Active registered reporters |
 | `GET /v1/changelog` | Breaking API changes per released version, newest first |
 | `GET /v1/breakdowns/{hash}` | Exact bytes of a supply breakdown that backs an on-chain snapshot |
-| `POST /v1/webhooks`, `GET /v1/webhooks`, `DELETE /v1/webhooks/{id}` | Manage authenticated issuer TOML change subscriptions |
+| `POST /v1/webhooks`, `GET /v1/webhooks`, `DELETE /v1/webhooks/{id}` | Manage authenticated issuer TOML change subscriptions. One API key may register up to 10 endpoints; every event fans out to all of them, and `GET /v1/webhooks` reports delivery state per endpoint. |
 | `POST /v1/coverage-webhooks` | Register a coverage threshold (admin token required) |
 | `DELETE /v1/coverage-webhooks/{id}` | Remove a registration and its delivery log (admin token required) |
-
 Every `4xx` and `5xx` response has the same body:
 `{"code":"asset_not_listed","message":"…"}`, with an optional `details` object.
 `code` is machine-readable and stable, so clients should match on it instead of

@@ -190,20 +190,28 @@ type fakeStore struct {
 	progress store.Progress
 	raw      [][]soroban.RawEvent
 	applied  [][]any
+	names    []string
 	cursors  []string
 	ledgers  []uint32
+	replayed [][]any
 }
 
 func (f *fakeStore) Progress(context.Context, string) (store.Progress, error) {
 	return f.progress, nil
 }
 
-func (f *fakeStore) ApplyEvents(_ context.Context, _, cursor string, ledger uint32, raw []soroban.RawEvent, events []any) error {
+func (f *fakeStore) ApplyEvents(_ context.Context, name, cursor string, ledger uint32, raw []soroban.RawEvent, events []any) error {
 	f.raw = append(f.raw, raw)
 	f.applied = append(f.applied, events)
+	f.names = append(f.names, name)
 	f.cursors = append(f.cursors, cursor)
 	f.ledgers = append(f.ledgers, ledger)
 	return nil
+}
+
+func (f *fakeStore) ApplyReplayEvents(_ context.Context, events []any) (store.ReplaySummary, error) {
+	f.replayed = append(f.replayed, events)
+	return store.SummarizeReplay(events), nil
 }
 
 func newIngester(rpc *fakeRPC, db *fakeStore) *Ingester {

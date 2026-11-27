@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -34,8 +35,13 @@ func loadEnvLocal() error {
 // environment. A missing file is not an error. The whole file is parsed before
 // any variable is set, so a malformed line changes nothing.
 func loadEnvFile(path string) error {
-	// #nosec G304 -- production only calls this with the fixed .env.local path.
-	f, err := os.Open(path)
+	// Open through a filesystem rooted at the file's directory: the read is
+	// confined to that directory and a path cannot reach outside it.
+	dir, name := filepath.Split(path)
+	if dir == "" {
+		dir = "."
+	}
+	f, err := os.DirFS(dir).Open(name)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil

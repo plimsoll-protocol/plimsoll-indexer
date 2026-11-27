@@ -30,10 +30,16 @@ func (r compressionReader) ListAssets(context.Context) ([]coverage.Asset, error)
 func (compressionReader) GetAsset(context.Context, string) (coverage.Asset, error) {
 	return coverage.Asset{}, store.ErrNotFound
 }
+func (compressionReader) LatestSupply(context.Context, string) (*coverage.Supply, error) {
+	return nil, nil
+}
 func (compressionReader) LatestSupplies(context.Context, []string) (map[string]*coverage.Supply, error) {
 	return map[string]*coverage.Supply{}, nil
 }
 func (compressionReader) SupplyHistory(context.Context, string, int) ([]coverage.Supply, error) {
+	return nil, nil
+}
+func (compressionReader) LatestReports(context.Context, string) (map[uint32]coverage.Report, error) {
 	return nil, nil
 }
 func (compressionReader) LatestReportsBySAC(context.Context, []string) (map[string]map[uint32]coverage.Report, error) {

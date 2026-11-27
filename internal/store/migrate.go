@@ -36,6 +36,11 @@ type migration struct {
 	SQL     string
 }
 
+// key is how a migration is recorded: its version alone does not identify it.
+func (m migration) key() string {
+	return fmt.Sprintf("%04d_%s", m.Version, m.Name)
+}
+
 // loadMigrations reads the migration files at the root of fsys and returns
 // them in version order. Migrations sharing a version are applied by name in
 // one transaction; this supports independently prepared branches that used the

@@ -12,13 +12,15 @@ One process (`cmd/plimsoll-indexer`) runs these jobs and an HTTP server on
 | Job | Log field `job` | Interval | Needs a key |
 | --- | --- | --- | --- |
 | Event ingester | `ingest` | `INGEST_INTERVAL` (10s) | no |
+| Reporter watcher | `reporters` | `REPORTER_INTERVAL` (5s, about one ledger) | no |
 | State reconciler | `reconcile` | `RECONCILE_INTERVAL` (15m) | no |
 | stellar.toml sync | `toml` | checked every minute, each asset refreshed every `TOML_INTERVAL` (6h) | no |
 | Coverage alerts | `webhooks` | `WEBHOOK_INTERVAL` (1m) | no |
 | Supply poster | `poster` | `POST_INTERVAL` (15m), reposts after `REPOST_AFTER` (6h) | yes, `SUPPLY_POSTER_SECRET` |
 | Keep-awake | `keepawake` | `KEEP_AWAKE_INTERVAL` (10m) | no |
 
-Ingest and reconcile run once before the server starts listening. A job that
+Ingest, the reporter watcher and reconcile run once before the server starts
+listening. A job that
 returns an error is logged as `job failed` with `err` and retried on its next
 tick; it does not stop the process. The process exits non-zero only if the
 database cannot be opened, the poster secret is invalid, or the HTTP server
@@ -50,6 +52,8 @@ values are reported together at startup.
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. Logs are JSON on stdout. |
 | `GO_ENV` | empty | `production` disables the local `.env.local` overlay. Set it on every deployed instance. |
 | `KEEP_AWAKE_URL` | derived | `none` disables; otherwise `$RENDER_EXTERNAL_URL/healthz` on Render. |
+| `REPORTER_INTERVAL` | `5s` | How often registry reporter events are polled on their own cursor, so a registration reaches `/v1/reporters` within about one ledger. |
+| `HTTP_KEEPALIVE_TIMEOUT` | `90s` | How long an idle HTTP/2 connection to Horizon or Soroban RPC is kept open for reuse. |
 
 Intervals use Go duration syntax (`10s`, `15m`, `6h`).
 
@@ -131,6 +135,8 @@ Logs are JSON (`log/slog`). Key messages:
 | warn | `webhook delivery failed` (`webhook_id`, `delivery_id`, `status`, `retry_at`) | Delivery will be retried with backoff, at most five attempts in total. |
 | info | `supply posting disabled (SUPPLY_POSTER_SECRET not set)` | Expected on read-only instances. |
 | info | `supply cross-check disabled (HORIZON_CHECK_URL not set)` | The poster signs on one Horizon's word. |
+| info | `indexed reporter events` | The reporter watcher stored a registration or revocation. |
+| info | `replay progress` / `replay complete` | A `replay` run advanced through its ledger range. |
 | info | `issuer stellar.toml changed` | The issuer document hash changed; includes `old_hash` and `new_hash`. |
 | error | `issuer stellar.toml change webhook delivery failed` | A destination could not receive the TOML change event. |
 
@@ -155,6 +161,20 @@ new secret, restart, confirm a post succeeds, then revoke the old reporter.
 **Supply snapshot stale.** Posting needs `SUPPLY_POSTER_SECRET`, a funded
 account and a ledger above the last snapshot (the poster never posts at or below
 the last snapshot's ledger). Check `job failed` entries with `job=poster`.
+
+**Replay a ledger range.** Re-ingest a window of ledgers without deleting
+anything and without moving the ingest cursor:
+
+```bash
+plimsoll-indexer replay -from 5034380 -to 5035000
+plimsoll-indexer replay -from 5034380 -to 5035000 -dry-run
+```
+
+Rows are keyed by event id, so running the same range twice produces the same
+state; reporter changes only apply when they are not older than what is
+stored. `-dry-run` needs no database and logs what would be upserted. Progress
+is logged every 1 000 ledgers, and the command exits 2 on a bad range, 1 on an
+RPC or database failure, and 0 on success.
 
 **Breakdown returns 404 for an on-chain hash.** The poster saves each
 breakdown before it posts it and serves it only once the post is confirmed: by

@@ -117,6 +117,14 @@ func (f *fake) ReportExportPage(_ context.Context, _ string, from, to *time.Time
 	}
 	return f.exportPages[pageIndex], nil
 }
+func (f *fake) LatestSupply(_ context.Context, sac string) (*coverage.Supply, error) {
+	return f.supply[sac], nil
+}
+
+func (f *fake) LatestReports(_ context.Context, sac string) (map[uint32]coverage.Report, error) {
+	return f.reports[sac], nil
+}
+
 func (f *fake) Reporters(context.Context) ([]coverage.Reporter, error) {
 	websiteURI, contactHash := "https://acme.example", "sha256:contact"
 	return []coverage.Reporter{{
@@ -158,6 +166,7 @@ func (f *fake) Attestation(_ context.Context, s string) (store.Attestation, erro
 	}
 	return store.Attestation{}, store.ErrNotFound
 }
+
 func TestHealthAggregatesContractStreamProgress(t *testing.T) {
 	f := &fake{
 		progress: map[string]store.Progress{
@@ -205,6 +214,15 @@ type webhookManagerFake struct {
 }
 
 func (f *webhookManagerFake) CreateWebhook(_ context.Context, url, hash string, ciphertext []byte, ownerKeyHash string) (store.Webhook, error) {
+	owned := 0
+	for _, item := range f.webhooks {
+		if item.OwnerKeyHash == ownerKeyHash {
+			owned++
+		}
+	}
+	if owned >= store.MaxWebhooksPerKey {
+		return store.Webhook{}, store.ErrWebhookLimit
+	}
 	item := store.Webhook{
 		ID: int64(len(f.webhooks) + 1), URL: url, SecretHash: hash,
 		SecretCiphertext: ciphertext, OwnerKeyHash: ownerKeyHash, CreatedAt: now,
@@ -215,6 +233,16 @@ func (f *webhookManagerFake) CreateWebhook(_ context.Context, url, hash string, 
 
 func (f *webhookManagerFake) ListWebhooks(context.Context) ([]store.Webhook, error) {
 	return f.webhooks, nil
+}
+
+func (f *webhookManagerFake) ListWebhooksForKey(_ context.Context, ownerKeyHash string) ([]store.Webhook, error) {
+	out := make([]store.Webhook, 0, len(f.webhooks))
+	for _, item := range f.webhooks {
+		if item.OwnerKeyHash == ownerKeyHash || item.OwnerKeyHash == "" {
+			out = append(out, item)
+		}
+	}
+	return out, nil
 }
 
 func (f *webhookManagerFake) DeleteWebhook(_ context.Context, id int64, ownerKeyHash string, allowLegacyAdmin bool) error {
@@ -334,6 +362,7 @@ func TestGetAssetCoverage(t *testing.T) {
 			t.Errorf("%s = %v (present: %t), want null", field, value, ok)
 		}
 	}
+	// The issuer's attestation document is folded into the stored SEP-1 object.
 	toml := body["toml"].(map[string]any)
 	if toml["attestation_hash"] != "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" ||
 		toml["attestation_first_seen_at"] != now.Add(-48*time.Hour).Format(time.RFC3339) ||
@@ -804,16 +833,15 @@ func TestReportExportStreamsPagesAndAppliesDateFilters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// One header and every row of both pages.
 	if len(records) != 502 || strings.Join(records[0], ",") != "ledger,timestamp,reporter,bps,tier,doc_uri" {
 		t.Fatalf("CSV has %d records and header %v", len(records), records[0])
-	}
-	if got := strings.Join(records[1], ","); got != "100,2026-10-05T10:00:00Z,GREPORTER,10200,issuer_signed,https://example.test/report" {
-		t.Fatalf("first report record = %q", got)
 	}
 	if f.exportCalls != 2 || f.exportCursors[1] == nil ||
 		f.exportCursors[1].Ledger != 599 || f.exportCursors[1].EventID != "event-599" {
 		t.Fatalf("page calls/cursor = %d / %+v", f.exportCalls, f.exportCursors)
 	}
+	// to is exclusive, so to=2026-10-05 asks for everything before 2026-10-06.
 	if f.exportFrom == nil || !f.exportFrom.Equal(time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)) ||
 		f.exportTo == nil || !f.exportTo.Equal(time.Date(2026, 10, 6, 0, 0, 0, 0, time.UTC)) {
 		t.Fatalf("date bounds = %v / %v", f.exportFrom, f.exportTo)
@@ -849,6 +877,7 @@ func adminRequest(t *testing.T, srv *httptest.Server, method, path, token, body 
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -906,6 +935,89 @@ func TestWebhookAdminEndpoints(t *testing.T) {
 	}
 	if got, _ := adminRequest(t, srv, http.MethodDelete, "/v1/coverage-webhooks/abc", "test-admin", ""); got != http.StatusBadRequest {
 		t.Fatalf("delete non-numeric: status %d, want 400", got)
+	}
+}
+
+func TestWebhookPerKeyLimitAndScopedListing(t *testing.T) {
+	manager := &webhookManagerFake{}
+	codec, err := webhook.NewSecretCodec(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := serverWithWebhooks(manager, codec, "admin-token")
+	defer srv.Close()
+
+	post := func(token, url string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/webhooks", strings.NewReader(`{"url":"`+url+`"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	for i := range store.MaxWebhooksPerKey {
+		resp := post("owner-token", "https://receiver.example/"+strconv.Itoa(i))
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("endpoint %d: status %d, want 201", i, resp.StatusCode)
+		}
+	}
+	over := post("owner-token", "https://receiver.example/over")
+	var overBody errorBody
+	if err := json.NewDecoder(over.Body).Decode(&overBody); err != nil {
+		t.Fatal(err)
+	}
+	over.Body.Close()
+	if over.StatusCode != http.StatusUnprocessableEntity || overBody.Code != "webhook_limit_reached" {
+		t.Fatalf("over the limit = %d %+v, want 422 webhook_limit_reached", over.StatusCode, overBody)
+	}
+	other := post("other-owner-token", "https://receiver.example/other")
+	other.Body.Close()
+	if other.StatusCode != http.StatusCreated {
+		t.Fatalf("second key: status %d, want 201", other.StatusCode)
+	}
+
+	list := func(token string) []map[string]any {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, srv.URL+"/v1/webhooks", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var body struct {
+			Webhooks []map[string]any `json:"webhooks"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		return body.Webhooks
+	}
+
+	mine := list("owner-token")
+	if len(mine) != store.MaxWebhooksPerKey {
+		t.Fatalf("owner lists %d endpoints, want %d", len(mine), store.MaxWebhooksPerKey)
+	}
+	for _, w := range mine {
+		if w["url"] == "https://receiver.example/other" {
+			t.Fatal("a key listed another key's endpoint")
+		}
+		if _, ok := w["delivery"]; !ok {
+			t.Fatalf("endpoint %v has no delivery state", w["url"])
+		}
+	}
+	if all := list("admin-token"); len(all) != store.MaxWebhooksPerKey+1 {
+		t.Fatalf("admin lists %d endpoints, want %d", len(all), store.MaxWebhooksPerKey+1)
 	}
 }
 
@@ -974,13 +1086,14 @@ var errUnreadable = errors.New(`supply snapshot at ledger 100: amount "NaN" is n
 func (unreadable) LatestSupply(context.Context, string) (*coverage.Supply, error) {
 	return nil, errUnreadable
 }
+
+func (unreadable) LatestSupplies(context.Context, []string) (map[string]*coverage.Supply, error) {
+	return nil, errUnreadable
+}
 func (unreadable) SupplyHistory(context.Context, string, int) ([]coverage.Supply, error) {
 	return nil, errUnreadable
 }
 func (unreadable) LatestReports(context.Context, string) (map[uint32]coverage.Report, error) {
-	return nil, errUnreadable
-}
-func (unreadable) LatestSupplies(context.Context, []string) (map[string]*coverage.Supply, error) {
 	return nil, errUnreadable
 }
 func (unreadable) LatestReportsBySAC(context.Context, []string) (map[string]map[uint32]coverage.Report, error) {

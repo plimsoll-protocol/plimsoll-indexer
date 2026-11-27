@@ -81,6 +81,17 @@ type Config struct {
 	KeepAwakeURL      string
 	KeepAwakeInterval time.Duration
 
+	// ReporterInterval is how often the registry contract is polled on its own
+	// cursor. It is deliberately shorter than IngestInterval so a reporter
+	// registration reaches /v1/reporters within about one ledger (roughly 5s)
+	// instead of waiting for the next reconcile pass.
+	ReporterInterval time.Duration
+
+	// HTTPKeepAlive is how long an idle connection to Horizon or Soroban RPC
+	// is kept open for reuse. Both are called several times a tick, so
+	// connection reuse avoids a TLS handshake per call.
+	HTTPKeepAlive time.Duration
+
 	// MaxFeeStroops is the absolute ceiling the invoker will sign per
 	// transaction. Zero means no ceiling.
 	MaxFeeStroops int64
@@ -197,6 +208,8 @@ func Load() (Config, error) {
 		{"TOML_INTERVAL", "6h", &c.TomlInterval},
 		{"WEBHOOK_INTERVAL", "1m", &c.WebhookInterval},
 		{"KEEP_AWAKE_INTERVAL", "10m", &c.KeepAwakeInterval},
+		{"REPORTER_INTERVAL", "5s", &c.ReporterInterval},
+		{"HTTP_KEEPALIVE_TIMEOUT", "90s", &c.HTTPKeepAlive},
 	}
 	for _, d := range durations {
 		v, err := time.ParseDuration(envOr(d.name, d.def))

@@ -158,6 +158,8 @@ func TestBreakdownBytesRoundTripExactly(t *testing.T) {
 	if err := s.SaveBreakdown(ctx, hash, testSAC, body); err != nil {
 		t.Fatal(err)
 	}
+	// Only a confirmed breakdown is served: sha256(body) is the on-chain hash,
+	// so the bytes are published once the post behind them landed.
 	if err := s.ConfirmBreakdown(ctx, hash); err != nil {
 		t.Fatal(err)
 	}

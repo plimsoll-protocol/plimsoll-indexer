@@ -3,7 +3,6 @@ package api
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/subtle"
 	_ "embed"
 	"encoding/base64"
@@ -39,8 +38,10 @@ type Reader interface {
 	Ping(ctx context.Context) error
 	ListAssets(ctx context.Context) ([]coverage.Asset, error)
 	GetAsset(ctx context.Context, sac string) (coverage.Asset, error)
+	LatestSupply(ctx context.Context, sac string) (*coverage.Supply, error)
 	LatestSupplies(ctx context.Context, sacs []string) (map[string]*coverage.Supply, error)
 	SupplyHistory(ctx context.Context, sac string, limit int) ([]coverage.Supply, error)
+	LatestReports(ctx context.Context, sac string) (map[uint32]coverage.Report, error)
 	LatestReportsBySAC(ctx context.Context, sacs []string) (map[string]map[uint32]coverage.Report, error)
 	ReportHistory(ctx context.Context, sac string, limit int) ([]coverage.Report, error)
 	ReportExportPage(ctx context.Context, sac string, from, to *time.Time, after *store.ReportExportCursor, limit int) ([]store.ReportExportRow, error)
@@ -101,9 +102,13 @@ type Server struct {
 	Changelog []changelog.Entry
 }
 
+// WebhookManager manages the endpoints of one API key. apiKey is the
+// fingerprint of the bearer token that made the request, so a key can only
+// list and delete its own endpoints.
 type WebhookManager interface {
-	CreateWebhook(context.Context, string, string, []byte, string) (store.Webhook, error)
-	ListWebhooks(context.Context) ([]store.Webhook, error)
+	CreateWebhook(ctx context.Context, url, secretHash string, ciphertext []byte, ownerKeyHash string) (store.Webhook, error)
+	ListWebhooks(ctx context.Context) ([]store.Webhook, error)
+	ListWebhooksForKey(ctx context.Context, ownerKeyHash string) ([]store.Webhook, error)
 	DeleteWebhook(ctx context.Context, id int64, ownerKeyHash string, allowLegacyAdmin bool) error
 }
 
@@ -202,9 +207,20 @@ type reporterJSON struct {
 }
 
 type webhookJSON struct {
-	ID        int64     `json:"id"`
-	URL       string    `json:"url"`
-	CreatedAt time.Time `json:"created_at"`
+	ID        int64        `json:"id"`
+	URL       string       `json:"url"`
+	CreatedAt time.Time    `json:"created_at"`
+	Delivery  deliveryJSON `json:"delivery"`
+}
+
+// deliveryJSON is the per-endpoint delivery state. Events fan out to every
+// endpoint, so each one succeeds or fails on its own.
+type deliveryJSON struct {
+	Deliveries int64      `json:"deliveries"`
+	Failures   int64      `json:"failures"`
+	LastAt     *time.Time `json:"last_at"`
+	LastStatus string     `json:"last_status,omitempty"`
+	LastError  string     `json:"last_error,omitempty"`
 }
 
 type createdWebhookJSON struct {
@@ -225,6 +241,21 @@ func toReport(r coverage.Report) *reportJSON {
 		out.DocCheck = &r.DocCheck
 	}
 	return out
+}
+
+func toWebhookJSON(w store.Webhook) webhookJSON {
+	return webhookJSON{
+		ID:        w.ID,
+		URL:       w.URL,
+		CreatedAt: w.CreatedAt,
+		Delivery: deliveryJSON{
+			Deliveries: w.Deliveries,
+			Failures:   w.Failures,
+			LastAt:     w.LastDeliveryAt,
+			LastStatus: w.LastDeliveryStatus,
+			LastError:  w.LastDeliveryError,
+		},
+	}
 }
 
 func (s *Server) toCoverage(r *coverage.Result) *coverageJSON {
@@ -473,6 +504,9 @@ func (s *Server) assemble(ctx context.Context, a coverage.Asset, minTier uint32)
 	return s.assembleWithData(ctx, a, supplies[a.SAC], reportsBySAC[a.SAC], minTier)
 }
 
+// assembleWithData builds the asset document from figures that were already
+// read for a whole page, so listing N assets does not issue four queries per
+// asset.
 func (s *Server) assembleWithData(ctx context.Context, a coverage.Asset, sp *coverage.Supply, reports map[uint32]coverage.Report, minTier uint32) (assetJSON, error) {
 	att, attErr := s.Store.Attestation(ctx, a.SAC)
 	if attErr != nil && !errors.Is(attErr, store.ErrNotFound) {
@@ -762,28 +796,46 @@ func (s *Server) createWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	created, err := s.WebhookStore.CreateWebhook(r.Context(), input.URL, webhook.SecretHash(secret), ciphertext, ownerKeyHash)
+	if errors.Is(err, store.ErrWebhookLimit) {
+		writeErrorDetails(w, http.StatusUnprocessableEntity, codeWebhookLimitReached,
+			fmt.Sprintf("an API key may register at most %d webhook endpoints", store.MaxWebhooksPerKey),
+			map[string]any{"limit": store.MaxWebhooksPerKey})
+		return
+	}
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, createdWebhookJSON{
-		webhookJSON: webhookJSON{ID: created.ID, URL: created.URL, CreatedAt: created.CreatedAt},
+		webhookJSON: toWebhookJSON(created),
 		Secret:      secret,
 	})
 }
 
 func (s *Server) listWebhooks(w http.ResponseWriter, r *http.Request) {
-	if !s.webhookConfigured(w) || !s.authorizeWebhookAdmin(w, r) {
+	if !s.webhookConfigured(w) {
 		return
 	}
-	webhooks, err := s.WebhookStore.ListWebhooks(r.Context())
+	ownerKeyHash, isAdmin, ok := s.authorizeWebhookAPIKey(w, r)
+	if !ok {
+		return
+	}
+	// A key sees the endpoints it registered; the admin token sees every
+	// endpoint, which is what an operator needs when one destination fails.
+	var webhooks []store.Webhook
+	var err error
+	if isAdmin {
+		webhooks, err = s.WebhookStore.ListWebhooks(r.Context())
+	} else {
+		webhooks, err = s.WebhookStore.ListWebhooksForKey(r.Context(), ownerKeyHash)
+	}
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
 	out := make([]webhookJSON, 0, len(webhooks))
 	for _, item := range webhooks {
-		out = append(out, webhookJSON{ID: item.ID, URL: item.URL, CreatedAt: item.CreatedAt})
+		out = append(out, toWebhookJSON(item))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"webhooks": out})
 }
@@ -826,15 +878,6 @@ func (s *Server) webhookConfigured(w http.ResponseWriter) bool {
 	return true
 }
 
-func (s *Server) authorizeWebhookAdmin(w http.ResponseWriter, r *http.Request) bool {
-	token, ok := bearerToken(r)
-	if !ok || !sameToken(token, s.WebhookAdminToken) {
-		writeError(w, http.StatusUnauthorized, codeUnauthorized, "unauthorized")
-		return false
-	}
-	return true
-}
-
 func (s *Server) authorizeWebhookAPIKey(w http.ResponseWriter, r *http.Request) (string, bool, bool) {
 	token, ok := bearerToken(r)
 	if !ok {
@@ -842,11 +885,11 @@ func (s *Server) authorizeWebhookAPIKey(w http.ResponseWriter, r *http.Request) 
 		return "", false, false
 	}
 	if sameToken(token, s.WebhookAdminToken) {
-		return webhookAPIKeyHash(token), true, true
+		return webhook.KeyID(token), true, true
 	}
 	for _, key := range s.WebhookAPIKeys {
 		if sameToken(token, key) {
-			return webhookAPIKeyHash(token), false, true
+			return webhook.KeyID(token), false, true
 		}
 	}
 	writeError(w, http.StatusUnauthorized, codeUnauthorized, "unauthorized")
@@ -862,11 +905,6 @@ func bearerToken(r *http.Request) (string, bool) {
 func sameToken(token, expected string) bool {
 	return len(token) == len(expected) &&
 		subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1
-}
-
-func webhookAPIKeyHash(key string) string {
-	sum := sha256.Sum256([]byte(key))
-	return hex.EncodeToString(sum[:])
 }
 
 // ---- coverage webhooks ----------------------------------------------------
@@ -1110,7 +1148,7 @@ func parseDateRange(w http.ResponseWriter, r *http.Request) (*time.Time, *time.T
 		return nil, nil, false
 	}
 	if from != nil && to != nil && !from.Before(*to) {
-		writeError(w, http.StatusBadRequest, codeInvalidDate, "from must be on or before to")
+		writeError(w, http.StatusBadRequest, codeInvalidDateRange, "from must be on or before to")
 		return nil, nil, false
 	}
 	return from, to, true
@@ -1170,12 +1208,14 @@ const (
 	codeCoverageNotFound      = "coverage_not_found"
 	codeInvalidMinTier        = "invalid_min_tier"
 	codeInvalidLimit          = "invalid_limit"
-	codeInvalidCursor         = "invalid_cursor"
 	codeInvalidDate           = "invalid_date"
 	codeInvalidBody           = "invalid_body"
+	codeInvalidCursor         = "invalid_cursor"
+	codeInvalidDateRange      = "invalid_date_range"
 	codeInvalidWebhookURL     = "invalid_webhook_url"
 	codeInvalidWebhookID      = "invalid_webhook_id"
 	codeWebhookNotFound       = "webhook_not_found"
+	codeWebhookLimitReached   = "webhook_limit_reached"
 	codeWebhookForbidden      = "webhook_forbidden"
 	codeWebhooksNotConfigured = "webhooks_not_configured"
 	codeUnauthorized          = "unauthorized"

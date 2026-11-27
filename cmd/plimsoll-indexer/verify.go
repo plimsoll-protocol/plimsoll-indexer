@@ -22,6 +22,7 @@ import (
 	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/horizon"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/netclient"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
 )
 
@@ -68,7 +69,7 @@ func runVerifyCommand(args []string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 	defer cancel()
 
-	httpClient := &http.Client{Timeout: 15 * time.Second}
+	httpClient := netclient.New(15*time.Second, netclient.DefaultKeepAlive)
 
 	// 1. Discover network parameters if needed
 	horizonURL := *horizonFlag
@@ -189,6 +190,7 @@ func runVerifyCommand(args []string) int {
 
 	// 5. Fetch current supply from Horizon
 	hzClient := horizon.NewClient(horizonURL)
+	hzClient.HTTP = netclient.New(20*time.Second, netclient.DefaultKeepAlive)
 	curBreakdown, err := hzClient.Supply(ctx, asset.Code, asset.Issuer)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error fetching supply from Horizon (%s): %v\n", horizonURL, err)
@@ -203,7 +205,7 @@ func fetchOnChainSupply(ctx context.Context, rpcURL, ledgerID, sac string) (stri
 	if rpcURL == "" || ledgerID == "" {
 		return "", 0, errors.New("rpc URL and coverage ledger contract ID are required")
 	}
-	rpcClient := rpcclient.NewClient(rpcURL, &http.Client{Timeout: 15 * time.Second})
+	rpcClient := rpcclient.NewClient(rpcURL, netclient.New(15*time.Second, netclient.DefaultKeepAlive))
 
 	contractAddr, err := soroban.ScAddress(ledgerID)
 	if err != nil {

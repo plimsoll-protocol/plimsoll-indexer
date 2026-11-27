@@ -13,12 +13,13 @@ import (
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
 )
 
-type subscriptionStore interface {
+type deliveryStore interface {
 	ListWebhooks(context.Context) ([]store.Webhook, error)
+	RecordWebhookDelivery(ctx context.Context, id int64, at time.Time, failure string) error
 }
 
 type Dispatcher struct {
-	Store  subscriptionStore
+	Store  deliveryStore
 	Codec  *SecretCodec
 	Client *http.Client
 	Now    func() time.Time
@@ -33,7 +34,7 @@ type TOMLChangedPayload struct {
 	OccurredAt time.Time `json:"occurred_at"`
 }
 
-func NewDispatcher(db subscriptionStore, codec *SecretCodec) *Dispatcher {
+func NewDispatcher(db deliveryStore, codec *SecretCodec) *Dispatcher {
 	return &Dispatcher{
 		Store: db,
 		Codec: codec,
@@ -67,8 +68,15 @@ func (d *Dispatcher) TOMLChanged(ctx context.Context, issuer, domain, oldHash, n
 
 	var failures []error
 	for _, w := range webhooks {
+		delivered := ""
 		if err := d.deliver(ctx, w, payload); err != nil {
+			delivered = err.Error()
 			failures = append(failures, fmt.Errorf("deliver webhook %d: %w", w.ID, err))
+		}
+		// Track the attempt per endpoint even when it failed, so GET
+		// /v1/webhooks shows which destination is broken.
+		if err := d.Store.RecordWebhookDelivery(ctx, w.ID, now, delivered); err != nil {
+			failures = append(failures, fmt.Errorf("record delivery for webhook %d: %w", w.ID, err))
 		}
 	}
 	return errors.Join(failures...)
