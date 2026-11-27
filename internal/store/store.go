@@ -1241,6 +1241,15 @@ func (s *Store) BatchCoverage(ctx context.Context, sacs []string) (map[string]Co
 		return nil, fmt.Errorf("iterate batch coverage: %w", err)
 	}
 	return out, nil
+// mustBig parses a NUMERIC column that the schema makes non-null. A value that
+// cannot be parsed is not silently dropped: it becomes zero, which coverage
+// reads as an empty reserve rather than as a healthy asset.
+func mustBig(s string) *big.Int {
+	n, ok := new(big.Int).SetString(s, 10)
+	if !ok {
+		return new(big.Int)
+	}
+	return n
 }
 
 func (s *Store) queryReports(ctx context.Context, sql string, args ...any) ([]coverage.Report, error) {
@@ -1268,11 +1277,27 @@ func (s *Store) queryReports(ctx context.Context, sql string, args ...any) ([]co
 	return out, rows.Err()
 }
 
+// Reporters returns every reporter in the registry, active or revoked, with the
+// strongest reserve-report tier they have posted and the number of distinct
+// assets and reports behind it. Filtering, sorting and paging are the API's job:
+// a registry is small, and the counts come from one grouped scan.
 func (s *Store) Reporters(ctx context.Context) ([]coverage.Reporter, error) {
 	defer measureQuery("reporters")()
 	rows, err := s.pool.Query(ctx, `
 		SELECT address, role, name, COALESCE(display_name, name), website_uri, contact_hash, updated_at FROM reporters
 		WHERE active ORDER BY role, name`)
+		SELECT r.address, r.role, r.name, r.active, r.updated_at,
+		       r.reputation_score, r.expires_at,
+		       COALESCE(agg.tier, 0), COALESCE(agg.asset_count, 0), COALESCE(agg.report_count, 0)
+		FROM reporters r
+		LEFT JOIN (
+		    SELECT reporter, MAX(tier) AS tier,
+		           COUNT(DISTINCT sac) AS asset_count,
+		           COUNT(*) AS report_count
+		    FROM reserve_reports
+		    GROUP BY reporter
+		) agg ON agg.reporter = r.address
+		ORDER BY r.role, r.name, r.address`)
 	if err != nil {
 		return nil, err
 	}
@@ -1287,6 +1312,16 @@ func (s *Store) Reporters(ctx context.Context) ([]coverage.Reporter, error) {
 		}
 		r.Role = uint32(role)
 		r.WebsiteURI, r.ContactHash = websiteURI, contactHash
+		var role, tier int32
+		var assetCount, reportCount int64
+		if err := rows.Scan(&r.Address, &role, &r.Name, &r.Active, &r.UpdatedAt,
+			&r.ReputationScore, &r.ExpiresAt, &tier, &assetCount, &reportCount); err != nil {
+			return nil, err
+		}
+		r.Role = uint32(role)
+		r.Tier = uint32(tier)
+		r.AssetCount = int(assetCount)
+		r.ReportCount = int(reportCount)
 		out = append(out, r)
 	}
 	return out, rows.Err()

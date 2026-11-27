@@ -42,6 +42,8 @@ func loadEnvFile(path string) error {
 		dir = "."
 	}
 	f, err := os.DirFS(dir).Open(name)
+	// The path is the package's own constant (.env.local), never user input.
+	f, err := os.Open(path) //nolint:gosec // fixed local path, not tainted input
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil

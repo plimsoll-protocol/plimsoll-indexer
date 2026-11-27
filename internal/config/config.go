@@ -80,6 +80,28 @@ type Config struct {
 	WebhookInterval   time.Duration
 	IngestInterval    time.Duration
 	PostInterval      time.Duration
+	HorizonCheckURL    string
+	NetworkPassphrase  string
+	CoverageLedgerID   string
+	ReporterRegistryID string
+	StartLedger        uint32
+	IngestWorkers      int
+	PosterSecret       string
+	// WebhookAdminToken protects webhook administration. It is shared by
+	// issuer TOML change subscriptions and coverage alerts.
+	WebhookAdminToken string
+	WebhookAPIKeys    []string
+	// WebhookEncryptionKey encrypts the per-subscription secrets of issuer
+	// TOML change webhooks at rest; WebhookSigningSecret keys the HMAC-SHA256
+	// signature on coverage alert deliveries. Each enables its own feature and
+	// needs WebhookAdminToken.
+	WebhookEncryptionKey string
+	WebhookSigningSecret string
+	WebhookInterval      time.Duration
+	SlackWebhookURL      string
+	DiscordWebhookURL    string
+	IngestInterval       time.Duration
+	PostInterval         time.Duration
 	// ReconcileInterval is how often contract state is read back to repair
 	// what event ingestion missed. Each pass is a handful of simulations per
 	// asset, so it can be infrequent.

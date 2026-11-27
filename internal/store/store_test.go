@@ -162,6 +162,7 @@ func TestBreakdownBytesRoundTripExactly(t *testing.T) {
 	}
 	// Only a confirmed breakdown is served: sha256(body) is the on-chain hash,
 	// so the bytes are published once the post behind them landed.
+	// A breakdown is served only once its post is confirmed on chain.
 	if err := s.ConfirmBreakdown(ctx, hash); err != nil {
 		t.Fatal(err)
 	}
