@@ -1,0 +1,22 @@
+schema:
+  - internal/graphql/schema.graphqls
+
+exec:
+  filename: internal/graphql/generated.go
+  package: graphql
+
+model:
+  filename: internal/graphql/models_gen.go
+  package: graphql
+
+resolver:
+  layout: follow-schema
+  dir: internal/graphql
+  package: graphql
+  filename_template: "{name}.resolvers.go"
+
+models:
+  Time:
+    model: github.com/99designs/gqlgen/graphql.Time
+  Asset:
+    model: github.com/plimsoll-protocol/plimsoll-indexer/internal/graphql.Asset

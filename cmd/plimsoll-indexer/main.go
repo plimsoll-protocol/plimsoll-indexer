@@ -24,6 +24,7 @@ import (
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/changelog"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/config"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/events"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/graphql"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/horizon"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/netclient"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/secrets"
@@ -46,6 +47,8 @@ func main() {
 	}
 	if len(os.Args) > 1 && os.Args[1] == "keygen" {
 		os.Exit(runKeygenCommand(os.Args[2:]))
+	if len(os.Args) > 1 && os.Args[1] == "reindex" {
+		os.Exit(runReindexCommand(os.Args[2:]))
 	}
 
 	cfg, err := config.Load()
@@ -203,6 +206,19 @@ func run(cfg config.Config, build buildinfo.Info, log *slog.Logger) error {
 		go every(ctx, cfg.WebhookInterval, log.With("job", "webhooks"), notifier.Run)
 	}
 
+	if cfg.RetentionDays > 0 {
+		retention := &worker.Retention{
+			Store: db,
+			Days:  cfg.RetentionDays,
+			Log:   log.With("job", "retention"),
+			Now:   time.Now,
+		}
+		log.Info("retention enabled", "days", cfg.RetentionDays)
+		go every(ctx, 24*time.Hour, log.With("job", "retention"), retention.Run)
+	} else {
+		log.Info("retention disabled (RETENTION_DAYS=0)")
+	}
+
 	if cfg.KeepAwakeURL != "" {
 		keepAwake := worker.NewKeepAwake(cfg.KeepAwakeURL)
 		kaLog := log.With("job", "keepawake")
@@ -257,6 +273,12 @@ func run(cfg config.Config, build buildinfo.Info, log *slog.Logger) error {
 		log.Info("supply posting disabled (no poster secret configured)")
 	}
 
+	var graphqlHandler http.Handler
+	if cfg.GraphQLEnabled {
+		graphqlHandler = graphql.NewHandler(db, cfg.IsProduction())
+		log.Info("graphql enabled", "introspection", !cfg.IsProduction())
+	} else {
+		log.Info("graphql disabled (ENABLE_GRAPHQL not set)")
 	// A malformed changelog would break the published API contract, so refuse
 	// to start rather than serve it.
 	changes, err := changelog.Load()
@@ -292,6 +314,14 @@ func run(cfg config.Config, build buildinfo.Info, log *slog.Logger) error {
 			Events: hub,
 			// Closing ctx ends live streams so shutdown does not wait on them.
 			Done: ctx.Done(),
+			CORS:    cfg.CORSOrigins,
+			Log:     log.With("component", "api"),
+			Now:     time.Now,
+			GraphQL: graphqlHandler,
+			CORS:      cfg.CORSOrigins,
+			Log:       log.With("component", "api"),
+			Now:       time.Now,
+			Changelog: changes,
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second, // Bounds the time clients can spend sending request bodies.

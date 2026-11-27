@@ -175,6 +175,20 @@ func appliedVersions(t *testing.T, url string) []int {
 	return v
 }
 
+// embeddedVersions is every migration compiled into the binary, in order.
+func embeddedVersions(t *testing.T) []int {
+	t.Helper()
+	ms, err := loadMigrations(migrationsFS())
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := make([]int, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, m.Version)
+	}
+	return out
+}
+
 func schemaDiff(a, b []string) []string {
 	in := map[string]int{}
 	for _, l := range a {
@@ -202,6 +216,13 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 	}
 	if got, want := appliedVersions(t, fresh), embeddedVersions(t); !slices.Equal(got, want) {
 		t.Fatalf("fresh database recorded %v, want %v", got, want)
+	wantVersions := embeddedVersions(t)
+	if got := appliedVersions(t, fresh); !slices.Equal(got, wantVersions) {
+		t.Fatalf("fresh database recorded %v, want %v", got, wantVersions)
+	if got := appliedVersions(t, fresh); len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3 {
+		t.Fatalf("fresh database recorded %v, want [1 2 3]", got)
+	if got := appliedVersions(t, fresh); len(got) != 4 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 {
+		t.Fatalf("fresh database recorded %v, want [1 2 3 4]", got)
 	}
 
 	for name, schema := range map[string]string{
@@ -233,6 +254,12 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 			}
 			if got, want := appliedVersions(t, url), embeddedVersions(t); !slices.Equal(got, want) {
 				t.Fatalf("recorded %v, want %v", got, want)
+			if got := appliedVersions(t, url); !slices.Equal(got, wantVersions) {
+				t.Fatalf("recorded %v, want %v", got, wantVersions)
+			if got := appliedVersions(t, url); len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3 {
+				t.Fatalf("recorded %v, want [1 2 3]", got)
+			if got := appliedVersions(t, url); len(got) != 4 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 {
+				t.Fatalf("recorded %v, want [1 2 3 4]", got)
 			}
 			a, err := s.GetAsset(context.Background(), "CSAC")
 			if err != nil || a.Code != "PUSD" {
@@ -259,6 +286,13 @@ func TestReopeningAppliesNothingTwice(t *testing.T) {
 	s2.Close()
 	if got, want := appliedVersions(t, url), embeddedVersions(t); !slices.Equal(got, want) {
 		t.Fatalf("recorded %v, want %v", got, want)
+	want := embeddedVersions(t)
+	if got := appliedVersions(t, url); !slices.Equal(got, want) {
+		t.Fatalf("recorded %v, want %v", got, want)
+	if got := appliedVersions(t, url); len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3 {
+		t.Fatalf("recorded %v, want [1 2 3]", got)
+	if got := appliedVersions(t, url); len(got) != 4 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 {
+		t.Fatalf("recorded %v, want [1 2 3 4]", got)
 	}
 }
 
@@ -292,6 +326,13 @@ func TestConcurrentStartsDoNotRace(t *testing.T) {
 	}
 	if got, want := appliedVersions(t, url), embeddedVersions(t); !slices.Equal(got, want) {
 		t.Fatalf("recorded %v, want %v", got, want)
+	want := embeddedVersions(t)
+	if got := appliedVersions(t, url); !slices.Equal(got, want) {
+		t.Fatalf("recorded %v, want %v", got, want)
+	if got := appliedVersions(t, url); len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3 {
+		t.Fatalf("recorded %v, want [1 2 3]", got)
+	if got := appliedVersions(t, url); len(got) != 4 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 {
+		t.Fatalf("recorded %v, want [1 2 3 4]", got)
 	}
 }
 

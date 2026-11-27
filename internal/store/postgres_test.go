@@ -174,7 +174,7 @@ func TestBatchCoverage(t *testing.T) {
 }
 
 // execSQL runs statements on the database at url outside any Store.
-func execSQL(t *testing.T, url, sql string, args ...any) {
+func execSQL(t testing.TB, url, sql string, args ...any) {
 	t.Helper()
 	conn, err := pgx.Connect(context.Background(), url)
 	if err != nil {
@@ -187,7 +187,7 @@ func execSQL(t *testing.T, url, sql string, args ...any) {
 }
 
 // testPool is a connection pool on the database at url, closed with the test.
-func testPool(t *testing.T, url string) *pgxpool.Pool {
+func testPool(t testing.TB, url string) *pgxpool.Pool {
 	t.Helper()
 	p, err := pgxpool.New(context.Background(), url)
 	if err != nil {
