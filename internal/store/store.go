@@ -99,6 +99,19 @@ type WebhookDelivery struct {
 	AttemptedAt       time.Time
 }
 
+type AuditCursor struct {
+	Ledger uint32
+	ID     string
+}
+
+type AuditEvent struct {
+	ID        string    `json:"-"`
+	Type      string    `json:"type"`
+	Actor     string    `json:"actor"`
+	Ledger    uint32    `json:"ledger"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
 // Open connects to the database and brings its schema up to date by applying
 // any pending migrations (see migrate.go).
 func Open(ctx context.Context, url string) (*Store, error) {
@@ -897,6 +910,52 @@ func (s *Store) ReportHistoryCount(ctx context.Context, sac string) (int64, erro
 		return 0, fmt.Errorf("count report history: %w", err)
 	}
 	return total, nil
+// AuditHistory returns event-backed coverage records in stable ledger order.
+// The event ID breaks ties for events emitted in the same ledger.
+func (s *Store) AuditHistory(ctx context.Context, sac string, after *AuditCursor, limit int) ([]AuditEvent, error) {
+	var afterLedger any
+	afterID := ""
+	if after != nil {
+		afterLedger = int64(after.Ledger)
+		afterID = after.ID
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT event_id, type, actor, ledger, timestamp
+		FROM (
+			SELECT event_id, 'asset_listed'::text AS type, issuer AS actor,
+			       listed_ledger AS ledger, listed_at AS timestamp
+			FROM assets WHERE sac = $1
+			UNION ALL
+			SELECT event_id, 'supply_posted'::text AS type, poster AS actor,
+			       posted_ledger AS ledger, posted_at AS timestamp
+			FROM supply_snapshots WHERE sac = $1 AND source = 'event'
+			UNION ALL
+			SELECT event_id, 'report_posted'::text AS type, reporter AS actor,
+			       posted_ledger AS ledger, posted_at AS timestamp
+			FROM reserve_reports WHERE sac = $1 AND source = 'event'
+		) AS events
+		WHERE $2::bigint IS NULL OR (ledger, event_id) > ($2, $3)
+		ORDER BY ledger, event_id
+		LIMIT $4`, sac, afterLedger, afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query audit history: %w", err)
+	}
+	defer rows.Close()
+	var out []AuditEvent
+	for rows.Next() {
+		var event AuditEvent
+		var ledger int64
+		if err := rows.Scan(&event.ID, &event.Type, &event.Actor, &ledger, &event.Timestamp); err != nil {
+			return nil, fmt.Errorf("scan audit event: %w", err)
+		}
+		event.Ledger = uint32(ledger)
+		event.Timestamp = event.Timestamp.UTC()
+		out = append(out, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read audit history: %w", err)
+	}
+	return out, nil
 }
 
 // latestReportsSQL asks for one report per tier, each the newest by as_of.
