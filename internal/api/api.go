@@ -74,6 +74,7 @@ type Reader interface {
 	Disputes(ctx context.Context, sac, status string, limit, offset int) ([]coverage.Dispute, error)
 	Breakdown(ctx context.Context, hash string) ([]byte, error)
 	Attestation(ctx context.Context, sac string) (store.Attestation, error)
+	AuditHistory(ctx context.Context, sac string, after *store.AuditCursor, limit int) ([]store.AuditEvent, error)
 	Progress(ctx context.Context, name string) (store.Progress, error)
 	// EventsSince backs Last-Event-ID resume from stored events.
 	EventsSince(ctx context.Context, after string, limit int) ([]any, error)
@@ -211,6 +212,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/assets/{sac}/coverage", s.coverageSeries)
 	mux.HandleFunc("GET /v1/assets/{sac}/vault", s.getAssetVault)
 	mux.HandleFunc("GET /v1/issuers/{issuer}/toml", s.getIssuerToml)
+	mux.HandleFunc("GET /v1/assets/{sac}/audit", s.auditHistory)
 	mux.HandleFunc("GET /v1/reporters", s.reporters)
 	mux.HandleFunc("GET /v1/changelog", s.changelog)
 	mux.HandleFunc("GET /v1/stats", s.stats)
@@ -1207,6 +1209,47 @@ func (s *Server) coverageNow(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"reports": out})
 }
 
+func (s *Server) auditHistory(w http.ResponseWriter, r *http.Request) {
+	sac, ok := parseSAC(w, r)
+	if !ok {
+		return
+	}
+	limit, ok := parseLimit(w, r)
+	if !ok {
+		return
+	}
+	var after *store.AuditCursor
+	if token := r.URL.Query().Get("cursor"); token != "" {
+		after, ok = parseAuditCursor(token)
+		if !ok {
+			writeErrorDetails(w, http.StatusBadRequest, codeInvalidCursor,
+				"cursor must be a valid audit cursor", map[string]any{"parameter": "cursor"})
+			return
+		}
+	}
+	if !s.requireAsset(w, r, sac) {
+		return
+	}
+	events, err := s.Store.AuditHistory(r.Context(), sac, after, limit+1)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	hasMore := len(events) > limit
+	if hasMore {
+		events = events[:limit]
+	}
+	var nextCursor string
+	if hasMore {
+		last := events[len(events)-1]
+		nextCursor = makeAuditCursor(store.AuditCursor{Ledger: last.Ledger, ID: last.ID})
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Events     []store.AuditEvent `json:"events"`
+		NextCursor string             `json:"next_cursor,omitempty"`
+	}{Events: events, NextCursor: nextCursor})
+}
+
 func (s *Server) reporters(w http.ResponseWriter, r *http.Request) {
 	list, err := s.Store.Reporters(r.Context())
 	if err != nil {
@@ -1988,6 +2031,24 @@ func parseDateRange(w http.ResponseWriter, r *http.Request) (*time.Time, *time.T
 		return nil, nil, false
 	}
 	return from, to, true
+func makeAuditCursor(cursor store.AuditCursor) string {
+	payload := strconv.AppendUint(nil, uint64(cursor.Ledger), 10)
+	payload = append(payload, ':')
+	payload = append(payload, cursor.ID...)
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func parseAuditCursor(token string) (*store.AuditCursor, bool) {
+	payload, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return nil, false
+	}
+	ledgerText, id, found := strings.Cut(string(payload), ":")
+	ledger, err := strconv.ParseUint(ledgerText, 10, 32)
+	if !found || err != nil || id == "" {
+		return nil, false
+	}
+	return &store.AuditCursor{Ledger: uint32(ledger), ID: id}, true
 }
 
 func (s *Server) cors(next http.Handler) http.Handler {
@@ -2058,6 +2119,7 @@ const (
 	codeInvalidStatus         = "invalid_status"
 	codeInvalidMinBps         = "invalid_min_bps"
 	codeInvalidMaxAge         = "invalid_max_age"
+	codeInvalidCursor         = "invalid_cursor"
 	codeInvalidBody           = "invalid_body"
 	codeInvalidCursor         = "invalid_cursor"
 	codeInvalidDateRange      = "invalid_date_range"
