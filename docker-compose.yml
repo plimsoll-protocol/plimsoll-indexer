@@ -36,8 +36,19 @@ services:
       COVERAGE_LEDGER_ID: CC2QQ7R4FLPHZP7KA5AO4IASXXICTG6N4GQXCXITTEBNYQEYTYXKMN4D
       REPORTER_REGISTRY_ID: CCZCBR7MGSW5LGIEUQR5TU5Z7JQWBDEESB3RGPTRPMCBUMOISRPY7GOB
       START_LEDGER: "5034380"
-      # Leave empty for read-only (API + ingest + toml sync only).
+      # Leave both empty for read-only (API + ingest + toml sync only). Posting
+      # needs exactly one of them: setting both is a startup error. Prefer the
+      # file, so the secret never appears in the environment, process listing or
+      # crash dumps. Uncomment the volume below, create ./supply_poster.secret
+      # containing just the seed, and use the commented file path instead.
       SUPPLY_POSTER_SECRET: ""
+      # Read on startup; trailing whitespace (a mounted secret's newline) is trimmed.
+      SUPPLY_POSTER_SECRET_FILE: ""
+      # SUPPLY_POSTER_SECRET_FILE: /run/secrets/supply_poster_secret
+# Mount a Docker/Kubernetes secret file rather than passing the seed in the
+# environment. Uncomment with the SUPPLY_POSTER_SECRET_FILE line above:
+#    volumes:
+#      - ./supply_poster.secret:/run/secrets/supply_poster_secret:ro
       INGEST_INTERVAL: 10s
       INGEST_WORKERS: 2
       POST_INTERVAL: 15m
