@@ -173,6 +173,56 @@ paths:
             maximum: 1000
             default: 100
         - name: offset
+        - name: before
+          in: query
+          required: false
+          description: Return snapshots strictly before this ledger (at_ledger < before). Pass next_before from the previous page to walk older history.
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Supply history snapshots
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  supply:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Supply'
+                    required:
+                      - supply
+                  next_before:
+                    type: integer
+                    description: Ledger of the last returned snapshot. Pass it as `before` to fetch the next older page. Absent when no more rows exist.
+                required:
+                  - supply
+        '400':
+          description: Invalid limit parameter, or sac is not a contract strkey
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Asset not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/assets/{sac}/reports:
+    get:
+      summary: Get historical reserve reports for an asset
+      operationId: getReportHistory
+      parameters:
+        - name: sac
+          in: path
+          required: true
+          description: Stellar Asset Contract (SAC) address
+          schema:
+            type: string
+            pattern: '^C[A-Z2-7]{55}$'
+        - name: limit
           in: query
           required: false
           description: Number of matching assets to skip
@@ -180,6 +230,15 @@ paths:
             type: integer
             minimum: 0
             default: 0
+            minimum: 1
+            maximum: 1000
+            default: 100
+        - name: before
+          in: query
+          required: false
+          description: Return reports strictly before this posted ledger (posted_ledger < before). Pass next_before from the previous page to walk older history.
+          schema:
+            type: integer
       responses:
         '200':
           description: Covered assets
@@ -195,6 +254,12 @@ paths:
                   next_offset:
                     type: integer
                     description: Present when another page exists; pass it as offset.
+                      $ref: '#/components/schemas/Report'
+                    required:
+                      - reports
+                  next_before:
+                    type: integer
+                    description: Posted ledger of the last returned report. Pass it as `before` to fetch the next older page. Absent when no more rows exist.
                 required:
                   - assets
         '400':

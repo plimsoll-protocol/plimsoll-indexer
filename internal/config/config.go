@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/secrets"
 	"unicode"
+	"github.com/stellar/go-stellar-sdk/strkey"
 )
 
 const (
@@ -258,13 +260,56 @@ func Load() (Config, error) {
 		{"REPORTER_INTERVAL", "5s", &c.ReporterInterval},
 		{"HTTP_KEEPALIVE_TIMEOUT", "90s", &c.HTTPKeepAlive},
 	}
+	// minInterval is the floor for intervals whose tick hits an external
+	// service (RPC, Horizon, or an HTTP endpoint). Zero or negative intervals
+	// would panic in time.NewTicker, so every interval must be positive.
+	const minInterval = time.Second
+
+	externalIntervals := map[string]bool{
+		"INGEST_INTERVAL":     true,
+		"POST_INTERVAL":       true,
+		"RECONCILE_INTERVAL":  true,
+		"TOML_INTERVAL":       true,
+		"KEEP_AWAKE_INTERVAL": true,
+	}
 	for _, d := range durations {
 		v, err := time.ParseDuration(envOr(d.name, d.def))
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", d.name, err))
 			continue
 		}
+		if v <= 0 {
+			errs = append(errs, fmt.Errorf("%s must be positive, got %s", d.name, v))
+			continue
+		}
+		if externalIntervals[d.name] && v < minInterval {
+			errs = append(errs, fmt.Errorf("%s must be at least %s, got %s", d.name, minInterval, v))
+			continue
+		}
 		*d.dst = v
+	}
+
+	if c.CoverageLedgerID != "" && !strkey.IsValidContractAddress(c.CoverageLedgerID) {
+		errs = append(errs, fmt.Errorf("COVERAGE_LEDGER_ID %q is not a contract address (must start with C)", c.CoverageLedgerID))
+	}
+	if c.ReporterRegistryID != "" && !strkey.IsValidContractAddress(c.ReporterRegistryID) {
+		errs = append(errs, fmt.Errorf("REPORTER_REGISTRY_ID %q is not a contract address (must start with C)", c.ReporterRegistryID))
+	}
+
+	for _, u := range []struct {
+		name, val string
+	}{
+		{"STELLAR_RPC_URL", c.RPCURL},
+		{"HORIZON_URL", c.HorizonURL},
+		{"HORIZON_CHECK_URL", c.HorizonCheckURL},
+	} {
+		if u.val == "" {
+			continue
+		}
+		parsed, err := url.ParseRequestURI(u.val)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			errs = append(errs, fmt.Errorf("%s must be an absolute http(s) URL, got %q", u.name, u.val))
+		}
 	}
 
 	for _, o := range strings.Split(envOr("CORS_ORIGINS", "*"), ",") {

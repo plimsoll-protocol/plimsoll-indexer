@@ -87,6 +87,34 @@ func TestComputeAndCovered(t *testing.T) {
 	}
 }
 
+func TestCoverageStatus(t *testing.T) {
+	sp := &Supply{Amount: n(100), PostedAt: t0}
+	rep := Report{Amount: n(101), AsOf: t0}
+	day := 24 * time.Hour
+
+	covered, reason := CoverageStatus(sp, map[uint32]Report{TierTranscribed: rep}, TierTranscribed, t0, 10_000, day)
+	if !covered || reason != "covered" {
+		t.Fatalf("covered: got %v %q", covered, reason)
+	}
+
+	if _, reason := CoverageStatus(nil, map[uint32]Report{TierTranscribed: rep}, TierTranscribed, t0, 0, day); reason != "no_supply" {
+		t.Errorf("no supply: got %q", reason)
+	}
+	if _, reason := CoverageStatus(sp, map[uint32]Report{}, TierTranscribed, t0, 0, day); reason != "no_report" {
+		t.Errorf("no report: got %q", reason)
+	}
+	if _, reason := CoverageStatus(sp, map[uint32]Report{TierTranscribed: rep}, TierTranscribed, t0.Add(2*day), 0, day); reason != "stale_supply" {
+		t.Errorf("stale supply: got %q", reason)
+	}
+	staleRep := Report{Amount: n(101), AsOf: t0.Add(-2 * day)}
+	if _, reason := CoverageStatus(sp, map[uint32]Report{TierTranscribed: staleRep}, TierTranscribed, t0, 0, day); reason != "stale_report" {
+		t.Errorf("stale report: got %q", reason)
+	}
+	if _, reason := CoverageStatus(sp, map[uint32]Report{TierTranscribed: rep}, TierTranscribed, t0, 10_200, day); reason != "under_backed" {
+		t.Errorf("under backed: got %q", reason)
+	}
+}
+
 func TestNames(t *testing.T) {
 	if TierName(TierIssuerSigned) != "issuer_signed" || RoleName(RoleSupplyPoster) != "supply_poster" {
 		t.Fatal("names changed")
