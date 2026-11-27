@@ -219,6 +219,12 @@ func (s *Server) compress(next http.Handler) http.Handler {
 	if s.Metrics != nil {
 		mux.Handle("GET /metrics", s.Metrics.Handler())
 		return s.Metrics.Middleware(s.cors(mux))
+	// The route table is the only list of endpoints: serving and documentation
+	// both come from it (see routes.go).
+	for _, rt := range routes() {
+		mux.HandleFunc(rt.Method+" "+rt.Pattern, func(w http.ResponseWriter, r *http.Request) {
+			rt.Handle(s, w, r)
+		})
 	}
 	return s.cors(mux)
 }
