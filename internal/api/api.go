@@ -55,6 +55,7 @@ type Reader interface {
 type CoverageWebhookStore interface {
 	CreateCoverageWebhook(ctx context.Context, w coverage.Webhook) (coverage.Webhook, error)
 	DeleteCoverageWebhook(ctx context.Context, id int64) error
+}
 
 type assetPageReader interface {
 	ListAssetsPage(ctx context.Context, limit int, afterCode, afterIssuer string) ([]coverage.Asset, error)
@@ -89,7 +90,6 @@ type Server struct {
 	WebhookAdminToken string
 	WebhookAPIKeys    []string
 	WebhookCodec      *webhook.SecretCodec
-	WebhookAdminToken string
 
 	// CoverageWebhooks and WebhookSigningSecret enable coverage threshold
 	// alerts at /v1/coverage-webhooks, administered with the same token.
@@ -458,12 +458,25 @@ func (s *Server) assemble(ctx context.Context, a coverage.Asset, minTier uint32)
 	if err != nil {
 		return assetJSON{}, err
 	}
+	out := s.assembleWithData(a, supplies[a.SAC], reportsBySAC[a.SAC], minTier)
+	out.Toml = tomlBody
+	return out, nil
+}
+
+func (s *Server) assembleWithData(a coverage.Asset, sp *coverage.Supply, reports map[uint32]coverage.Report, minTier uint32) assetJSON {
 	out := assetJSON{
-		Asset:    a,
-		Toml:     tomlBody,
-		Supply:   toSupply(sp),
-		Reports:  map[string]*reportJSON{},
-		Coverage: s.toCoverage(coverage.Compute(sp, reports, minTier)),
+		Asset:         a,
+		Toml:          json.RawMessage("null"),
+		TomlCheckedAt: a.TomlCheckedAt,
+		Supply:        toSupply(sp),
+		Reports:       map[string]*reportJSON{},
+		Coverage:      s.toCoverage(coverage.Compute(sp, reports, minTier)),
+	}
+	if a.TomlError != "" {
+		out.TomlError = &a.TomlError
+	}
+	if len(a.Toml) > 0 {
+		out.Toml = a.Toml
 	}
 	for tier, rep := range reports {
 		out.Reports[coverage.TierName(tier)] = toReport(rep)
@@ -623,17 +636,17 @@ func (s *Server) coverageNow(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAsset(w, r, sac) {
 		return
 	}
-	supply, err := s.Store.LatestSupply(r.Context(), sac)
+	supplies, err := s.Store.LatestSupplies(r.Context(), []string{sac})
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	reports, err := s.Store.LatestReports(r.Context(), sac)
+	reportsBySAC, err := s.Store.LatestReportsBySAC(r.Context(), []string{sac})
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	res := coverage.Compute(supply, reports, coverage.TierTranscribed)
+	res := coverage.Compute(supplies[sac], reportsBySAC[sac], coverage.TierTranscribed)
 	if res == nil {
 		writeError(w, http.StatusNotFound, codeCoverageNotFound, "no live coverage report")
 		return
@@ -841,6 +854,7 @@ func sameToken(token, expected string) bool {
 func webhookAPIKeyHash(key string) string {
 	sum := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum[:])
+}
 
 // ---- coverage webhooks ----------------------------------------------------
 
@@ -998,7 +1012,7 @@ func parseAssetLimit(w http.ResponseWriter, r *http.Request) (int, bool) {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil || n < 1 || n > 200 {
-		writeError(w, http.StatusBadRequest, "limit must be between 1 and 200")
+		writeError(w, http.StatusBadRequest, codeInvalidLimit, "limit must be between 1 and 200")
 		return 0, false
 	}
 	return n, true
@@ -1011,19 +1025,19 @@ func parseAssetCursor(w http.ResponseWriter, r *http.Request) (*assetCursor, boo
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(v)
 	if err != nil || base64.RawURLEncoding.EncodeToString(raw) != v {
-		writeError(w, http.StatusBadRequest, "invalid cursor")
+		writeError(w, http.StatusBadRequest, codeInvalidBody, "invalid cursor")
 		return nil, false
 	}
 	var cursor assetCursor
 	dec := json.NewDecoder(strings.NewReader(string(raw)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cursor); err != nil || cursor.Version != 1 || cursor.Code == "" || cursor.Issuer == "" {
-		writeError(w, http.StatusBadRequest, "invalid cursor")
+		writeError(w, http.StatusBadRequest, codeInvalidBody, "invalid cursor")
 		return nil, false
 	}
 	var trailing any
 	if err := dec.Decode(&trailing); err != io.EOF {
-		writeError(w, http.StatusBadRequest, "invalid cursor")
+		writeError(w, http.StatusBadRequest, codeInvalidBody, "invalid cursor")
 		return nil, false
 	}
 	return &cursor, true
@@ -1065,7 +1079,7 @@ func parseDateRange(w http.ResponseWriter, r *http.Request) (*time.Time, *time.T
 		}
 		date, err := time.Parse("2006-01-02", value)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, name+" must be a date in YYYY-MM-DD format")
+			writeError(w, http.StatusBadRequest, codeInvalidBody, name+" must be a date in YYYY-MM-DD format")
 			return nil, false
 		}
 		date = date.UTC()
@@ -1083,7 +1097,7 @@ func parseDateRange(w http.ResponseWriter, r *http.Request) (*time.Time, *time.T
 		return nil, nil, false
 	}
 	if from != nil && to != nil && !from.Before(*to) {
-		writeError(w, http.StatusBadRequest, "from must be on or before to")
+		writeError(w, http.StatusBadRequest, codeInvalidBody, "from must be on or before to")
 		return nil, nil, false
 	}
 	return from, to, true
@@ -1151,6 +1165,7 @@ const (
 	codeWebhooksNotConfigured = "webhooks_not_configured"
 	codeUnauthorized          = "unauthorized"
 	codeInternal              = "internal_error"
+	codeAPIAuthNotConfigured  = "api_auth_not_configured"
 	codeDBUnavailable         = "db_unavailable"
 	codeProgressUnavailable   = "progress_unavailable"
 )

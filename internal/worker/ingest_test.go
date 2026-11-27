@@ -328,16 +328,18 @@ type eventTrackingStore struct {
 	mu       sync.Mutex
 	names    map[string]bool
 	eventIDs map[string]int
+	raw      [][]soroban.RawEvent
 }
 
 func (s *eventTrackingStore) Progress(context.Context, string) (store.Progress, error) {
 	return store.Progress{}, nil
 }
 
-func (s *eventTrackingStore) ApplyEvents(_ context.Context, name, _ string, _ uint32, events []any) error {
+func (s *eventTrackingStore) ApplyEvents(_ context.Context, name, _ string, _ uint32, raw []soroban.RawEvent, events []any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.names[name] = true
+	s.raw = append(s.raw, raw)
 	for _, event := range events {
 		supply, ok := event.(soroban.SupplyPosted)
 		if !ok {
@@ -389,6 +391,8 @@ func TestIngesterRunsContractStreamsConcurrentlyWithoutDuplicates(t *testing.T) 
 	}
 	if len(db.eventIDs) != 2 || db.eventIDs["ledger-event"] != 1 || db.eventIDs["registry-event"] != 1 {
 		t.Errorf("stored event IDs = %v, want each stream's event exactly once", db.eventIDs)
+	}
+}
 
 // Run hands the store every event of a page raw, tracked or not, next to the
 // typed rows, so both are written in the page's transaction.

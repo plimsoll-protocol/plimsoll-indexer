@@ -208,7 +208,7 @@ To build the image locally instead, replace the `image:` line in
 `docker-compose.yml` with `build: .` and run `docker compose up --build`.
 
 The image is multi-stage (`golang:1.27-bookworm` → `gcr.io/distroless/static-debian12`)
-and is around 35 MB; most of that is the AWS and GCP SDKs behind
+and is about 31 MB; most of that is the AWS and GCP SDKs behind
 `SECRETS_PROVIDER`. Leave `SUPPLY_POSTER_SECRET` empty in `docker-compose.yml`
 for a read-only run.
 

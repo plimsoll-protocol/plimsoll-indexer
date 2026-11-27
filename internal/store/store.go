@@ -629,44 +629,6 @@ func (s *Store) LatestReports(ctx context.Context, sac string) (map[uint32]cover
 	return out, nil
 }
 
-// LatestReportsBySAC returns the newest report for each tier of each requested SAC.
-func (s *Store) LatestReportsBySAC(ctx context.Context, sacs []string) (map[string]map[uint32]coverage.Report, error) {
-	out := make(map[string]map[uint32]coverage.Report)
-	if len(sacs) == 0 {
-		return out, nil
-	}
-	rows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT ON (sac, tier)
-		       sac, tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source,
-		       COALESCE(doc_check, '')
-		FROM reserve_reports
-		WHERE sac = ANY($1)
-		ORDER BY sac, tier, as_of DESC`, sacs)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var sac string
-		var r coverage.Report
-		var tier int16
-		var amount string
-		if err := rows.Scan(&sac, &tier, &amount, &r.AsOf, &r.PostedAt, &r.Reporter, &r.DocHash, &r.DocURI, &r.TxHash, &r.Source, &r.DocCheck); err != nil {
-			return nil, err
-		}
-		r.Tier = uint32(tier)
-		r.Amount = mustBig(amount)
-		if out[sac] == nil {
-			out[sac] = make(map[uint32]coverage.Report)
-		}
-		out[sac][r.Tier] = r
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 func (s *Store) queryReports(ctx context.Context, sql string, args ...any) ([]coverage.Report, error) {
 	rows, err := s.pool.Query(ctx, sql, args...)
 	if err != nil {
@@ -946,6 +908,14 @@ func parseAmount(s string) (*big.Int, error) {
 		return nil, fmt.Errorf("amount %q is not an integer", s)
 	}
 	return n, nil
+}
+
+func mustBig(s string) *big.Int {
+	n, ok := new(big.Int).SetString(s, 10)
+	if !ok {
+		return new(big.Int)
+	}
+	return n
 }
 
 // ---- advisory lock --------------------------------------------------------

@@ -74,31 +74,27 @@ type Config struct {
 	DatabasePasswordName string
 	// DatabasePassword is fetched by ResolveSecrets and overrides the password
 	// in DATABASE_URL. Never log it.
-	DatabasePassword     string
-	PosterSecret         string
-	WebhookAdminToken    string
-	WebhookAPIKeys       []string
-	WebhookEncryptionKey string
-	SlackWebhookURL      string
-	DiscordWebhookURL    string
-	HorizonCheckURL      string
-	NetworkPassphrase    string
-	CoverageLedgerID     string
-	ReporterRegistryID   string
-	StartLedger          uint32
-	PosterSecret         string
+	DatabasePassword string
+
+	PosterSecret string
 	// WebhookAdminToken protects webhook administration. It is shared by
 	// issuer TOML change subscriptions and coverage alerts.
 	WebhookAdminToken string
+	// WebhookAPIKeys are extra bearer tokens accepted for webhook
+	// administration. Each must be unique and non-empty.
+	WebhookAPIKeys []string
 	// WebhookEncryptionKey encrypts the per-subscription secrets of issuer
 	// TOML change webhooks at rest; WebhookSigningSecret keys the HMAC-SHA256
 	// signature on coverage alert deliveries. Each enables its own feature and
 	// needs WebhookAdminToken.
 	WebhookEncryptionKey string
 	WebhookSigningSecret string
-	WebhookInterval      time.Duration
-	IngestInterval       time.Duration
-	PostInterval         time.Duration
+	// SlackWebhookURL and DiscordWebhookURL receive coverage drop alerts.
+	SlackWebhookURL   string
+	DiscordWebhookURL string
+	WebhookInterval   time.Duration
+	IngestInterval    time.Duration
+	PostInterval      time.Duration
 	// ReconcileInterval is how often contract state is read back to repair
 	// what event ingestion missed. Each pass is a handful of simulations per
 	// asset, so it can be infrequent.
