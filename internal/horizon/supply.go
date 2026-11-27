@@ -46,6 +46,19 @@ var ErrLedgerMoved = errors.New("horizon ledger advanced while supply was read")
 // assetsLedgerAttempts is how many times Supply re-reads /assets when it
 // cannot pin the ledger the balances were served at.
 const assetsLedgerAttempts = 3
+// ErrAccountNotFound means Horizon has no account at that address. It is kept
+// apart from ErrAssetNotFound so a missing account is never mistaken for an
+// asset with no holders.
+var ErrAccountNotFound = errors.New("account not found on horizon")
+
+// ErrBadHorizonURL means the configured base URL does not answer like a Horizon
+// root, so every request built on it is wrong. This is a configuration problem,
+// not a fact about an asset.
+var ErrBadHorizonURL = errors.New("horizon root returned 404: HORIZON_URL is not a Horizon root")
+
+// errNotFound is Horizon's 404 before the caller decides what was missing.
+// Each endpoint knows what a 404 means for it; get does not.
+var errNotFound = errors.New("horizon returned 404")
 
 // Breakdown is the per-bucket supply. Its canonical JSON encoding is hashed
 // and the hash is posted on-chain with the total, so anyone can recompute it.
@@ -120,28 +133,42 @@ type account struct {
 }
 
 // LatestLedger returns the newest ledger Horizon has ingested.
+//
+// A 404 from the root means the base URL is not a Horizon root (a wrong host, or
+// a path such as /api/v1), so it is reported as ErrBadHorizonURL rather than as
+// a fact about any asset.
 func (c *Client) LatestLedger(ctx context.Context) (uint32, error) {
 	var r root
 	if err := c.get(ctx, "/", &r); err != nil {
+		if errors.Is(err, errNotFound) {
+			return 0, fmt.Errorf("horizon root %s: %w", c.BaseURL, ErrBadHorizonURL)
+		}
 		return 0, fmt.Errorf("horizon root: %w", err)
 	}
 	return r.HistoryLatestLedger, nil
 }
 
 // HomeDomain returns the issuer account's home_domain ("" if unset).
+// A missing account is ErrAccountNotFound.
 func (c *Client) HomeDomain(ctx context.Context, issuer string) (string, error) {
 	var a account
 	if err := c.get(ctx, "/accounts/"+url.PathEscape(issuer), &a); err != nil {
+		if errors.Is(err, errNotFound) {
+			return "", fmt.Errorf("horizon account %s: %w", issuer, ErrAccountNotFound)
+		}
 		return "", fmt.Errorf("horizon account %s: %w", issuer, err)
 	}
 	return a.HomeDomain, nil
 }
 
 // NativeBalance returns the XLM balance of address in stroops (1 XLM = 10 000 000 stroops).
-// Returns 0 and ErrAssetNotFound when the account does not exist.
+// Returns 0 and ErrAccountNotFound when the account does not exist.
 func (c *Client) NativeBalance(ctx context.Context, address string) (int64, error) {
 	var a account
 	if err := c.get(ctx, "/accounts/"+url.PathEscape(address), &a); err != nil {
+		if errors.Is(err, errNotFound) {
+			return 0, fmt.Errorf("horizon account %s: %w", address, ErrAccountNotFound)
+		}
 		return 0, fmt.Errorf("horizon account %s: %w", address, err)
 	}
 	for _, b := range a.Balances {
@@ -217,6 +244,23 @@ func (c *Client) assets(ctx context.Context, query, code, issuer string) (http.H
 	hdr, err := c.getWithHeaders(ctx, "/assets?"+query, &page)
 	if err != nil {
 		return nil, assetPage{}, fmt.Errorf("horizon assets %s:%s: %w", code, issuer, err)
+		return Breakdown{}, err
+	}
+	q := url.Values{"asset_code": {code}, "asset_issuer": {issuer}}
+	var page struct {
+		Embedded struct {
+			Records []AssetRecord `json:"records"`
+		} `json:"_embedded"`
+	}
+	if err := c.get(ctx, "/assets?"+q.Encode(), &page); err != nil {
+		// Horizon answers for an asset it has no record of with an empty
+		// records list, so a 404 here says the request itself was not
+		// understood. For a supply read either way means there is no asset to
+		// report, and that is the only caller's question, so Supply decides.
+		if errors.Is(err, errNotFound) {
+			return Breakdown{}, fmt.Errorf("horizon assets %s:%s: %w", code, issuer, ErrAssetNotFound)
+		}
+		return Breakdown{}, fmt.Errorf("horizon assets %s:%s: %w", code, issuer, err)
 	}
 	return hdr, page, nil
 }
@@ -439,6 +483,7 @@ func (c *Client) wait(ctx context.Context, d time.Duration) error {
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, ErrAssetNotFound
+		return errNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
