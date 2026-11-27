@@ -111,6 +111,10 @@ type Config struct {
 	// PosterLowBalanceStroops is the XLM balance (in stroops) below which the
 	// poster logs a warning on every tick. Zero disables the check.
 	PosterLowBalanceStroops int64
+	// DecimalCheckEnabled warns when a new supply snapshot differs from the
+	// previous on-chain one by more than six orders of magnitude, which is the
+	// shape of a decimal-point mistake rather than a real supply change.
+	DecimalCheckEnabled bool
 }
 
 // Load reads the environment. Missing required values are reported together.
@@ -150,6 +154,15 @@ func Load() (Config, error) {
 		LogLevel:             envOr("LOG_LEVEL", "info"),
 		IngestWorkers:        2,
 		KeepAwakeURL:         keepAwakeURL(os.Getenv("KEEP_AWAKE_URL"), os.Getenv("RENDER_EXTERNAL_URL")),
+		DecimalCheckEnabled:  true,
+	}
+	if v := os.Getenv("DECIMAL_CHECK_ENABLED"); v != "" {
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("DECIMAL_CHECK_ENABLED: %w", err))
+		} else {
+			c.DecimalCheckEnabled = enabled
+		}
 	}
 	if rawKeys := os.Getenv("WEBHOOK_API_KEYS"); rawKeys != "" {
 		keys, err := parseWebhookAPIKeys(rawKeys, c.WebhookAdminToken)

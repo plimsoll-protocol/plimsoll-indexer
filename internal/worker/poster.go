@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"time"
 
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
@@ -77,6 +78,13 @@ type Poster struct {
 	Store        breakdownStore
 	LedgerID     string
 	RepostAfter  time.Duration
+	// DecimalCheck, when true, compares a new supply figure with the previous
+	// on-chain snapshot and logs a warning when they differ by more than six
+	// orders of magnitude. Supply is usually a slow-moving figure, so a jump
+	// that large is much more likely to be a decimals mistake than a real
+	// change; the snapshot is still posted, because the indexer is not the
+	// authority on which figure is right.
+	DecimalCheck bool
 	Log          *slog.Logger
 	Now          func() time.Time
 
@@ -103,6 +111,39 @@ type Poster struct {
 // asserts on its own authority, so a second source disagreeing about it is
 // reason to publish nothing rather than pick a side.
 var errSupplyDisagreement = errors.New("horizons disagree about supply at the same ledger")
+
+// decimalMismatchFactor is six orders of magnitude. A supply figure that moves
+// by more than this between snapshots almost always means the asset's decimals
+// were applied on the wrong side, not that the asset's supply really changed.
+const decimalMismatchFactor = 1_000_000
+
+// warnOnDecimalMismatch logs a warning when previous and current differ by more
+// than six orders of magnitude in either direction. Zero is skipped: a new or
+// emptied asset has no ratio to compare, and treating "0 to something" as a
+// decimal shift would warn on every asset's first snapshot.
+func (p *Poster) warnOnDecimalMismatch(code, issuer, sac string, previous *big.Int, previousLedger uint32, current *big.Int, currentLedger uint32) {
+	if !p.DecimalCheck || previous == nil || current == nil || previous.Sign() <= 0 || current.Sign() <= 0 {
+		return
+	}
+	factor := big.NewInt(decimalMismatchFactor)
+	var shifted bool
+	if current.Cmp(previous) >= 0 {
+		shifted = new(big.Int).Mul(previous, factor).Cmp(current) < 0
+	} else {
+		shifted = new(big.Int).Mul(current, factor).Cmp(previous) < 0
+	}
+	if !shifted {
+		return
+	}
+	p.Log.Warn("supply changed by more than six orders of magnitude; check the asset's decimals",
+		"code", code,
+		"issuer", issuer,
+		"sac", sac,
+		"previous_amount", previous.String(),
+		"new_amount", current.String(),
+		"previous_ledger", previousLedger,
+		"at_ledger", currentLedger)
+}
 
 // crossCheck compares a breakdown against the second Horizon.
 //

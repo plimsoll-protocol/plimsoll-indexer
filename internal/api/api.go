@@ -34,6 +34,13 @@ import (
 //go:embed openapi.yaml
 var openAPISpec []byte
 
+// is_covered has no default arguments on chain, so the shortcut endpoint owns
+// its defaults: 100% backing, fresh within a day, at any report tier.
+const (
+	defaultCoveredMinBps uint32 = 10_000
+	defaultCoveredMaxAge        = 24 * time.Hour
+)
+
 // Reader is what the API needs from storage.
 type Reader interface {
 	Ping(ctx context.Context) error
@@ -48,6 +55,7 @@ type Reader interface {
 	ReportHistory(ctx context.Context, sac string, limit int) ([]coverage.Report, error)
 	ReportExportPage(ctx context.Context, sac string, from, to *time.Time, after *store.ReportExportCursor, limit int) ([]store.ReportExportRow, error)
 	Reporters(ctx context.Context) ([]coverage.Reporter, error)
+	Disputes(ctx context.Context, sac, status string, limit, offset int) ([]coverage.Dispute, error)
 	Breakdown(ctx context.Context, hash string) ([]byte, error)
 	Attestation(ctx context.Context, sac string) (store.Attestation, error)
 	Progress(ctx context.Context, name string) (store.Progress, error)
@@ -502,6 +510,14 @@ func (s *Server) searchAssets(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getAsset(w http.ResponseWriter, r *http.Request) {
+	// Go 1.22+'s ServeMux rejects a literal GET /v1/assets/covered alongside
+	// HEAD /v1/assets/{sac}: the literal is more specific by path but less
+	// specific by method, so neither pattern wins. Dispatch the reserved name
+	// here instead of registering a conflicting literal route.
+	if r.PathValue("sac") == "covered" {
+		s.coveredAssets(w, r)
+		return
+	}
 	sac, ok := parseSAC(w, r)
 	if !ok {
 		return
@@ -569,7 +585,7 @@ func (s *Server) assembleWithData(ctx context.Context, a coverage.Asset, sp *cov
 	}
 	tomlBody, err := withAttestation(a.Toml, att, attErr == nil)
 	if err != nil {
-		return assetJSON{}, err
+		return nil, nil, err
 	}
 	out := s.assembleWithData(a, supplies[a.SAC], reportsBySAC[a.SAC], minTier)
 	out.Toml = tomlBody
@@ -577,6 +593,10 @@ func (s *Server) assembleWithData(ctx context.Context, a coverage.Asset, sp *cov
 }
 
 func (s *Server) assembleWithData(a coverage.Asset, sp *coverage.Supply, reports map[uint32]coverage.Report, minTier uint32) assetJSON {
+	return sp, reports, nil
+}
+
+func (s *Server) assembleFrom(a coverage.Asset, minTier uint32, sp *coverage.Supply, reports map[uint32]coverage.Report) assetJSON {
 	out := assetJSON{
 		Asset:         a,
 		Toml:          json.RawMessage("null"),
@@ -789,6 +809,102 @@ func (s *Server) reporters(w http.ResponseWriter, r *http.Request) {
 		out = append(out, reporterJSON{Role: coverage.RoleName(rep.Role), Reporter: rep})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"reporters": out})
+}
+
+// coveredAssets lists only the assets whose current coverage passes the same
+// freshness and ratio checks as the contract's is_covered. The contract has no
+// defaults for min_bps and max_age, so this endpoint documents and applies its
+// own: 100% backing and 24 hours, the pair the Plimsoll app treats as covered.
+func (s *Server) coveredAssets(w http.ResponseWriter, r *http.Request) {
+	minTier, ok := parseTier(w, r)
+	if !ok {
+		return
+	}
+	minBps, ok := parseMinBps(w, r)
+	if !ok {
+		return
+	}
+	maxAge, ok := parseMaxAge(w, r)
+	if !ok {
+		return
+	}
+	limit, ok := parseLimit(w, r)
+	if !ok {
+		return
+	}
+	offset, ok := parseOffset(w, r)
+	if !ok {
+		return
+	}
+
+	assets, err := s.Store.ListAssets(r.Context())
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	matched := make([]assetJSON, 0, len(assets))
+	for _, a := range assets {
+		sp, reports, err := s.coverageInputs(r.Context(), a.SAC)
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		result := coverage.Compute(sp, reports, minTier)
+		if !result.Covered(s.Now(), minBps, maxAge) {
+			continue
+		}
+		matched = append(matched, s.assembleFrom(a, minTier, sp, reports))
+	}
+
+	page, next := pageOf(matched, limit, offset)
+	body := map[string]any{"assets": page}
+	if next != nil {
+		body["next_offset"] = *next
+	}
+	writeJSON(w, http.StatusOK, body)
+}
+
+// disputeHistory lists one asset's disputes, newest-opened first. It returns
+// 404 for an unlisted asset, like the supply and report histories, instead of
+// an empty list that looks the same as an asset with no disputes.
+func (s *Server) disputeHistory(w http.ResponseWriter, r *http.Request) {
+	sac, ok := parseSAC(w, r)
+	if !ok {
+		return
+	}
+	status, ok := parseDisputeStatus(w, r)
+	if !ok {
+		return
+	}
+	limit, ok := parseLimit(w, r)
+	if !ok {
+		return
+	}
+	offset, ok := parseOffset(w, r)
+	if !ok {
+		return
+	}
+	if !s.requireAsset(w, r, sac) {
+		return
+	}
+	list, err := s.Store.Disputes(r.Context(), sac, status, limit+1, offset)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	var next *int
+	if len(list) > limit {
+		list = list[:limit]
+		n := offset + limit
+		next = &n
+	}
+	out := make([]coverage.Dispute, 0, len(list))
+	out = append(out, list...)
+	body := map[string]any{"disputes": out}
+	if next != nil {
+		body["next_offset"] = *next
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (s *Server) changelog(w http.ResponseWriter, _ *http.Request) {
@@ -1283,6 +1399,10 @@ const (
 	codeInvalidMinTier        = "invalid_min_tier"
 	codeInvalidLimit          = "invalid_limit"
 	codeInvalidDate           = "invalid_date"
+	codeInvalidOffset         = "invalid_offset"
+	codeInvalidStatus         = "invalid_status"
+	codeInvalidMinBps         = "invalid_min_bps"
+	codeInvalidMaxAge         = "invalid_max_age"
 	codeInvalidBody           = "invalid_body"
 	codeInvalidCursor         = "invalid_cursor"
 	codeInvalidDateRange      = "invalid_date_range"

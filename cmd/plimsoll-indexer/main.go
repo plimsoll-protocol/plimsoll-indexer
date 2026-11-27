@@ -211,14 +211,15 @@ func run(cfg config.Config, build buildinfo.Info, log *slog.Logger) error {
 			Passphrase: cfg.NetworkPassphrase,
 		}
 		poster := &worker.Poster{
-			Horizon:     hz,
-			RPC:         rpc,
-			Invoker:     invoker,
-			Store:       db,
-			LedgerID:    cfg.CoverageLedgerID,
-			RepostAfter: cfg.RepostAfter,
-			Log:         log.With("job", "poster"),
-			Now:         time.Now,
+			Horizon:      hz,
+			RPC:          rpc,
+			Invoker:      invoker,
+			Store:        db,
+			LedgerID:     cfg.CoverageLedgerID,
+			RepostAfter:  cfg.RepostAfter,
+			DecimalCheck: cfg.DecimalCheckEnabled,
+			Log:          log.With("job", "poster"),
+			Now:          time.Now,
 		}
 		// Left nil when no second Horizon is configured: comparing hz against
 		// itself would always agree and prove nothing.
