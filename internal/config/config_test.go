@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -78,6 +79,11 @@ func setBase(t *testing.T) {
 	for _, k := range []string{"NETWORK", "STELLAR_RPC_URL", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE", "SUPPLY_POSTER_SECRET", "SUPPLY_POSTER_SECRET_FILE"} {
 	for _, k := range []string{"NETWORK", "STELLAR_RPC_URL", "RPC_URL", "RPC_URLS", "STELLAR_RPC_URLS", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE", "WEBHOOK_ADMIN_TOKEN", "WEBHOOK_ENCRYPTION_KEY"} {
 	for _, k := range []string{"NETWORK", "STELLAR_RPC_URL", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE", "WEBHOOK_ADMIN_TOKEN", "WEBHOOK_ENCRYPTION_KEY", "METRICS_ENABLED"} {
+	for _, k := range []string{
+		"NETWORK", "STELLAR_RPC_URL", "HORIZON_URL", "STELLAR_NETWORK_PASSPHRASE",
+		"WEBHOOK_ADMIN_TOKEN", "WEBHOOK_ENCRYPTION_KEY",
+		"LOG_LEVEL", "LOG_LEVEL_API", "LOG_LEVEL_WORKER", "LOG_LEVEL_INGEST",
+	} {
 		t.Setenv(k, "")
 	}
 	t.Setenv("DATABASE_URL", "postgres://x")
@@ -263,6 +269,9 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if got.LogLevel != "info" {
 		t.Errorf("LogLevel = %q, want info", got.LogLevel)
+	}
+	if got.LogLevelAPI != "info" || got.LogLevelWorker != "info" || got.LogLevelIngest != "info" {
+		t.Errorf("component log levels = (%q, %q, %q), want info", got.LogLevelAPI, got.LogLevelWorker, got.LogLevelIngest)
 	}
 	if len(got.CORSOrigins) != 1 || got.CORSOrigins[0] != "*" {
 		t.Errorf("CORSOrigins = %v, want [*]", got.CORSOrigins)
@@ -907,4 +916,47 @@ func TestRetentionDaysAndGraphQL(t *testing.T) {
 			t.Error("IsProduction() = false, want true")
 		}
 	})
+}
+func TestLoadLogLevelsFallbackAndOverrides(t *testing.T) {
+	setBase(t)
+	t.Setenv("LOG_LEVEL", "warn")
+	got, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.LogLevel != "warn" || got.LogLevelAPI != "warn" || got.LogLevelWorker != "warn" || got.LogLevelIngest != "warn" {
+		t.Fatalf("fallback levels = %+v, want all warn", got)
+	}
+
+	t.Setenv("LOG_LEVEL_API", "debug")
+	t.Setenv("LOG_LEVEL_INGEST", "error")
+	got, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.LogLevelAPI != "debug" || got.LogLevelWorker != "warn" || got.LogLevelIngest != "error" {
+		t.Fatalf("override levels = (api=%q worker=%q ingest=%q), want (debug warn error)",
+			got.LogLevelAPI, got.LogLevelWorker, got.LogLevelIngest)
+	}
+}
+
+func TestParseLogLevel(t *testing.T) {
+	cases := []struct {
+		in   string
+		want slog.Level
+	}{
+		{"debug", slog.LevelDebug},
+		{"DEBUG", slog.LevelDebug},
+		{"info", slog.LevelInfo},
+		{"warn", slog.LevelWarn},
+		{" warning ", slog.LevelWarn},
+		{"error", slog.LevelError},
+		{"", slog.LevelInfo},
+		{"unknown", slog.LevelInfo},
+	}
+	for _, tc := range cases {
+		if got := ParseLogLevel(tc.in); got != tc.want {
+			t.Errorf("ParseLogLevel(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
 }

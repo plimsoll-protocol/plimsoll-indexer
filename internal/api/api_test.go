@@ -87,6 +87,12 @@ type fake struct {
 
 	stats      store.Stats
 	statsCalls int
+	assets        []coverage.Asset
+	supply        map[string]*coverage.Supply
+	reports       map[string]map[uint32]coverage.Report
+	bodies        map[string][]byte
+	vaults        map[string]coverage.Vault
+	tomlSnapshots map[string]coverage.IssuerTomlSnapshot
 }
 
 func (f *fake) Ping(context.Context) error { return nil }
@@ -239,6 +245,18 @@ func (f *fake) Progress(context.Context, string) (store.Progress, error) {
 		EventLedger:   40,
 		EventAt:       now.Add(-90 * time.Second),
 	}, nil
+}
+func (f *fake) GetVault(_ context.Context, s string) (coverage.Vault, error) {
+	if v, ok := f.vaults[s]; ok {
+		return v, nil
+	}
+	return coverage.Vault{}, store.ErrNotFound
+}
+func (f *fake) LatestIssuerToml(_ context.Context, issuer string) (coverage.IssuerTomlSnapshot, error) {
+	if snap, ok := f.tomlSnapshots[issuer]; ok {
+		return snap, nil
+	}
+	return coverage.IssuerTomlSnapshot{}, store.ErrNotFound
 }
 
 type webhookManagerFake struct {
@@ -1884,5 +1902,126 @@ func TestWebhookDLQListAndRetryEndpoints(t *testing.T) {
 	defer retry.Body.Close()
 	if retry.StatusCode != http.StatusOK || manager.retryWebhookID != 12 || manager.retryDeliveryID != 34 {
 		t.Fatalf("retry status=%d ids=(%d,%d)", retry.StatusCode, manager.retryWebhookID, manager.retryDeliveryID)
+	}
+}
+
+func TestGetAssetVault(t *testing.T) {
+	const vaultAddr = "CC3SUECAJSAC4PBV4QLUII7X5Y4WNVL5YGTBAQ4CHCAH6R3QLRYJUZHQ"
+	f := &fake{
+		assets: []coverage.Asset{{SAC: sac, Code: "PUSD", Issuer: "GISS"}},
+		vaults: map[string]coverage.Vault{
+			sac: {
+				SAC:            sac,
+				VaultAddress:   vaultAddr,
+				ReserveBalance: big.NewInt(5_000_0000000),
+				ThresholdBps:   10000,
+				UpdatedAt:      now,
+			},
+		},
+	}
+	s := &Server{
+		Store: f,
+		CORS:  []string{"*"},
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:   func() time.Time { return now },
+	}
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	bad := get(t, srv, "/v1/assets/not-a-sac/vault", http.StatusBadRequest)
+	if bad["code"] != "invalid_sac" {
+		t.Fatalf("unexpected error code: %+v", bad)
+	}
+	missing := get(t, srv, "/v1/assets/"+unlistedSAC(t)+"/vault", http.StatusNotFound)
+	if missing["code"] != "vault_not_found" {
+		t.Fatalf("unexpected error code: %+v", missing)
+	}
+
+	body := get(t, srv, "/v1/assets/"+sac+"/vault", http.StatusOK)
+	if body["sac"] != sac || body["vault_address"] != vaultAddr ||
+		body["reserve_balance"] != "50000000000" || body["threshold_bps"].(float64) != 10000 {
+		t.Fatalf("unexpected vault response: %+v", body)
+	}
+
+	resp, err := http.Get(srv.URL + "/openapi.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(spec), "/v1/assets/{sac}/vault:") {
+		t.Fatal("openapi spec missing /v1/assets/{sac}/vault path")
+	}
+}
+
+func TestGetIssuerToml(t *testing.T) {
+	const issuerAddr = "GBIE3ANCRVCBWETUZXWYKRMP27LQVJHX757XXAQUT3LYHVTNFPPPXEY4"
+	const otherIssuer = "GCCMGQ3UGITN2HUUSQKTDMBFZ34QQTKMODR56NT26JMPH2MHVYWZMXNE"
+	const rawToml = "VERSION = \"2.7.0\"\n"
+	fetchedAt := time.Date(2026, 11, 24, 15, 0, 0, 0, time.UTC)
+
+	f := &fake{
+		tomlSnapshots: map[string]coverage.IssuerTomlSnapshot{
+			issuerAddr: {
+				Issuer:     issuerAddr,
+				HomeDomain: "example.money",
+				SHA256Hash: strings.Repeat("b", 64),
+				Content:    rawToml,
+				FetchedAt:  fetchedAt,
+			},
+		},
+	}
+	s := &Server{
+		Store: f,
+		CORS:  []string{"*"},
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:   func() time.Time { return now },
+	}
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	bad := get(t, srv, "/v1/issuers/not-an-issuer/toml", http.StatusBadRequest)
+	if bad["code"] != "invalid_issuer" {
+		t.Fatalf("unexpected error code: %+v", bad)
+	}
+	missing := get(t, srv, "/v1/issuers/"+otherIssuer+"/toml", http.StatusNotFound)
+	if missing["code"] != "issuer_toml_not_found" {
+		t.Fatalf("unexpected error code: %+v", missing)
+	}
+
+	resp, err := http.Get(srv.URL + "/v1/issuers/" + issuerAddr + "/toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	lastModHeader := resp.Header.Get("Last-Modified")
+	parsedLastMod, err := http.ParseTime(lastModHeader)
+	if err != nil {
+		t.Fatalf("parse Last-Modified %q: %v", lastModHeader, err)
+	}
+	if !parsedLastMod.Equal(fetchedAt) {
+		t.Fatalf("Last-Modified = %v, want %v", parsedLastMod, fetchedAt)
+	}
+	var got coverage.IssuerTomlSnapshot
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Issuer != issuerAddr || got.HomeDomain != "example.money" ||
+		got.SHA256Hash != strings.Repeat("b", 64) || got.Content != rawToml ||
+		!got.FetchedAt.Equal(fetchedAt) {
+		t.Fatalf("unexpected issuer toml response: %+v", got)
+	}
+
+	specResp, err := http.Get(srv.URL + "/openapi.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, _ := io.ReadAll(specResp.Body)
+	specResp.Body.Close()
+	if !strings.Contains(string(spec), "/v1/issuers/{issuer}/toml:") {
+		t.Fatal("openapi spec missing /v1/issuers/{issuer}/toml path")
 	}
 }

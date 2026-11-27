@@ -116,13 +116,12 @@ func TestDecodeReservePosted(t *testing.T) {
 	amount := check(t)(I128Val(big.NewInt(1_020_0000000)))
 	hash := check(t)(BytesN32Val(strings.Repeat("01", 32)))
 	ev := protocol.EventInfo{
-		ID:                       "0001-0",
-		Ledger:                   5034500,
-		LedgerClosedAt:           "2026-10-05T10:30:00Z",
-		ContractID:               "CLEDGER",
-		TransactionHash:          "abc",
-		InSuccessfulContractCall: true,
-		TopicXDR:                 []string{b64(t, sym("reserve_posted")), b64(t, sac), b64(t, U32Val(3))},
+		ID:              "0001-0",
+		Ledger:          5034500,
+		LedgerClosedAt:  "2026-10-05T10:30:00Z",
+		ContractID:      "CLEDGER",
+		TransactionHash: "abc",
+		TopicXDR:        []string{b64(t, sym("reserve_posted")), b64(t, sac), b64(t, U32Val(3))},
 		ValueXDR: b64(t, mapVal(
 			"amount", amount,
 			"as_of", u64(1_700_000_000),

@@ -57,6 +57,9 @@ values are reported together at startup.
 | `CORS_ORIGINS` | `*` | Comma separated. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. Logs are JSON on stdout. |
 | `GO_ENV` | empty | `production` disables the local `.env.local` overlay. Set it on every deployed instance. |
+| `LOG_LEVEL_API` | `LOG_LEVEL` | Log level override for the HTTP API server. Reloaded on `SIGHUP`. |
+| `LOG_LEVEL_WORKER` | `LOG_LEVEL` | Log level override for background workers (`reconcile`, `toml`, `poster`, `keepawake`). Reloaded on `SIGHUP`. |
+| `LOG_LEVEL_INGEST` | `LOG_LEVEL` | Log level override for the event ingester (`ingest`). Reloaded on `SIGHUP`. |
 | `KEEP_AWAKE_URL` | derived | `none` disables; otherwise `$RENDER_EXTERNAL_URL/healthz` on Render. |
 | `REPORTER_INTERVAL` | `5s` | How often registry reporter events are polled on their own cursor, so a registration reaches `/v1/reporters` within about one ledger. |
 | `HTTP_KEEPALIVE_TIMEOUT` | `90s` | How long an idle HTTP/2 connection to Horizon or Soroban RPC is kept open for reuse. |
