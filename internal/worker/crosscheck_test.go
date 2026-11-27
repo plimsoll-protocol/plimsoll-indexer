@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync/atomic"
 	"testing"
 
@@ -18,8 +19,10 @@ import (
 // real client does the talking: the cross-check is only worth anything if it
 // works against something that answers like Horizon does.
 //
-// ledgers is consumed one per request, so a test can have the second Horizon
-// catch up (or fail to) between attempts.
+// ledgers is consumed one per /assets request, so a test can have the second
+// Horizon catch up (or fail to) between attempts. Each response carries the
+// Latest-Ledger header the way Horizon's does, so the client labels the
+// balances with the ledger they were served at.
 type checkHorizon struct {
 	srv      *httptest.Server
 	requests atomic.Int32
@@ -33,12 +36,13 @@ func newCheckHorizon(t *testing.T, units string, ledgers ...uint32) *checkHorizo
 	c.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/":
+			fmt.Fprintf(w, `{"history_latest_ledger": %d}`, ledgers[len(ledgers)-1])
+		case "/assets":
 			n := int(c.requests.Add(1)) - 1
 			if n >= len(ledgers) {
 				n = len(ledgers) - 1
 			}
-			fmt.Fprintf(w, `{"history_latest_ledger": %d}`, ledgers[n])
-		case "/assets":
+			w.Header().Set("Latest-Ledger", strconv.FormatUint(uint64(ledgers[n]), 10))
 			fmt.Fprintf(w, `{"_embedded":{"records":[{
 			  "asset_code":"PUSD",
 			  "balances":{"authorized":"%s","authorized_to_maintain_liabilities":"0.0000000","unauthorized":"0.0000000"},
@@ -136,6 +140,22 @@ func TestCrossCheckTreatsEqualTotalsAsAgreementAtAnyLedger(t *testing.T) {
 	}
 	if got := check.requests.Load(); got != 1 {
 		t.Errorf("asked %d times, want 1: equal totals are agreement at any ledger", got)
+	}
+	if len(c.invoked) != 1 {
+		t.Fatalf("want the supply posted, got %v", c.invoked)
+	}
+}
+
+// The second Horizon advancing a ledger between the primary read and the check
+// must not be mistaken for a disagreement: the totals are compared at the
+// ledgers each read was served at.
+func TestCrossCheckDoesNotFlagSupplyThatMovedWithTheLedger(t *testing.T) {
+	b := crossCheckBreakdown(5_469_000)
+	check := newCheckHorizon(t, "999900", 5_468_999, 5_469_001) // same total, other ledgers
+	p, c := newCrossPoster(t, b, check.client())
+
+	if err := p.Run(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 	if len(c.invoked) != 1 {
 		t.Fatalf("want the supply posted, got %v", c.invoked)

@@ -51,6 +51,28 @@ hashed is served byte-for-byte at `/v1/breakdowns/{hash}`; `sha256` of that
 body equals the `breakdown_hash` in the on-chain `supply_posted` event, and each
 bucket can be recomputed from Horizon's `/assets` endpoint.
 
+### How the snapshot ledger is determined
+
+The `ledger` field in a breakdown is part of the hashed JSON, so it has to name
+the ledger the balances were actually read at: anyone recomputing the breakdown
+at that ledger must get the same totals. The indexer never derives it from a
+separate call.
+
+- The balances come from Horizon's `/assets`. Horizon stamps that response with
+a `Latest-Ledger` header, and that header is the ledger the response body
+reflects, so it becomes the breakdown's ledger.
+- If the header is absent (an older Horizon, or a proxy that strips it), the
+indexer brackets the read with two root queries. If `history_latest_ledger` did
+not move across the read, the read is attributable to that ledger; if it did
+move, the read is retried and, when it will not settle, abandoned rather than
+labelled with a guess.
+- A Soroban RPC usually trails Horizon by a ledger or two, so before signing the
+poster waits briefly for the RPC's latest ledger to reach the one the balances
+were read at. It never rewrites the snapshot's ledger to the RPC head; if the
+RPC does not catch up, nothing is posted that tick.
+- A zero snapshot for an asset with no trustlines has no balances to read, so it
+takes the RPC's latest ledger explicitly.
+
 ### Verifying supply snapshots
 
 Verify an asset's latest supply snapshot against live Horizon balances without needing a local database:
