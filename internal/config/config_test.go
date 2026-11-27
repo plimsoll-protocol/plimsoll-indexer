@@ -313,6 +313,8 @@ func TestLoadIngestWorkers(t *testing.T) {
 	}
 	if got.IngestWorkers != 1 {
 		t.Errorf("IngestWorkers = %d, want 1", got.IngestWorkers)
+	if got.ReporterStaleThreshold.String() != "720h0m0s" {
+		t.Errorf("ReporterStaleThreshold = %v, want 720h0m0s", got.ReporterStaleThreshold)
 	}
 }
 
@@ -373,6 +375,7 @@ func TestLoadBadDurations(t *testing.T) {
 		"KEEP_AWAKE_INTERVAL",
 		"REPORTER_INTERVAL",
 		"HTTP_KEEPALIVE_TIMEOUT",
+		"REPORTER_STALE_THRESHOLD",
 	}
 	for _, v := range durationVars {
 		t.Run(v, func(t *testing.T) {
@@ -407,6 +410,9 @@ func TestWebhookConfig(t *testing.T) {
 
 	t.Setenv("WEBHOOK_ADMIN_TOKEN", "token")
 	t.Setenv("WEBHOOK_SIGNING_SECRET", "secret")
+func TestReporterStaleThresholdConfiguration(t *testing.T) {
+	setBase(t)
+	t.Setenv("REPORTER_STALE_THRESHOLD", "48h")
 	got, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -421,6 +427,22 @@ func TestWebhookConfig(t *testing.T) {
 	}
 	if got.WebhookInterval.String() != "1m0s" {
 		t.Errorf("WebhookInterval = %v, want 1m0s", got.WebhookInterval)
+	if got.ReporterStaleThreshold.String() != "48h0m0s" {
+		t.Errorf("ReporterStaleThreshold = %v, want 48h0m0s", got.ReporterStaleThreshold)
+	}
+
+	t.Setenv("REPORTER_STALE_THRESHOLD", "0")
+	got, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ReporterStaleThreshold != 0 {
+		t.Errorf("ReporterStaleThreshold = %v, want 0", got.ReporterStaleThreshold)
+	}
+
+	t.Setenv("REPORTER_STALE_THRESHOLD", "-1h")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "must not be negative") {
+		t.Fatalf("want negative threshold error, got %v", err)
 	}
 }
 

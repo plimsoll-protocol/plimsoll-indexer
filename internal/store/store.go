@@ -150,6 +150,12 @@ type Progress struct {
 	EventAt     time.Time
 }
 
+// ReporterLatestReport is the most recent report date for an active reporter.
+type ReporterLatestReport struct {
+	Reporter string
+	AsOf     time.Time
+}
+
 // Progress returns how far ingestion for name has reached.
 func (s *Store) Progress(ctx context.Context, name string) (Progress, error) {
 	defer measureQuery("progress")()
@@ -875,6 +881,33 @@ func (s *Store) LatestReports(ctx context.Context, sac string) (map[uint32]cover
 	out := make(map[uint32]coverage.Report, len(list))
 	for _, r := range list {
 		out[r.Tier] = r
+	}
+	return out, nil
+}
+
+// LatestReporterReports returns the newest report by as_of date for each
+// active reporter that has submitted at least one report.
+func (s *Store) LatestReporterReports(ctx context.Context) ([]ReporterLatestReport, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT ON (rr.reporter) rr.reporter, rr.as_of
+		FROM reserve_reports rr
+		JOIN reporters r ON r.address = rr.reporter
+		WHERE r.active
+		ORDER BY rr.reporter, rr.as_of DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("query latest reporter reports: %w", err)
+	}
+	defer rows.Close()
+	var out []ReporterLatestReport
+	for rows.Next() {
+		var report ReporterLatestReport
+		if err := rows.Scan(&report.Reporter, &report.AsOf); err != nil {
+			return nil, fmt.Errorf("scan latest reporter report: %w", err)
+		}
+		out = append(out, report)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate latest reporter reports: %w", err)
 	}
 	return out, nil
 }

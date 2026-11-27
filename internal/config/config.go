@@ -119,6 +119,9 @@ type Config struct {
 	// previous on-chain one by more than six orders of magnitude, which is the
 	// shape of a decimal-point mistake rather than a real supply change.
 	DecimalCheckEnabled bool
+	// ReporterStaleThreshold is how old a reporter's latest report may be
+	// before ingestion logs a warning. Zero disables the check.
+	ReporterStaleThreshold time.Duration
 }
 
 // Load reads the environment. Missing required values are reported together.
@@ -291,6 +294,7 @@ func Load() (Config, error) {
 		"RECONCILE_INTERVAL":  true,
 		"TOML_INTERVAL":       true,
 		"KEEP_AWAKE_INTERVAL": true,
+		{"REPORTER_STALE_THRESHOLD", "720h", &c.ReporterStaleThreshold},
 	}
 	for _, d := range durations {
 		v, err := time.ParseDuration(envOr(d.name, d.def))
@@ -307,6 +311,9 @@ func Load() (Config, error) {
 			continue
 		}
 		*d.dst = v
+	}
+	if c.ReporterStaleThreshold < 0 {
+		errs = append(errs, errors.New("REPORTER_STALE_THRESHOLD must not be negative"))
 	}
 
 	if c.CoverageLedgerID != "" && !strkey.IsValidContractAddress(c.CoverageLedgerID) {
