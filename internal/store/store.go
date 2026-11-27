@@ -303,12 +303,26 @@ func applyEvent(ctx context.Context, tx pgx.Tx, ev any) error {
 			int64(e.Ledger), e.ClosedAt, e.TxHash)
 	case soroban.ReporterSet:
 		_, err = tx.Exec(ctx, `
-			INSERT INTO reporters (address, role, name, active, updated_ledger, updated_at)
-			VALUES ($1, $2, $3, true, $4, $5)
+			INSERT INTO reporters (address, role, name, display_name, active, updated_ledger, updated_at)
+			VALUES ($1, $2, $3, NULL, true, $4, $5)
 			ON CONFLICT (address) DO UPDATE
 			SET role = EXCLUDED.role, name = EXCLUDED.name, active = true, deleted_at = NULL,
 			    updated_ledger = EXCLUDED.updated_ledger, updated_at = EXCLUDED.updated_at`,
 			e.Reporter, int16(e.Role), e.Name, int64(e.Ledger), e.ClosedAt)
+	case soroban.ReporterMetadataUpdated:
+		// An inactive placeholder lets reconciliation recover registration details
+		// when the corresponding reporter_set event has aged out of RPC retention.
+		_, err = tx.Exec(ctx, `
+			INSERT INTO reporters
+			  (address, role, name, display_name, website_uri, contact_hash, active, updated_ledger, updated_at)
+			VALUES ($1, 0, '', $2, $3, $4, false, $5, $6)
+			ON CONFLICT (address) DO UPDATE
+			SET display_name = EXCLUDED.display_name,
+			    website_uri = EXCLUDED.website_uri,
+			    contact_hash = EXCLUDED.contact_hash,
+			    updated_ledger = EXCLUDED.updated_ledger,
+			    updated_at = EXCLUDED.updated_at`,
+			e.Reporter, e.DisplayName, e.WebsiteURI, e.ContactHash, int64(e.Ledger), e.ClosedAt)
 	case soroban.ReporterRevoked:
 		// A revocation is a soft delete: the row stays so the reports the
 		// reporter posted still name an address the API can resolve.
@@ -544,7 +558,7 @@ func (s *Store) LatestReportsBySAC(ctx context.Context, sacs []string) (map[stri
 		r.Tier = uint32(tier)
 		n, err := parseAmount(amount)
 		if err != nil {
-			return nil, fmt.Errorf("report for %s tier %d: %w", sac, tier, err)
+			return nil, fmt.Errorf("reserve report for %s at tier %d: %w", sac, tier, err)
 		}
 		r.Amount = n
 		if out[sac] == nil {
@@ -650,15 +664,15 @@ func (s *Store) ReportExportPage(ctx context.Context, sac string, from, to *time
 		row.Tier = uint32(tier)
 		row.Cursor.Ledger = ledger
 		if supplyAmount.Valid {
-			reserves, err := parseAmount(amount)
+			reportAmount, err := parseAmount(amount)
 			if err != nil {
-				return nil, fmt.Errorf("report export reserves: %w", err)
+				return nil, fmt.Errorf("report export amount for %s at ledger %d: %w", sac, ledger, err)
 			}
-			supply, err := parseAmount(supplyAmount.String)
+			supplyAmountInt, err := parseAmount(supplyAmount.String)
 			if err != nil {
-				return nil, fmt.Errorf("report export supply: %w", err)
+				return nil, fmt.Errorf("report export supply for %s at ledger %d: %w", sac, ledger, err)
 			}
-			bps := coverage.BPS(reserves, supply)
+			bps := coverage.BPS(reportAmount, supplyAmountInt)
 			row.Bps = &bps
 		}
 		out = append(out, row)
@@ -712,9 +726,8 @@ func (s *Store) queryReports(ctx context.Context, sql string, args ...any) ([]co
 // that added deleted_at backfilled it for rows that were only inactive.
 func (s *Store) Reporters(ctx context.Context, includeDeleted bool) ([]coverage.Reporter, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT address, role, name, updated_at, deleted_at FROM reporters
-		WHERE $1 OR deleted_at IS NULL
-		ORDER BY role, name`, includeDeleted)
+		SELECT address, role, name, COALESCE(display_name, name), website_uri, contact_hash, updated_at FROM reporters
+		WHERE active ORDER BY role, name`)
 	if err != nil {
 		return nil, err
 	}
@@ -723,12 +736,12 @@ func (s *Store) Reporters(ctx context.Context, includeDeleted bool) ([]coverage.
 	for rows.Next() {
 		var r coverage.Reporter
 		var role int16
-		var deletedAt *time.Time
-		if err := rows.Scan(&r.Address, &role, &r.Name, &r.UpdatedAt, &deletedAt); err != nil {
+		var websiteURI, contactHash *string
+		if err := rows.Scan(&r.Address, &role, &r.Name, &r.DisplayName, &websiteURI, &contactHash, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		r.Role = uint32(role)
-		r.DeletedAt = deletedAt
+		r.WebsiteURI, r.ContactHash = websiteURI, contactHash
 		out = append(out, r)
 	}
 	return out, rows.Err()
@@ -906,7 +919,7 @@ func (s *Store) DeleteWebhook(ctx context.Context, id int64, ownerKeyHash string
 		return fmt.Errorf("read webhook owner: %w", err)
 	}
 	// Rows created before owner tracking have no key hash and are admin-only.
-	if storedOwner != ownerKeyHash && !(storedOwner == "" && allowLegacyAdmin) {
+	if storedOwner != ownerKeyHash && (storedOwner != "" || !allowLegacyAdmin) {
 		return ErrForbidden
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM webhooks WHERE id = $1`, id); err != nil {
@@ -1102,20 +1115,30 @@ func (s *Store) ReportReporterAddresses(ctx context.Context) ([]string, error) {
 }
 
 // SaveChainReporter upserts a reporter read back from the registry contract.
-// It returns true when the row was new or changed (role, name, or active status).
+// It returns true when any stored registry field changed.
 // updated_ledger is set to 0 because the reconciler reads current state without
 // knowing which specific ledger set it.
 func (s *Store) SaveChainReporter(ctx context.Context, r coverage.Reporter) (bool, error) {
+	var displayName *string
+	if r.DisplayName != "" {
+		displayName = &r.DisplayName
+	}
 	tag, err := s.pool.Exec(ctx, `
-		INSERT INTO reporters (address, role, name, active, updated_ledger, updated_at)
-		VALUES ($1, $2, $3, true, 0, now())
+		INSERT INTO reporters
+		  (address, role, name, display_name, website_uri, contact_hash, active, updated_ledger, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, true, 0, now())
 		ON CONFLICT (address) DO UPDATE
-		SET role = EXCLUDED.role, name = EXCLUDED.name, active = true, deleted_at = NULL,
+		SET role = EXCLUDED.role, name = EXCLUDED.name,
+		    display_name = EXCLUDED.display_name, website_uri = EXCLUDED.website_uri,
+		    contact_hash = EXCLUDED.contact_hash, active = true,
 		    updated_at = now()
 		WHERE reporters.active = false
 		   OR reporters.role <> EXCLUDED.role
-		   OR reporters.name <> EXCLUDED.name`,
-		r.Address, int16(r.Role), r.Name)
+		   OR reporters.name <> EXCLUDED.name
+		   OR reporters.display_name IS DISTINCT FROM EXCLUDED.display_name
+		   OR reporters.website_uri IS DISTINCT FROM EXCLUDED.website_uri
+		   OR reporters.contact_hash IS DISTINCT FROM EXCLUDED.contact_hash`,
+		r.Address, int16(r.Role), r.Name, displayName, r.WebsiteURI, r.ContactHash)
 	if err != nil {
 		return false, fmt.Errorf("save chain reporter: %w", err)
 	}

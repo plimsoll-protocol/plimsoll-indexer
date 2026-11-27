@@ -56,23 +56,18 @@ type Config struct {
 	// supply against before signing it on chain. One Horizon is one point of
 	// trust for the only figure this indexer asserts itself. Empty disables the
 	// comparison.
-	HorizonCheckURL    string
-	NetworkPassphrase  string
-	CoverageLedgerID   string
-	ReporterRegistryID string
-	StartLedger        uint32
-	IngestWorkers      int
-	// MaxRPCDriftLedgers is how many ledgers the RPC endpoints may differ by
-	// before the drift monitor warns (MAX_RPC_DRIFT_LEDGERS, default 10).
-	MaxRPCDriftLedgers   uint32
+	HorizonCheckURL      string
+	NetworkPassphrase    string
+	CoverageLedgerID     string
+	ReporterRegistryID   string
+	StartLedger          uint32
+	IngestWorkers        int
 	PosterSecret         string
 	WebhookAdminToken    string
 	WebhookAPIKeys       []string
 	WebhookEncryptionKey string
 	SlackWebhookURL      string
 	DiscordWebhookURL    string
-	// WebhookSigningSecret keys the HMAC-SHA256 signature on coverage alert
-	// deliveries; it needs WebhookAdminToken.
 	WebhookSigningSecret string
 	WebhookInterval      time.Duration
 	IngestInterval       time.Duration

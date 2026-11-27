@@ -11,11 +11,12 @@ import (
 
 // Event names emitted by the Plimsoll contracts (snake_case struct names).
 const (
-	EventAssetListed     = "asset_listed"
-	EventSupplyPosted    = "supply_posted"
-	EventReservePosted   = "reserve_posted"
-	EventReporterSet     = "reporter_set"
-	EventReporterRevoked = "reporter_revoked"
+	EventAssetListed             = "asset_listed"
+	EventSupplyPosted            = "supply_posted"
+	EventReservePosted           = "reserve_posted"
+	EventReporterSet             = "reporter_set"
+	EventReporterMetadataUpdated = "reporter_metadata_updated"
+	EventReporterRevoked         = "reporter_revoked"
 )
 
 // Meta is common to every event.
@@ -64,6 +65,14 @@ type ReporterSet struct {
 	Reporter string
 	Role     uint32
 	Name     string
+}
+
+type ReporterMetadataUpdated struct {
+	Meta
+	Reporter    string
+	DisplayName *string
+	WebsiteURI  *string
+	ContactHash *string
 }
 
 type ReporterRevoked struct {
@@ -133,6 +142,13 @@ func Decode(e protocol.EventInfo) (any, error) {
 		out.Role = d.u32(f, "role")
 		out.Name = d.str(f, "name")
 		return out, d.wrap(e.ID, name)
+	case EventReporterMetadataUpdated:
+		f := d.fields(value)
+		out := ReporterMetadataUpdated{Meta: meta, Reporter: d.topicAddr(1)}
+		out.DisplayName = d.optionalString(f, "name", AsSymbol)
+		out.WebsiteURI = d.optionalString(f, "website_uri", AsString)
+		out.ContactHash = d.optionalString(f, "contact_hash", AsHex)
+		return out, d.wrap(e.ID, name)
 	case EventReporterRevoked:
 		out := ReporterRevoked{Meta: meta, Reporter: d.topicAddr(1)}
 		return out, d.wrap(e.ID, name)
@@ -198,6 +214,12 @@ func (d *decoder) str(f map[string]xdr.ScVal, k string) string {
 	s, err := AsString(d.field(f, k))
 	d.set(err)
 	return s
+}
+
+func (d *decoder) optionalString(f map[string]xdr.ScVal, k string, decode func(xdr.ScVal) (string, error)) *string {
+	value, err := decodeOptionalString(d.field(f, k), decode)
+	d.set(err)
+	return value
 }
 
 func (d *decoder) addr(f map[string]xdr.ScVal, k string) string {

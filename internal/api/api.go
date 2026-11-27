@@ -148,7 +148,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/webhooks/{id}", s.deleteWebhook)
 	mux.HandleFunc("POST /v1/coverage-webhooks", s.createCoverageWebhook)
 	mux.HandleFunc("DELETE /v1/coverage-webhooks/{id}", s.deleteCoverageWebhook)
-	return s.cors(errorEnvelope(mux))
+	return s.compress(s.cors(errorEnvelope(mux)))
+}
+
+func (s *Server) compress(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cw := &compressionWriter{
+			ResponseWriter: w,
+			encoding:       acceptedEncoding(strings.Join(r.Header.Values("Accept-Encoding"), ",")),
+			logger:         s.Log,
+			method:         r.Method,
+		}
+		next.ServeHTTP(cw, r)
+		if err := cw.finish(); err != nil && s.Log != nil {
+			s.Log.Error("write compressed API response", "err", err)
+		}
+	})
 }
 
 // ---- JSON shapes ----------------------------------------------------------
@@ -445,7 +460,12 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]assetJSON, 0, len(assets))
 	for _, a := range assets {
-		out = append(out, s.assembleWithData(a, supplies[a.SAC], reports[a.SAC], minTier))
+		aj, err := s.assembleWithData(r.Context(), a, supplies[a.SAC], reports[a.SAC], minTier)
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		out = append(out, aj)
 	}
 	body := map[string]any{"assets": out}
 	if hasNext {
@@ -708,8 +728,10 @@ func (s *Server) assemble(ctx context.Context, a coverage.Asset, minTier uint32)
 	if err != nil {
 		return assetJSON{}, err
 	}
-	sp := supplies[a.SAC]
-	reports := reportsBySAC[a.SAC]
+	return s.assembleWithData(ctx, a, supplies[a.SAC], reportsBySAC[a.SAC], minTier)
+}
+
+func (s *Server) assembleWithData(ctx context.Context, a coverage.Asset, sp *coverage.Supply, reports map[uint32]coverage.Report, minTier uint32) (assetJSON, error) {
 	att, attErr := s.Store.Attestation(ctx, a.SAC)
 	if attErr != nil && !errors.Is(attErr, store.ErrNotFound) {
 		return assetJSON{}, attErr
@@ -729,29 +751,6 @@ func (s *Server) assemble(ctx context.Context, a coverage.Asset, minTier uint32)
 		out.Reports[coverage.TierName(tier)] = toReport(rep)
 	}
 	return out, nil
-}
-
-// assembleWithData builds one asset from supply and reports that a list
-// request already fetched in bulk.
-func (s *Server) assembleWithData(a coverage.Asset, sp *coverage.Supply, reports map[uint32]coverage.Report, minTier uint32) assetJSON {
-	out := assetJSON{
-		Asset:         a,
-		Toml:          json.RawMessage("null"),
-		TomlCheckedAt: a.TomlCheckedAt,
-		Supply:        toSupply(sp),
-		Reports:       map[string]*reportJSON{},
-		Coverage:      s.toCoverage(coverage.Compute(sp, reports, minTier)),
-	}
-	if a.TomlError != "" {
-		out.TomlError = &a.TomlError
-	}
-	if len(a.Toml) > 0 {
-		out.Toml = a.Toml
-	}
-	for tier, rep := range reports {
-		out.Reports[coverage.TierName(tier)] = toReport(rep)
-	}
-	return out
 }
 
 // withAttestation adds the issuer's attestation document fields to the stored
@@ -906,17 +905,17 @@ func (s *Server) coverageNow(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAsset(w, r, sac) {
 		return
 	}
-	supply, err := s.Store.LatestSupply(r.Context(), sac)
+	supplies, err := s.Store.LatestSupplies(r.Context(), []string{sac})
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	reports, err := s.Store.LatestReports(r.Context(), sac)
+	reportsBySAC, err := s.Store.LatestReportsBySAC(r.Context(), []string{sac})
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	res := coverage.Compute(supply, reports, coverage.TierTranscribed)
+	res := coverage.Compute(supplies[sac], reportsBySAC[sac], coverage.TierTranscribed)
 	if res == nil {
 		writeError(w, http.StatusNotFound, codeCoverageNotFound, "no live coverage report")
 		return
@@ -1479,9 +1478,6 @@ const (
 	codeInvalidLimit          = "invalid_limit"
 	codeInvalidCursor         = "invalid_cursor"
 	codeInvalidDate           = "invalid_date"
-	codeInvalidCovered        = "invalid_covered"
-	codeInvalidIncludeDeleted = "invalid_include_deleted"
-	codeAuthNotConfigured     = "auth_not_configured"
 	codeInvalidBody           = "invalid_body"
 	codeInvalidWebhookURL     = "invalid_webhook_url"
 	codeInvalidWebhookID      = "invalid_webhook_id"
@@ -1489,6 +1485,7 @@ const (
 	codeWebhookForbidden      = "webhook_forbidden"
 	codeWebhooksNotConfigured = "webhooks_not_configured"
 	codeUnauthorized          = "unauthorized"
+	codeAuthUnavailable       = "auth_unavailable"
 	codeInternal              = "internal_error"
 	codeDBUnavailable         = "db_unavailable"
 	codeProgressUnavailable   = "progress_unavailable"

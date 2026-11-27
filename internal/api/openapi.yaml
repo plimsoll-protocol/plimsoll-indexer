@@ -441,7 +441,7 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
   /v1/reporters:
     get:
-      summary: List registered reporters and their roles
+      summary: List registered reporters, roles, and profile metadata
       operationId: listReporters
       parameters:
         - name: include_deleted
@@ -1110,11 +1110,17 @@ components:
         name:
           type: string
           example: "Acme"
-        deleted_at:
+        display_name:
+          type: string
+          example: "Acme Inc."
+        website_uri:
           type: [string, "null"]
-          format: date-time
-          description: When the registry de-registered the reporter; null while it is live
-          example: null
+          format: uri
+          example: "https://acme.example"
+        contact_hash:
+          type: [string, "null"]
+          description: Hash of the reporter's contact details.
+          example: "sha256:..."
         updated_at:
           type: string
           format: date-time
@@ -1123,7 +1129,9 @@ components:
         - role
         - address
         - name
-        - deleted_at
+        - display_name
+        - website_uri
+        - contact_hash
         - updated_at
     CoverageWebhookRequest:
       type: object

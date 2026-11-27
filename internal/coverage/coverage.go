@@ -97,13 +97,13 @@ type DocCheckTask struct {
 }
 
 type Reporter struct {
-	Address string `json:"address"`
-	Role    uint32 `json:"-"`
-	Name    string `json:"name"`
-	// DeletedAt is set when the registry revoked the reporter. The row is kept
-	// so the reports it posted still name it.
-	DeletedAt *time.Time `json:"deleted_at"`
-	UpdatedAt time.Time  `json:"updated_at"`
+	Address     string    `json:"address"`
+	Role        uint32    `json:"-"`
+	Name        string    `json:"name"`
+	DisplayName string    `json:"display_name"`
+	WebsiteURI  *string   `json:"website_uri"`
+	ContactHash *string   `json:"contact_hash"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // Result mirrors the contract's Coverage struct.

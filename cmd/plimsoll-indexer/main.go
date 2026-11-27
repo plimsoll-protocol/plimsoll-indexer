@@ -127,10 +127,11 @@ func run(cfg config.Config, log *slog.Logger) error {
 	// Reading is simulation, so this needs no key and runs even on an instance
 	// that cannot sign.
 	reconciler := &worker.Reconciler{
-		Invoker:  &soroban.Reader{RPC: rpc},
-		Store:    db,
-		LedgerID: cfg.CoverageLedgerID,
-		Log:      log.With("job", "reconcile"),
+		Invoker:            &soroban.Reader{RPC: rpc},
+		Store:              db,
+		LedgerID:           cfg.CoverageLedgerID,
+		ReporterRegistryID: cfg.ReporterRegistryID,
+		Log:                log.With("job", "reconcile"),
 	}
 	if err := reconciler.Run(ctx); err != nil {
 		log.Error("initial reconcile failed", "err", err)

@@ -130,6 +130,17 @@ func AsHex(v xdr.ScVal) (string, error) {
 	return hex.EncodeToString(*v.Bytes), nil
 }
 
+func decodeOptionalString(v xdr.ScVal, decode func(xdr.ScVal) (string, error)) (*string, error) {
+	if v.Type == xdr.ScValTypeScvVoid {
+		return nil, nil
+	}
+	value, err := decode(v)
+	if err != nil {
+		return nil, err
+	}
+	return &value, nil
+}
+
 // Fields turns a symbol-keyed ScMap into a Go map.
 func Fields(v xdr.ScVal) (map[string]xdr.ScVal, error) {
 	if v.Type != xdr.ScValTypeScvMap || v.Map == nil || *v.Map == nil {

@@ -159,6 +159,9 @@ func TestBreakdownBytesRoundTripExactly(t *testing.T) {
 	if err := s.SaveBreakdown(ctx, hash, testSAC, body); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.ConfirmBreakdown(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
 	got, err := s.Breakdown(ctx, hash)
 	if err != nil {
 		t.Fatal(err)
