@@ -374,60 +374,66 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-      parameters:
-        - name: sac
-          in: path
-          required: true
-          description: Stellar Asset Contract (SAC) address
-          schema:
-            type: string
-            pattern: '^C[A-Z2-7]{55}$'
-        - name: from
-          in: query
-          required: false
-          description: Include reports posted on or after this UTC date
-          schema:
-            type: string
-            format: date
-        - name: to
-          in: query
-          required: false
-          description: Include reports posted through this UTC date
-          schema:
-            type: string
-            format: date
-      responses:
-        '200':
-          description: CSV report history, paginated internally
-          headers:
-            Content-Disposition:
-              description: Indicates that the CSV is an attachment
-              schema:
-                type: string
-          content:
-            text/csv:
-              schema:
-                type: string
-                example: |-
-                  ledger,timestamp,reporter,bps,tier,doc_uri
-                  42,2026-10-05T12:00:00Z,G...,10200,issuer_signed,https://example.test/report
-        '400':
-          description: Invalid date parameter, or sac is not a contract strkey
-
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '404':
-          description: Asset not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
   /v1/reporters:
     get:
-      summary: List registered reporters and their roles
+      summary: List registered reporters, their strongest report tier and counts
       operationId: listReporters
+      description: >
+        Returns every reporter in the registry, active or revoked, unless the
+        active filter is supplied. `tier` is the strongest reserve-report tier
+        the reporter has posted (null when they have never posted one), and
+        `asset_count` and `report_count` are derived from the reserve reports
+        they signed. `reputation_score` and `expires_at` are registry fields
+        that current contract deployments do not expose, so they are null until
+        a registry version provides them (plimsoll-contracts#72 and #92).
+      parameters:
+        - name: tier
+          in: query
+          required: false
+          description: Only reporters whose strongest report is at this tier
+          schema:
+            type: string
+            enum: ['1', '2', '3', transcribed, issuer_signed, auditor_signed]
+        - name: active
+          in: query
+          required: false
+          description: >
+            true for active reporters only, false for revoked ones only.
+            Omitted, both are returned.
+          schema:
+            type: boolean
+        - name: sort
+          in: query
+          required: false
+          description: Sort column; missing scores and expiries sort last
+          schema:
+            type: string
+            enum: [name, address, tier, score, expiry, updated_at]
+            default: name
+        - name: order
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: asc
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of reporters to return (1-1000)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+        - name: offset
+          in: query
+          required: false
+          description: Number of reporters to skip
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
       responses:
         '200':
           description: List of registered reporters
@@ -440,8 +446,17 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/Reporter'
+                  next_offset:
+                    type: integer
+                    description: Present when another page exists; pass it as offset.
                 required:
                   - reporters
+        '400':
+          description: Invalid query parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/changelog:
     get:
       summary: List breaking changes per released API version
@@ -957,6 +972,7 @@ components:
       properties:
         role:
           type: string
+          enum: [auditor, transcriber, supply_poster, unknown]
           example: "auditor"
         address:
           type: string
@@ -964,6 +980,35 @@ components:
         name:
           type: string
           example: "Acme"
+        active:
+          type: boolean
+          description: False once the registry has revoked the reporter.
+          example: true
+        tier:
+          type: [string, "null"]
+          enum: [transcribed, issuer_signed, auditor_signed, null]
+          description: >
+            Strongest reserve-report tier this reporter has posted; null when
+            they have never posted a report.
+        asset_count:
+          type: integer
+          description: Distinct assets the reporter has posted a reserve report for.
+          example: 2
+        report_count:
+          type: integer
+          description: Reserve reports the reporter has posted.
+          example: 3
+        reputation_score:
+          type: [integer, "null"]
+          description: >
+            On-chain registry score. Null until the registry exposes one
+            (plimsoll-contracts#72); the indexer does not invent a score.
+        expires_at:
+          type: [string, "null"]
+          format: date-time
+          description: >
+            Registry expiry. Null when the registry has no expiry for this
+            reporter or does not expose one yet (plimsoll-contracts#92).
         updated_at:
           type: string
           format: date-time
@@ -972,6 +1017,12 @@ components:
         - role
         - address
         - name
+        - active
+        - tier
+        - asset_count
+        - report_count
+        - reputation_score
+        - expires_at
         - updated_at
     CoverageWebhookRequest:
       type: object
@@ -1088,7 +1139,9 @@ components:
             Machine-readable error identifier. Match on this value, not on
             `message`. Handlers use: not_found, invalid_sac,
             asset_not_listed, invalid_breakdown_hash, breakdown_not_found,
-            coverage_not_found, invalid_min_tier, invalid_limit, invalid_body,
+            coverage_not_found, invalid_min_tier, invalid_limit, invalid_offset,
+            invalid_tier, invalid_active, invalid_sort, invalid_order,
+            invalid_body,
             invalid_webhook_url, invalid_webhook_id, webhook_not_found,
             webhook_forbidden,
             webhooks_not_configured, unauthorized, internal_error,

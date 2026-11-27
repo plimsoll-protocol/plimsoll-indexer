@@ -75,7 +75,9 @@ func (n *CoverageDropNotifier) Notify(ctx context.Context, ev CoverageDropEvent)
 	return errorsJoin(errs...)
 }
 
-func postWebhook(ctx context.Context, client interface{ Do(req *http.Request) (*http.Response, error) }, url string, payload any) error {
+func postWebhook(ctx context.Context, client interface {
+	Do(req *http.Request) (*http.Response, error)
+}, url string, payload any) error {
 	bs, err := json.Marshal(payload)
 	if err != nil {
 		return err

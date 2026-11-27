@@ -85,7 +85,7 @@ are, so it is safe on a live database, and on an empty one that holds only
 | `GET /v1/assets/{sac}/supply?limit=100` | Supply snapshot history. Each row carries `source`: `event` for a figure decoded from a contract event, with the `tx_hash` that produced it, or `chain` for one recovered from contract state after an ingestion gap, where `tx_hash` is empty. |
 | `GET /v1/assets/{sac}/reports?limit=100` | Reserve report history |
 | `GET /v1/assets/{sac}/coverage/now` | The `bps`, `tier`, `as_of` and `reporter` of the live report `coverage()` selects, without the asset document. `404` when no live report exists |
-| `GET /v1/reporters` | Active registered reporters |
+| `GET /v1/reporters?tier=auditor_signed&active=true&sort=score&order=desc&limit=100&offset=0` | Every registered reporter, active or revoked unless `active` is given, with the strongest reserve-report tier they have posted, their asset and report counts, and the registry's nullable `reputation_score` and `expires_at`. Sorts by `name`, `address`, `tier`, `score`, `expiry` or `updated_at`; pages with `next_offset`. |
 | `GET /v1/changelog` | Breaking API changes per released version, newest first |
 | `GET /v1/breakdowns/{hash}` | Exact bytes of a supply breakdown that backs an on-chain snapshot |
 | `POST /v1/webhooks`, `GET /v1/webhooks`, `DELETE /v1/webhooks/{id}` | Manage authenticated issuer TOML change subscriptions |

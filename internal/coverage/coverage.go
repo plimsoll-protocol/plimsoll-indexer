@@ -100,7 +100,21 @@ type Reporter struct {
 	Address   string    `json:"address"`
 	Role      uint32    `json:"-"`
 	Name      string    `json:"name"`
+	Active    bool      `json:"active"`
 	UpdatedAt time.Time `json:"updated_at"`
+	// Tier is the strongest reserve-report tier this reporter has posted, or 0
+	// when they have never posted a report. The registry carries a role, not a
+	// tier: a reporter's weight comes from the reports they sign.
+	Tier uint32 `json:"-"`
+	// AssetCount and ReportCount are derived from the reporter's reserve
+	// reports, so they describe indexed evidence rather than the registry.
+	AssetCount  int `json:"asset_count"`
+	ReportCount int `json:"report_count"`
+	// ReputationScore and ExpiresAt are registry fields that current contract
+	// deployments do not expose. They stay nil rather than being guessed; see
+	// plimsoll-contracts#72 and plimsoll-contracts#92.
+	ReputationScore *int32     `json:"reputation_score"`
+	ExpiresAt       *time.Time `json:"expires_at"`
 }
 
 // Result mirrors the contract's Coverage struct.

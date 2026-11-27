@@ -58,6 +58,7 @@ type fake struct {
 	attestation      map[string]store.Attestation
 	created          []coverage.Webhook
 	deleted          []int64
+	reporterList     []coverage.Reporter
 }
 
 func (f *fake) Ping(context.Context) error { return nil }
@@ -118,7 +119,83 @@ func (f *fake) ReportExportPage(_ context.Context, _ string, from, to *time.Time
 	return f.exportPages[pageIndex], nil
 }
 func (f *fake) Reporters(context.Context) ([]coverage.Reporter, error) {
+	if f.reporterList != nil {
+		return f.reporterList, nil
+	}
 	return []coverage.Reporter{{Address: "GAUD", Role: coverage.RoleAuditor, Name: "Acme"}}, nil
+}
+
+func TestReporterListFiltersSortsAndPages(t *testing.T) {
+	score := int32(42)
+	expires := now.Add(48 * time.Hour)
+	f := &fake{reporterList: []coverage.Reporter{
+		{Address: "GAUD", Role: coverage.RoleAuditor, Name: "Auditor", Active: true,
+			Tier: coverage.TierAuditorSigned, AssetCount: 2, ReportCount: 3,
+			ReputationScore: &score, ExpiresAt: &expires, UpdatedAt: now},
+		{Address: "GTRANS", Role: coverage.RoleTranscriber, Name: "Transcriber", Active: false,
+			Tier: coverage.TierTranscribed, AssetCount: 1, ReportCount: 1, UpdatedAt: now.Add(-time.Hour)},
+		{Address: "GPOST", Role: coverage.RoleSupplyPoster, Name: "Poster", Active: true,
+			UpdatedAt: now.Add(-2 * time.Hour)},
+	}}
+	srv := serverFor(f)
+	defer srv.Close()
+
+	all := get(t, srv, "/v1/reporters", 200)["reporters"].([]any)
+	if len(all) != 3 {
+		t.Fatalf("default list has %d reporters, want all 3", len(all))
+	}
+	if all[0].(map[string]any)["name"] != "Auditor" || all[2].(map[string]any)["name"] != "Transcriber" {
+		t.Fatalf("default order = %+v, want name ascending", all)
+	}
+	if got := all[2].(map[string]any)["asset_count"]; got != nil && got.(float64) != 1 {
+		t.Errorf("asset_count = %v, want 1", got)
+	}
+	if poster := all[1].(map[string]any); poster["tier"] != nil {
+		t.Errorf("tier = %v, want null for a reporter with no reports", poster["tier"])
+	}
+
+	active := get(t, srv, "/v1/reporters?active=true", 200)["reporters"].([]any)
+	if len(active) != 2 {
+		t.Fatalf("active list has %d reporters, want 2", len(active))
+	}
+	revoked := get(t, srv, "/v1/reporters?active=false", 200)["reporters"].([]any)
+	if len(revoked) != 1 || revoked[0].(map[string]any)["address"] != "GTRANS" {
+		t.Fatalf("revoked list = %+v, want only GTRANS", revoked)
+	}
+
+	tier := get(t, srv, "/v1/reporters?tier=auditor_signed", 200)["reporters"].([]any)
+	if len(tier) != 1 || tier[0].(map[string]any)["address"] != "GAUD" {
+		t.Fatalf("tier filter = %+v, want only GAUD", tier)
+	}
+	if tier[0].(map[string]any)["tier"] != "auditor_signed" {
+		t.Errorf("tier name missing from reporter: %+v", tier[0])
+	}
+
+	byScore := get(t, srv, "/v1/reporters?sort=score&order=desc", 200)["reporters"].([]any)
+	if byScore[0].(map[string]any)["reputation_score"].(float64) != 42 {
+		t.Fatalf("score sort = %+v, want the scored reporter first", byScore)
+	}
+	byExpiry := get(t, srv, "/v1/reporters?sort=expiry", 200)["reporters"].([]any)
+	if byExpiry[0].(map[string]any)["address"] != "GAUD" {
+		t.Fatalf("expiry sort = %+v, want the dated reporter first and nulls last", byExpiry)
+	}
+
+	page := get(t, srv, "/v1/reporters?limit=1&offset=1", 200)
+	if page["reporters"].([]any)[0].(map[string]any)["name"] != "Poster" || page["next_offset"].(float64) != 2 {
+		t.Fatalf("second page = %+v, want Poster and next_offset 2", page)
+	}
+
+	for _, path := range []string{
+		"/v1/reporters?tier=9",
+		"/v1/reporters?active=maybe",
+		"/v1/reporters?sort=stake",
+		"/v1/reporters?order=sideways",
+		"/v1/reporters?offset=-1",
+	} {
+		if body := get(t, srv, path, 400); body["code"] == nil {
+			t.Errorf("%s: missing error code", path)
+		}
+	}
 }
 func (f *fake) Breakdown(_ context.Context, h string) ([]byte, error) {
 	if b, ok := f.bodies[h]; ok {
@@ -130,6 +207,13 @@ func (f *fake) Progress(_ context.Context, name string) (store.Progress, error) 
 	if p, ok := f.progress[name]; ok {
 		return p, nil
 	}
+	return store.Progress{
+		Cursor:        "c",
+		ScannedLedger: 42,
+		EventLedger:   40,
+		EventAt:       now.Add(-90 * time.Second),
+	}, nil
+}
 
 func (f *fake) CreateCoverageWebhook(_ context.Context, w coverage.Webhook) (coverage.Webhook, error) {
 	w.ID = int64(len(f.created) + 1)
@@ -151,14 +235,6 @@ func (f *fake) Attestation(_ context.Context, s string) (store.Attestation, erro
 		return a, nil
 	}
 	return store.Attestation{}, store.ErrNotFound
-}
-func (f *fake) Progress(context.Context, string) (store.Progress, error) {
-	return store.Progress{
-		Cursor:        "c",
-		ScannedLedger: 42,
-		EventLedger:   40,
-		EventAt:       now.Add(-90 * time.Second),
-	}, nil
 }
 
 func TestHealthAggregatesContractStreamProgress(t *testing.T) {
@@ -320,10 +396,20 @@ func TestGetAssetCoverage(t *testing.T) {
 	srv := server()
 	defer srv.Close()
 	body := get(t, srv, "/v1/assets/"+sac, 200)
-	for _, field := range []string{"toml", "toml_checked_at", "toml_error"} {
-		value, ok := body[field]
-		if !ok || value != nil {
-			t.Errorf("%s = %v (present: %t), want null", field, value, ok)
+	// The issuer's attestation document is merged into the stored SEP-1 object.
+	toml, ok := body["toml"].(map[string]any)
+	if !ok {
+		t.Fatalf("toml = %v, want the attestation object", body["toml"])
+	}
+	if got := toml["attestation_hash"]; got != "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" {
+		t.Errorf("attestation_hash = %v", got)
+	}
+	if got := toml["attestation_changed_at"]; got != now.UTC().Format(time.RFC3339) {
+		t.Errorf("attestation_changed_at = %v, want %s", got, now.UTC().Format(time.RFC3339))
+	}
+	for _, field := range []string{"toml_checked_at", "toml_error"} {
+		if value, present := body[field]; !present || value != nil {
+			t.Errorf("%s = %v (present: %t), want null", field, value, present)
 		}
 	}
 	report := body["reports"].(map[string]any)["issuer_signed"].(map[string]any)
@@ -771,6 +857,43 @@ func TestReportExportStreamsPagesAndAppliesDateFilters(t *testing.T) {
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/v1/assets/" + sac + "/reports/export.csv?from=2026-10-01&to=2026-10-05")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/csv") {
+		t.Errorf("content-type = %q, want text/csv", ct)
+	}
+	if got := resp.Header.Get("Content-Disposition"); got != `attachment; filename="reports-`+sac+`.csv"` {
+		t.Errorf("Content-Disposition = %q", got)
+	}
+	records, err := csv.NewReader(resp.Body).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 502 {
+		t.Fatalf("records = %d, want 501 exported rows plus the header", len(records))
+	}
+	if got := strings.Join(records[0], ","); got != "ledger,timestamp,reporter,bps,tier,doc_uri" {
+		t.Errorf("header = %q", got)
+	}
+	if got := strings.Join(records[1], ","); got != "100,2026-10-05T10:00:00Z,GREPORTER,10200,issuer_signed,https://example.test/report" {
+		t.Errorf("first report record = %q", got)
+	}
+	if f.exportFrom == nil || !f.exportFrom.Equal(time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Errorf("from = %v, want 2026-10-01", f.exportFrom)
+	}
+	if f.exportTo == nil || !f.exportTo.Equal(time.Date(2026, 10, 6, 0, 0, 0, 0, time.UTC)) {
+		t.Errorf("to = %v, want the day after 2026-10-05", f.exportTo)
+	}
+	if f.exportCalls != 2 || len(f.exportCursors) != 2 || f.exportCursors[1] == nil {
+		t.Errorf("pages = %d, cursors = %+v, want two pages with a cursor between them",
+			f.exportCalls, f.exportCursors)
+	}
+}
 
 // adminRequest sends a webhook-administration request and returns the status
 // and decoded body (nil for 204).
@@ -792,33 +915,15 @@ func adminRequest(t *testing.T, srv *httptest.Server, method, path, token, body 
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status %d, want 200", resp.StatusCode)
+	status := resp.StatusCode
+	if status == http.StatusNoContent {
+		return status, nil
 	}
-	if got := resp.Header.Get("Content-Disposition"); got != `attachment; filename="reports-`+sac+`.csv"` {
-		t.Fatalf("Content-Disposition = %q", got)
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode %s %s: %v", method, path, err)
 	}
-	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/csv") {
-		t.Fatalf("Content-Type = %q", got)
-	}
-	records, err := csv.NewReader(resp.Body).ReadAll()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(records) != 502 || strings.Join(records[0], ",") != "ledger,timestamp,reporter,bps,tier,doc_uri" {
-		t.Fatalf("CSV has %d records and header %v", len(records), records[0])
-	}
-	if got := strings.Join(records[1], ","); got != "100,2026-10-05T10:00:00Z,GREPORTER,10200,issuer_signed,https://example.test/report" {
-		t.Fatalf("first report record = %q", got)
-	}
-	if f.exportCalls != 2 || f.exportCursors[1] == nil ||
-		f.exportCursors[1].Ledger != 599 || f.exportCursors[1].EventID != "event-599" {
-		t.Fatalf("page calls/cursor = %d / %+v", f.exportCalls, f.exportCursors)
-	}
-	if f.exportFrom == nil || !f.exportFrom.Equal(time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)) ||
-		f.exportTo == nil || !f.exportTo.Equal(time.Date(2026, 10, 6, 0, 0, 0, 0, time.UTC)) {
-		t.Fatalf("date bounds = %v / %v", f.exportFrom, f.exportTo)
-	}
+	return status, out
 }
 
 func makeExportRows(n int) []store.ReportExportRow {
@@ -833,13 +938,6 @@ func makeExportRows(n int) []store.ReportExportRow {
 		}
 	}
 	return rows
-
-	if resp.StatusCode == http.StatusNoContent {
-		return resp.StatusCode, nil
-	}
-	var out map[string]any
-	_ = json.NewDecoder(resp.Body).Decode(&out)
-	return resp.StatusCode, out
 }
 
 func TestWebhookAdminEndpoints(t *testing.T) {
@@ -951,13 +1049,13 @@ type unreadable struct{ *fake }
 
 var errUnreadable = errors.New(`supply snapshot at ledger 100: amount "NaN" is not an integer`)
 
-func (unreadable) LatestSupply(context.Context, string) (*coverage.Supply, error) {
+func (unreadable) LatestSupplies(context.Context, []string) (map[string]*coverage.Supply, error) {
 	return nil, errUnreadable
 }
 func (unreadable) SupplyHistory(context.Context, string, int) ([]coverage.Supply, error) {
 	return nil, errUnreadable
 }
-func (unreadable) LatestReports(context.Context, string) (map[uint32]coverage.Report, error) {
+func (unreadable) LatestReportsBySAC(context.Context, []string) (map[string]map[uint32]coverage.Report, error) {
 	return nil, errUnreadable
 }
 func (unreadable) ReportHistory(context.Context, string, int) ([]coverage.Report, error) {

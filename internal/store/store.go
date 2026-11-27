@@ -609,42 +609,15 @@ func (s *Store) LatestReports(ctx context.Context, sac string) (map[uint32]cover
 	return out, nil
 }
 
-// LatestReportsBySAC returns the newest report for each tier of each requested SAC.
-func (s *Store) LatestReportsBySAC(ctx context.Context, sacs []string) (map[string]map[uint32]coverage.Report, error) {
-	out := make(map[string]map[uint32]coverage.Report)
-	if len(sacs) == 0 {
-		return out, nil
+// mustBig parses a NUMERIC column that the schema makes non-null. A value that
+// cannot be parsed is not silently dropped: it becomes zero, which coverage
+// reads as an empty reserve rather than as a healthy asset.
+func mustBig(s string) *big.Int {
+	n, ok := new(big.Int).SetString(s, 10)
+	if !ok {
+		return new(big.Int)
 	}
-	rows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT ON (sac, tier)
-		       sac, tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source,
-		       COALESCE(doc_check, '')
-		FROM reserve_reports
-		WHERE sac = ANY($1)
-		ORDER BY sac, tier, as_of DESC`, sacs)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var sac string
-		var r coverage.Report
-		var tier int16
-		var amount string
-		if err := rows.Scan(&sac, &tier, &amount, &r.AsOf, &r.PostedAt, &r.Reporter, &r.DocHash, &r.DocURI, &r.TxHash, &r.Source, &r.DocCheck); err != nil {
-			return nil, err
-		}
-		r.Tier = uint32(tier)
-		r.Amount = mustBig(amount)
-		if out[sac] == nil {
-			out[sac] = make(map[uint32]coverage.Report)
-		}
-		out[sac][r.Tier] = r
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return n
 }
 
 func (s *Store) queryReports(ctx context.Context, sql string, args ...any) ([]coverage.Report, error) {
@@ -672,10 +645,24 @@ func (s *Store) queryReports(ctx context.Context, sql string, args ...any) ([]co
 	return out, rows.Err()
 }
 
+// Reporters returns every reporter in the registry, active or revoked, with the
+// strongest reserve-report tier they have posted and the number of distinct
+// assets and reports behind it. Filtering, sorting and paging are the API's job:
+// a registry is small, and the counts come from one grouped scan.
 func (s *Store) Reporters(ctx context.Context) ([]coverage.Reporter, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT address, role, name, updated_at FROM reporters
-		WHERE active ORDER BY role, name`)
+		SELECT r.address, r.role, r.name, r.active, r.updated_at,
+		       r.reputation_score, r.expires_at,
+		       COALESCE(agg.tier, 0), COALESCE(agg.asset_count, 0), COALESCE(agg.report_count, 0)
+		FROM reporters r
+		LEFT JOIN (
+		    SELECT reporter, MAX(tier) AS tier,
+		           COUNT(DISTINCT sac) AS asset_count,
+		           COUNT(*) AS report_count
+		    FROM reserve_reports
+		    GROUP BY reporter
+		) agg ON agg.reporter = r.address
+		ORDER BY r.role, r.name, r.address`)
 	if err != nil {
 		return nil, err
 	}
@@ -683,11 +670,16 @@ func (s *Store) Reporters(ctx context.Context) ([]coverage.Reporter, error) {
 	var out []coverage.Reporter
 	for rows.Next() {
 		var r coverage.Reporter
-		var role int16
-		if err := rows.Scan(&r.Address, &role, &r.Name, &r.UpdatedAt); err != nil {
+		var role, tier int32
+		var assetCount, reportCount int64
+		if err := rows.Scan(&r.Address, &role, &r.Name, &r.Active, &r.UpdatedAt,
+			&r.ReputationScore, &r.ExpiresAt, &tier, &assetCount, &reportCount); err != nil {
 			return nil, err
 		}
 		r.Role = uint32(role)
+		r.Tier = uint32(tier)
+		r.AssetCount = int(assetCount)
+		r.ReportCount = int(reportCount)
 		out = append(out, r)
 	}
 	return out, rows.Err()
@@ -865,7 +857,7 @@ func (s *Store) DeleteWebhook(ctx context.Context, id int64, ownerKeyHash string
 		return fmt.Errorf("read webhook owner: %w", err)
 	}
 	// Rows created before owner tracking have no key hash and are admin-only.
-	if storedOwner != ownerKeyHash && !(storedOwner == "" && allowLegacyAdmin) {
+	if storedOwner != ownerKeyHash && (storedOwner != "" || !allowLegacyAdmin) {
 		return ErrForbidden
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM webhooks WHERE id = $1`, id); err != nil {

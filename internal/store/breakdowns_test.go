@@ -93,7 +93,7 @@ func TestSupplyPostedEventConfirmsTheBreakdown(t *testing.T) {
 		BreakdownHash: "h1",
 		Poster:        breakdownPoster,
 	}
-	if err := s.ApplyEvents(context.Background(), "test", "c1", 42, []any{ev}); err != nil {
+	if err := s.ApplyEvents(context.Background(), "test", "c1", 42, nil, []any{ev}); err != nil {
 		t.Fatal(err)
 	}
 	wantServed(t, s, "h1", body)

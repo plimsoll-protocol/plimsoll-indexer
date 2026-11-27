@@ -452,3 +452,59 @@ func TestLatestSuppliesAndReportsBySAC(t *testing.T) {
 		t.Fatalf("CSAC2 reports = %+v", bySAC["CSAC2"])
 	}
 }
+
+// Reporters reads every registry row with the strongest report tier and the
+// distinct asset and report counts behind it, including a revoked reporter and
+// one that has never posted a report.
+func TestReportersAggregateTiersAndCounts(t *testing.T) {
+	s, url := openStore(t)
+	ctx := context.Background()
+	expires := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
+	execSQL(t, url, `
+		INSERT INTO reporters (address, role, name, active, updated_ledger, updated_at, reputation_score, expires_at)
+		VALUES ($1, $2, 'Auditor', true, 10, now(), 42, $3),
+		       ($4, $5, 'Revoked', false, 11, now(), NULL, NULL)`,
+		"GAUD", int16(coverage.RoleAuditor), expires,
+		"GREVOKED", int16(coverage.RoleTranscriber))
+	execSQL(t, url, `
+		INSERT INTO reserve_reports
+		  (event_id, sac, tier, amount, as_of, reporter, doc_hash, doc_uri, posted_ledger, posted_at, tx_hash)
+		VALUES ('rr-1', 'CSAC1', 1, 10, now(), 'GAUD', 'h', 'https://x', 10, now(), 'tx-1'),
+		       ('rr-2', 'CSAC2', 3, 10, now(), 'GAUD', 'h', 'https://x', 10, now(), 'tx-2'),
+		       ('rr-3', 'CSAC2', 2, 10, now(), 'GAUD', 'h', 'https://x', 10, now(), 'tx-3')`)
+
+	list, err := s.Reporters(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("reporters = %+v, want both registry rows", list)
+	}
+	byAddress := map[string]coverage.Reporter{}
+	for _, r := range list {
+		byAddress[r.Address] = r
+	}
+	auditor, ok := byAddress["GAUD"]
+	if !ok {
+		t.Fatalf("GAUD missing from %+v", list)
+	}
+	if !auditor.Active || auditor.Tier != coverage.TierAuditorSigned {
+		t.Errorf("auditor = %+v, want active with the strongest posted tier", auditor)
+	}
+	if auditor.AssetCount != 2 || auditor.ReportCount != 3 {
+		t.Errorf("counts = %d assets / %d reports, want 2 / 3", auditor.AssetCount, auditor.ReportCount)
+	}
+	if auditor.ReputationScore == nil || *auditor.ReputationScore != 42 {
+		t.Errorf("reputation_score = %v, want 42", auditor.ReputationScore)
+	}
+	if auditor.ExpiresAt == nil || !auditor.ExpiresAt.Equal(expires) {
+		t.Errorf("expires_at = %v, want %s", auditor.ExpiresAt, expires)
+	}
+	revoked := byAddress["GREVOKED"]
+	if revoked.Active || revoked.Tier != 0 || revoked.AssetCount != 0 || revoked.ReportCount != 0 {
+		t.Errorf("revoked = %+v, want inactive with no derived evidence", revoked)
+	}
+	if revoked.ReputationScore != nil || revoked.ExpiresAt != nil {
+		t.Errorf("revoked registry fields = %v / %v, want nulls", revoked.ReputationScore, revoked.ExpiresAt)
+	}
+}

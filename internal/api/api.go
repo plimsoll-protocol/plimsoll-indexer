@@ -55,6 +55,7 @@ type Reader interface {
 type CoverageWebhookStore interface {
 	CreateCoverageWebhook(ctx context.Context, w coverage.Webhook) (coverage.Webhook, error)
 	DeleteCoverageWebhook(ctx context.Context, id int64) error
+}
 
 type assetPageReader interface {
 	ListAssetsPage(ctx context.Context, limit int, afterCode, afterIssuer string) ([]coverage.Asset, error)
@@ -89,7 +90,6 @@ type Server struct {
 	WebhookAdminToken string
 	WebhookAPIKeys    []string
 	WebhookCodec      *webhook.SecretCodec
-	WebhookAdminToken string
 
 	// CoverageWebhooks and WebhookSigningSecret enable coverage threshold
 	// alerts at /v1/coverage-webhooks, administered with the same token.
@@ -183,6 +183,8 @@ type coverageNowJSON struct {
 
 type reporterJSON struct {
 	Role string `json:"role"`
+	// Tier is null for a reporter who has never posted a reserve report.
+	Tier *string `json:"tier"`
 	coverage.Reporter
 }
 
@@ -381,7 +383,12 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]assetJSON, 0, len(assets))
 	for _, a := range assets {
-		out = append(out, s.assembleWithData(a, supplies[a.SAC], reports[a.SAC], minTier))
+		doc, err := s.assembleWithData(r.Context(), a, supplies[a.SAC], reports[a.SAC], minTier)
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		out = append(out, doc)
 	}
 	body := map[string]any{"assets": out}
 	if hasNext {
@@ -450,6 +457,13 @@ func (s *Server) assemble(ctx context.Context, a coverage.Asset, minTier uint32)
 	if err != nil {
 		return assetJSON{}, err
 	}
+	return s.assembleWithData(ctx, a, supplies[a.SAC], reportsBySAC[a.SAC], minTier)
+}
+
+// assembleWithData builds one asset document from data already in hand, so a
+// page of assets can fetch every supply and report in a single query. It reads
+// the issuer's attestation document, which is why it needs the context.
+func (s *Server) assembleWithData(ctx context.Context, a coverage.Asset, sp *coverage.Supply, reports map[uint32]coverage.Report, minTier uint32) (assetJSON, error) {
 	att, attErr := s.Store.Attestation(ctx, a.SAC)
 	if attErr != nil && !errors.Is(attErr, store.ErrNotFound) {
 		return assetJSON{}, attErr
@@ -459,16 +473,20 @@ func (s *Server) assemble(ctx context.Context, a coverage.Asset, minTier uint32)
 		return assetJSON{}, err
 	}
 	out := assetJSON{
-		Asset:    a,
-		Toml:     tomlBody,
-		Supply:   toSupply(sp),
-		Reports:  map[string]*reportJSON{},
-		Coverage: s.toCoverage(coverage.Compute(sp, reports, minTier)),
+		Asset:         a,
+		Toml:          tomlBody,
+		TomlCheckedAt: a.TomlCheckedAt,
+		Supply:        toSupply(sp),
+		Reports:       map[string]*reportJSON{},
+		Coverage:      s.toCoverage(coverage.Compute(sp, reports, minTier)),
+	}
+	if a.TomlError != "" {
+		out.TomlError = &a.TomlError
 	}
 	for tier, rep := range reports {
 		out.Reports[coverage.TierName(tier)] = toReport(rep)
 	}
-	return out
+	return out, nil
 }
 
 // withAttestation adds the issuer's attestation document fields to the stored
@@ -623,17 +641,17 @@ func (s *Server) coverageNow(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAsset(w, r, sac) {
 		return
 	}
-	supply, err := s.Store.LatestSupply(r.Context(), sac)
+	supplies, err := s.Store.LatestSupplies(r.Context(), []string{sac})
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	reports, err := s.Store.LatestReports(r.Context(), sac)
+	reportsBySAC, err := s.Store.LatestReportsBySAC(r.Context(), []string{sac})
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	res := coverage.Compute(supply, reports, coverage.TierTranscribed)
+	res := coverage.Compute(supplies[sac], reportsBySAC[sac], coverage.TierTranscribed)
 	if res == nil {
 		writeError(w, http.StatusNotFound, codeCoverageNotFound, "no live coverage report")
 		return
@@ -650,17 +668,63 @@ func (s *Server) coverageNow(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// reporters lists every reporter in the registry, active or revoked unless the
+// active filter is supplied. tier is the strongest reserve-report tier the
+// reporter has posted, and asset_count/report_count describe the indexed
+// evidence behind it. A registry is small, so one query reads it whole and
+// filtering, sorting and paging happen here.
 func (s *Server) reporters(w http.ResponseWriter, r *http.Request) {
+	tier, ok := parseReporterTier(w, r)
+	if !ok {
+		return
+	}
+	active, ok := parseActive(w, r)
+	if !ok {
+		return
+	}
+	sortBy, order, ok := parseReporterSort(w, r)
+	if !ok {
+		return
+	}
+	limit, ok := parseLimit(w, r)
+	if !ok {
+		return
+	}
+	offset, ok := parseOffset(w, r)
+	if !ok {
+		return
+	}
+
 	list, err := s.Store.Reporters(r.Context())
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	out := make([]reporterJSON, 0, len(list))
+	filtered := make([]coverage.Reporter, 0, len(list))
 	for _, rep := range list {
-		out = append(out, reporterJSON{Role: coverage.RoleName(rep.Role), Reporter: rep})
+		if active != nil && rep.Active != *active {
+			continue
+		}
+		if tier != nil && rep.Tier != *tier {
+			continue
+		}
+		filtered = append(filtered, rep)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"reporters": out})
+	desc := order == "desc"
+	sort.SliceStable(filtered, func(i, j int) bool {
+		return reporterLess(filtered[i], filtered[j], sortBy, desc)
+	})
+
+	page, next := pageOf(filtered, limit, offset)
+	out := make([]reporterJSON, 0, len(page))
+	for _, rep := range page {
+		out = append(out, toReporter(rep))
+	}
+	body := map[string]any{"reporters": out}
+	if next != nil {
+		body["next_offset"] = *next
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (s *Server) changelog(w http.ResponseWriter, _ *http.Request) {
@@ -841,6 +905,7 @@ func sameToken(token, expected string) bool {
 func webhookAPIKeyHash(key string) string {
 	sum := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum[:])
+}
 
 // ---- coverage webhooks ----------------------------------------------------
 
@@ -998,7 +1063,7 @@ func parseAssetLimit(w http.ResponseWriter, r *http.Request) (int, bool) {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil || n < 1 || n > 200 {
-		writeError(w, http.StatusBadRequest, "limit must be between 1 and 200")
+		writeErrorMessage(w, http.StatusBadRequest, "limit must be between 1 and 200")
 		return 0, false
 	}
 	return n, true
@@ -1011,19 +1076,19 @@ func parseAssetCursor(w http.ResponseWriter, r *http.Request) (*assetCursor, boo
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(v)
 	if err != nil || base64.RawURLEncoding.EncodeToString(raw) != v {
-		writeError(w, http.StatusBadRequest, "invalid cursor")
+		writeErrorMessage(w, http.StatusBadRequest, "invalid cursor")
 		return nil, false
 	}
 	var cursor assetCursor
 	dec := json.NewDecoder(strings.NewReader(string(raw)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cursor); err != nil || cursor.Version != 1 || cursor.Code == "" || cursor.Issuer == "" {
-		writeError(w, http.StatusBadRequest, "invalid cursor")
+		writeErrorMessage(w, http.StatusBadRequest, "invalid cursor")
 		return nil, false
 	}
 	var trailing any
 	if err := dec.Decode(&trailing); err != io.EOF {
-		writeError(w, http.StatusBadRequest, "invalid cursor")
+		writeErrorMessage(w, http.StatusBadRequest, "invalid cursor")
 		return nil, false
 	}
 	return &cursor, true
@@ -1057,6 +1122,173 @@ func parseLimit(w http.ResponseWriter, r *http.Request) (int, bool) {
 	return n, true
 }
 
+func parseOffset(w http.ResponseWriter, r *http.Request) (int, bool) {
+	v := r.URL.Query().Get("offset")
+	if v == "" {
+		return 0, true
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		writeErrorDetails(w, http.StatusBadRequest, codeInvalidOffset,
+			"offset must be a non-negative integer", map[string]any{"parameter": "offset", "value": v})
+		return 0, false
+	}
+	return n, true
+}
+
+// parseReporterTier accepts both the numeric and the named form of a report
+// tier, so a client can ask for ?tier=auditor_signed without knowing its
+// discriminant. An empty value means no tier filter.
+func parseReporterTier(w http.ResponseWriter, r *http.Request) (*uint32, bool) {
+	v := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("tier")))
+	if v == "" {
+		return nil, true
+	}
+	var tier uint32
+	switch v {
+	case "1", "transcribed":
+		tier = coverage.TierTranscribed
+	case "2", "issuer_signed":
+		tier = coverage.TierIssuerSigned
+	case "3", "auditor_signed":
+		tier = coverage.TierAuditorSigned
+	default:
+		writeErrorDetails(w, http.StatusBadRequest, codeInvalidTier,
+			"tier must be 1, 2, 3, transcribed, issuer_signed or auditor_signed",
+			map[string]any{"parameter": "tier", "value": v})
+		return nil, false
+	}
+	return &tier, true
+}
+
+func parseActive(w http.ResponseWriter, r *http.Request) (*bool, bool) {
+	v := r.URL.Query().Get("active")
+	if v == "" {
+		return nil, true
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		writeErrorDetails(w, http.StatusBadRequest, codeInvalidActive,
+			"active must be true or false", map[string]any{"parameter": "active", "value": v})
+		return nil, false
+	}
+	return &b, true
+}
+
+func parseReporterSort(w http.ResponseWriter, r *http.Request) (string, string, bool) {
+	sortBy := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("sort")))
+	if sortBy == "" {
+		sortBy = "name"
+	}
+	switch sortBy {
+	case "name", "address", "tier", "score", "expiry", "updated_at":
+	default:
+		writeErrorDetails(w, http.StatusBadRequest, codeInvalidSort,
+			"sort must be name, address, tier, score, expiry or updated_at",
+			map[string]any{"parameter": "sort", "value": sortBy})
+		return "", "", false
+	}
+	order := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("order")))
+	if order == "" {
+		order = "asc"
+	}
+	if order != "asc" && order != "desc" {
+		writeErrorDetails(w, http.StatusBadRequest, codeInvalidOrder,
+			"order must be asc or desc", map[string]any{"parameter": "order", "value": order})
+		return "", "", false
+	}
+	return sortBy, order, true
+}
+
+// pageOf applies limit and offset to an already filtered list and reports the
+// offset of the next page, or nil when this is the last one.
+func pageOf[T any](list []T, limit, offset int) ([]T, *int) {
+	if offset >= len(list) {
+		return []T{}, nil
+	}
+	list = list[offset:]
+	if len(list) <= limit {
+		return list, nil
+	}
+	next := offset + limit
+	return list[:limit], &next
+}
+
+func toReporter(r coverage.Reporter) reporterJSON {
+	out := reporterJSON{Role: coverage.RoleName(r.Role), Reporter: r}
+	if r.Tier != 0 {
+		tier := coverage.TierName(r.Tier)
+		out.Tier = &tier
+	}
+	return out
+}
+
+// reporterLess orders reporters by the requested column. A missing score or
+// expiry sorts last in both directions: unknown is not a small value. Ties fall
+// back to the address so paging is deterministic.
+func reporterLess(a, b coverage.Reporter, field string, desc bool) bool {
+	cmp := 0
+	switch field {
+	case "tier":
+		cmp = cmpUint32(a.Tier, b.Tier)
+	case "score":
+		switch {
+		case a.ReputationScore == nil && b.ReputationScore == nil:
+			cmp = 0
+		case a.ReputationScore == nil:
+			return false
+		case b.ReputationScore == nil:
+			return true
+		default:
+			cmp = cmpInt32(*a.ReputationScore, *b.ReputationScore)
+		}
+	case "expiry":
+		switch {
+		case a.ExpiresAt == nil && b.ExpiresAt == nil:
+			cmp = 0
+		case a.ExpiresAt == nil:
+			return false
+		case b.ExpiresAt == nil:
+			return true
+		default:
+			cmp = a.ExpiresAt.Compare(*b.ExpiresAt)
+		}
+	case "updated_at":
+		cmp = a.UpdatedAt.Compare(b.UpdatedAt)
+	case "address":
+		cmp = strings.Compare(a.Address, b.Address)
+	default: // name
+		cmp = strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
+	}
+	if cmp == 0 {
+		return a.Address < b.Address
+	}
+	if desc {
+		return cmp > 0
+	}
+	return cmp < 0
+}
+
+func cmpUint32(a, b uint32) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	}
+	return 0
+}
+
+func cmpInt32(a, b int32) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	}
+	return 0
+}
+
 func parseDateRange(w http.ResponseWriter, r *http.Request) (*time.Time, *time.Time, bool) {
 	parse := func(name string) (*time.Time, bool) {
 		value := r.URL.Query().Get(name)
@@ -1065,7 +1297,7 @@ func parseDateRange(w http.ResponseWriter, r *http.Request) (*time.Time, *time.T
 		}
 		date, err := time.Parse("2006-01-02", value)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, name+" must be a date in YYYY-MM-DD format")
+			writeErrorMessage(w, http.StatusBadRequest, name+" must be a date in YYYY-MM-DD format")
 			return nil, false
 		}
 		date = date.UTC()
@@ -1083,7 +1315,7 @@ func parseDateRange(w http.ResponseWriter, r *http.Request) (*time.Time, *time.T
 		return nil, nil, false
 	}
 	if from != nil && to != nil && !from.Before(*to) {
-		writeError(w, http.StatusBadRequest, "from must be on or before to")
+		writeErrorMessage(w, http.StatusBadRequest, "from must be on or before to")
 		return nil, nil, false
 	}
 	return from, to, true
@@ -1143,6 +1375,11 @@ const (
 	codeCoverageNotFound      = "coverage_not_found"
 	codeInvalidMinTier        = "invalid_min_tier"
 	codeInvalidLimit          = "invalid_limit"
+	codeInvalidOffset         = "invalid_offset"
+	codeInvalidTier           = "invalid_tier"
+	codeInvalidActive         = "invalid_active"
+	codeInvalidSort           = "invalid_sort"
+	codeInvalidOrder          = "invalid_order"
 	codeInvalidBody           = "invalid_body"
 	codeInvalidWebhookURL     = "invalid_webhook_url"
 	codeInvalidWebhookID      = "invalid_webhook_id"
@@ -1233,6 +1470,12 @@ func codeForStatus(status int) string {
 
 func writeError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, errorBody{Code: code, Message: message})
+}
+
+// writeErrorMessage answers with the code that matches the status, for checks
+// that have no more specific identifier of their own.
+func writeErrorMessage(w http.ResponseWriter, status int, message string) {
+	writeError(w, status, codeForStatus(status), message)
 }
 
 // writeErrorDetails is writeError with context identifying what was rejected.

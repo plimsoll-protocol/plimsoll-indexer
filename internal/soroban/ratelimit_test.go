@@ -275,9 +275,12 @@ func TestRateLimitTransportStopsWhenContextIsDone(t *testing.T) {
 		t.Fatal(err)
 	}
 	start := time.Now()
-	if _, err := client.Do(req); err == nil {
+	resp, err := client.Do(req)
+	if err == nil {
+		resp.Body.Close()
 		t.Fatal("expected the cancelled back-off to fail the request")
-	} else if !errors.Is(err, context.DeadlineExceeded) {
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
