@@ -8,9 +8,11 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/metrics"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
 )
@@ -23,11 +25,13 @@ const (
 	pageLimit          = 200
 )
 
-// eventSource is the RPC surface ingestion needs.
-type eventSource interface {
+// EventSource is the RPC surface ingestion needs.
+type EventSource interface {
 	GetEvents(ctx context.Context, req protocol.GetEventsRequest) (protocol.GetEventsResponse, error)
 	GetLatestLedger(ctx context.Context) (protocol.GetLatestLedgerResponse, error)
 }
+
+type eventSource = EventSource
 
 // eventStore is the storage surface ingestion needs.
 type eventStore interface {
@@ -37,7 +41,9 @@ type eventStore interface {
 
 // Ingester copies Plimsoll contract events from RPC into Postgres.
 type Ingester struct {
-	RPC         eventSource
+	RPC         EventSource
+	RPCs        []EventSource
+	RPCURLs     []string
 	Store       eventStore
 	ContractIDs []string
 	// RegistryID is the reporter registry contract. RunReporters watches it
@@ -46,6 +52,8 @@ type Ingester struct {
 	StartLedger uint32
 	Workers     int
 	Log         *slog.Logger
+	currentRPC  int
+	reportTimes []time.Time
 }
 
 // Run pulls every available page once. Call it on a ticker.
@@ -166,7 +174,7 @@ func (in *Ingester) runStream(ctx context.Context, cursorName string, contractID
 			req.StartLedger = start
 		}
 
-		resp, err := in.RPC.GetEvents(ctx, req)
+		resp, err := in.getEvents(ctx, req)
 		if err != nil {
 			// A cursor older than RPC's retention window is refused, and
 			// retrying the same cursor can only be refused again, so ingestion
@@ -190,6 +198,29 @@ func (in *Ingester) runStream(ctx context.Context, cursorName string, contractID
 		}
 		if err := in.Store.ApplyEvents(ctx, cursorName, resp.Cursor, resp.LatestLedger, raw, decoded); err != nil {
 			return fmt.Errorf("apply events: %w", err)
+		}
+		if resp.LatestLedger > 0 {
+			if resp.LatestLedger >= progress.ScannedLedger && progress.ScannedLedger > 0 {
+				metrics.IngestLagLedgers.Set(float64(resp.LatestLedger - progress.ScannedLedger))
+			} else {
+				metrics.IngestLagLedgers.Set(0)
+			}
+		}
+		for _, ev := range decoded {
+			switch ev.(type) {
+			case soroban.AssetListed:
+				metrics.EventsIngestedTotal.WithLabelValues("asset_listed").Inc()
+			case soroban.SupplyPosted:
+				metrics.EventsIngestedTotal.WithLabelValues("supply_posted").Inc()
+			case soroban.ReservePosted:
+				metrics.EventsIngestedTotal.WithLabelValues("reserve_posted").Inc()
+				metrics.ReportsIngestedTotal.Inc()
+				in.recordReportTime(time.Now())
+			case soroban.ReporterSet:
+				metrics.EventsIngestedTotal.WithLabelValues("reporter_set").Inc()
+			case soroban.ReporterRevoked:
+				metrics.EventsIngestedTotal.WithLabelValues("reporter_revoked").Inc()
+			}
 		}
 		if len(decoded) > 0 {
 			in.Log.Info("ingested events", "stream", cursorName, "count", len(decoded), "latest_ledger", resp.LatestLedger)
@@ -284,6 +315,17 @@ func reporterEvents(events []any) []any {
 		}
 	}
 	return out
+func (in *Ingester) recordReportTime(now time.Time) {
+	cutoff := now.Add(-time.Minute)
+	valid := 0
+	for _, t := range in.reportTimes {
+		if t.After(cutoff) {
+			in.reportTimes[valid] = t
+			valid++
+		}
+	}
+	in.reportTimes = append(in.reportTimes[:valid], now)
+	metrics.ReportsPerMinute.Set(float64(len(in.reportTimes)))
 }
 
 // outsideRetention reports whether RPC refused the request because the ledger
@@ -322,6 +364,8 @@ func decodePage(events []protocol.EventInfo) ([]soroban.RawEvent, []any, error) 
 // startLedger clamps the configured start to RPC's retention window.
 func (in *Ingester) startLedger(ctx context.Context, contractIDs []string) (uint32, error) {
 	latest, err := in.RPC.GetLatestLedger(ctx)
+func (in *Ingester) startLedger(ctx context.Context) (uint32, error) {
+	latest, err := in.getLatestLedger(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("getLatestLedger: %w", err)
 	}
@@ -330,7 +374,7 @@ func (in *Ingester) startLedger(ctx context.Context, contractIDs []string) (uint
 		start = latest.Sequence
 	}
 	// RPC keeps roughly 7 days; asking for older ledgers is an error.
-	probe, err := in.RPC.GetEvents(ctx, protocol.GetEventsRequest{
+	probe, err := in.getEvents(ctx, protocol.GetEventsRequest{
 		StartLedger: latest.Sequence,
 		Filters:     []protocol.EventFilter{{ContractIDs: contractIDs}},
 		Pagination:  &protocol.PaginationOptions{Limit: 1},
@@ -341,4 +385,108 @@ func (in *Ingester) startLedger(ctx context.Context, contractIDs []string) (uint
 		start = probe.OldestLedger
 	}
 	return start, nil
+}
+
+func (in *Ingester) sources() []EventSource {
+	if len(in.RPCs) > 0 {
+		return in.RPCs
+	}
+	if in.RPC != nil {
+		return []EventSource{in.RPC}
+	}
+	return nil
+}
+
+func (in *Ingester) endpointName(i int) string {
+	if i >= 0 && i < len(in.RPCURLs) && in.RPCURLs[i] != "" {
+		return in.RPCURLs[i]
+	}
+	return fmt.Sprintf("endpoint-%d", i)
+}
+
+func (in *Ingester) getEvents(ctx context.Context, req protocol.GetEventsRequest) (protocol.GetEventsResponse, error) {
+	srcs := in.sources()
+	if len(srcs) <= 1 {
+		src := in.RPC
+		if len(srcs) == 1 {
+			src = srcs[0]
+		}
+		if src == nil {
+			return protocol.GetEventsResponse{}, errors.New("no RPC source configured")
+		}
+		return src.GetEvents(ctx, req)
+	}
+
+	start := in.currentRPC
+	n := len(srcs)
+	var lastErr error
+	for i := 0; i < n; i++ {
+		idx := (start + i) % n
+		resp, err := srcs[idx].GetEvents(ctx, req)
+		if err == nil {
+			in.currentRPC = idx
+			in.RPC = srcs[idx]
+			return resp, nil
+		}
+		if ctx.Err() != nil {
+			return protocol.GetEventsResponse{}, ctx.Err()
+		}
+		if outsideRetention(err) {
+			return protocol.GetEventsResponse{}, err
+		}
+		lastErr = err
+		next := (idx + 1) % n
+		in.Log.Warn("rpc endpoint connection failure, failing over to next endpoint",
+			"failed_endpoint", in.endpointName(idx),
+			"next_endpoint", in.endpointName(next),
+			"error", err,
+		)
+		in.currentRPC = next
+		in.RPC = srcs[next]
+	}
+	in.currentRPC = 0
+	in.RPC = srcs[0]
+	return protocol.GetEventsResponse{}, fmt.Errorf("all %d RPC endpoints failed: %w", n, lastErr)
+}
+
+func (in *Ingester) getLatestLedger(ctx context.Context) (protocol.GetLatestLedgerResponse, error) {
+	srcs := in.sources()
+	if len(srcs) <= 1 {
+		src := in.RPC
+		if len(srcs) == 1 {
+			src = srcs[0]
+		}
+		if src == nil {
+			return protocol.GetLatestLedgerResponse{}, errors.New("no RPC source configured")
+		}
+		return src.GetLatestLedger(ctx)
+	}
+
+	start := in.currentRPC
+	n := len(srcs)
+	var lastErr error
+	for i := 0; i < n; i++ {
+		idx := (start + i) % n
+		resp, err := srcs[idx].GetLatestLedger(ctx)
+		if err == nil {
+			in.currentRPC = idx
+			in.RPC = srcs[idx]
+			return resp, nil
+		}
+		if ctx.Err() != nil {
+			return protocol.GetLatestLedgerResponse{}, ctx.Err()
+		}
+		lastErr = err
+		next := (idx + 1) % n
+		in.Log.Warn("rpc endpoint connection failure, failing over to next endpoint",
+			"failed_endpoint", in.endpointName(idx),
+			"next_endpoint", in.endpointName(next),
+			"error", err,
+		)
+		in.currentRPC = next
+		in.RPC = srcs[next]
+	}
+	in.currentRPC = 0
+	in.RPC = srcs[0]
+	return protocol.GetLatestLedgerResponse{}, fmt.Errorf("all %d RPC endpoints failed: %w", n, lastErr)
 }

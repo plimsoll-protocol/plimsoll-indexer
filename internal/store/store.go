@@ -18,6 +18,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/metrics"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
 )
 
@@ -113,11 +114,19 @@ func poolConfig(url, password string) (*pgxpool.Config, error) {
 	// Timestamps leave the API in UTC regardless of the server's zone.
 	cfg.ConnConfig.RuntimeParams["timezone"] = "UTC"
 	return cfg, nil
+func measureQuery(op string) func() {
+	start := time.Now()
+	return func() {
+		metrics.DBQueryDuration.WithLabelValues(op).Observe(time.Since(start).Seconds())
+	}
 }
 
 func (s *Store) Close() { s.pool.Close() }
 
-func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
+func (s *Store) Ping(ctx context.Context) error {
+	defer measureQuery("ping")()
+	return s.pool.Ping(ctx)
+}
 
 // ---- ingest cursor --------------------------------------------------------
 
@@ -143,6 +152,7 @@ type Progress struct {
 
 // Progress returns how far ingestion for name has reached.
 func (s *Store) Progress(ctx context.Context, name string) (Progress, error) {
+	defer measureQuery("progress")()
 	var p Progress
 	var scanned, event int64
 	var at *time.Time
@@ -163,6 +173,9 @@ func (s *Store) Progress(ctx context.Context, name string) (Progress, error) {
 // transaction: raw holds every event in the page, decoded or not, and events
 // the decoded ones. A page delivered twice stores each raw event once.
 func (s *Store) ApplyEvents(ctx context.Context, name, cursor string, ledger uint32, raw []soroban.RawEvent, events []any) error {
+// ApplyEvents writes decoded events and advances the cursor in one transaction.
+func (s *Store) ApplyEvents(ctx context.Context, name, cursor string, ledger uint32, events []any) error {
+	defer measureQuery("apply_events")()
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -554,6 +567,7 @@ func scanAsset(row pgx.Row) (coverage.Asset, error) {
 }
 
 func (s *Store) ListAssets(ctx context.Context) ([]coverage.Asset, error) {
+	defer measureQuery("list_assets")()
 	rows, err := s.pool.Query(ctx, `SELECT `+assetCols+` FROM assets ORDER BY code, issuer`)
 	if err != nil {
 		return nil, err
@@ -597,6 +611,7 @@ func (s *Store) ListAssetsPage(ctx context.Context, limit int, afterCode, afterI
 }
 
 func (s *Store) GetAsset(ctx context.Context, sac string) (coverage.Asset, error) {
+	defer measureQuery("get_asset")()
 	a, err := scanAsset(s.pool.QueryRow(ctx, `SELECT `+assetCols+` FROM assets WHERE sac = $1`, sac))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return a, ErrNotFound
@@ -651,6 +666,8 @@ func (s *Store) SupplyHistory(ctx context.Context, sac string, limit int, before
 // LatestSupply returns nil when nothing has been posted.
 func (s *Store) LatestSupply(ctx context.Context, sac string) (*coverage.Supply, error) {
 	h, _, err := s.SupplyHistory(ctx, sac, 1, nil)
+	defer measureQuery("latest_supply")()
+	h, err := s.SupplyHistory(ctx, sac, 1)
 	if err != nil || len(h) == 0 {
 		return nil, err
 	}
@@ -850,6 +867,7 @@ func (s *Store) ReportExportPage(ctx context.Context, sac string, from, to *time
 
 // LatestReports returns the newest report (by as_of) for each tier.
 func (s *Store) LatestReports(ctx context.Context, sac string) (map[uint32]coverage.Report, error) {
+	defer measureQuery("latest_reports")()
 	list, err := s.queryReports(ctx, latestReportsSQL, sac)
 	if err != nil {
 		return nil, err
@@ -887,6 +905,7 @@ func (s *Store) queryReports(ctx context.Context, sql string, args ...any) ([]co
 }
 
 func (s *Store) Reporters(ctx context.Context) ([]coverage.Reporter, error) {
+	defer measureQuery("reporters")()
 	rows, err := s.pool.Query(ctx, `
 		SELECT address, role, name, COALESCE(display_name, name), website_uri, contact_hash, updated_at FROM reporters
 		WHERE active ORDER BY role, name`)
@@ -963,6 +982,7 @@ func (s *Store) SaveBreakdown(ctx context.Context, hash, sac string, body []byte
 // Breakdown returns the body of a confirmed breakdown, byte for byte. A
 // breakdown whose post never reached the chain is ErrNotFound.
 func (s *Store) Breakdown(ctx context.Context, hash string) ([]byte, error) {
+	defer measureQuery("breakdown")()
 	var body string
 	err := s.pool.QueryRow(ctx,
 		`SELECT body FROM breakdowns WHERE hash = $1 AND confirmed_at IS NOT NULL`, hash).Scan(&body)

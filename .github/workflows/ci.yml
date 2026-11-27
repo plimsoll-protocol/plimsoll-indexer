@@ -26,6 +26,12 @@ jobs:
             -ldflags="-X github.com/plimsoll-protocol/plimsoll-indexer/internal/buildinfo.Version=${GITHUB_REF_NAME} \
               -X github.com/plimsoll-protocol/plimsoll-indexer/internal/buildinfo.Commit=${GITHUB_SHA}" \
             -o bin/plimsoll-indexer ./cmd/plimsoll-indexer
+        run: go build -o bin/plimsoll-indexer ./cmd/plimsoll-indexer
+      - name: Verify OpenAPI spec
+        run: |
+          go install github.com/swaggo/swag/v2/cmd/swag@v2.0.0-rc6
+          make generate
+          git diff --exit-code docs/openapi.yaml
 
   lint:
     name: lint

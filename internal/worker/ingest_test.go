@@ -183,6 +183,9 @@ func (f *fakeRPC) GetEvents(_ context.Context, req protocol.GetEventsRequest) (p
 }
 
 func (f *fakeRPC) GetLatestLedger(context.Context) (protocol.GetLatestLedgerResponse, error) {
+	if err := f.errs["latest"]; err != nil {
+		return protocol.GetLatestLedgerResponse{}, err
+	}
 	return protocol.GetLatestLedgerResponse{Sequence: f.latest}, nil
 }
 
@@ -430,5 +433,153 @@ func TestRunStoresEveryEventRaw(t *testing.T) {
 	}
 	if len(db.applied) != 1 || len(db.applied[0]) != 1 {
 		t.Fatalf("want one typed row, got %v", db.applied)
+type testLogHandler struct {
+	records []slog.Record
+}
+
+func (h *testLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *testLogHandler) Handle(_ context.Context, r slog.Record) error {
+	h.records = append(h.records, r)
+	return nil
+}
+func (h *testLogHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *testLogHandler) WithGroup(string) slog.Handler      { return h }
+
+func TestFailoverToNextEndpointOnConnectionFailure(t *testing.T) {
+	page := supplyPostedPage(t)
+	validCursor := "0023421401557905408-0000000000"
+	validCursor2 := "0023421401557905408-0000000001"
+	rpc0 := &fakeRPC{latest: 5468159, oldest: 5347200, errs: map[string]error{"": errors.New("connection refused")}}
+	rpc1 := &fakeRPC{latest: 5468159, oldest: 5347200, pages: map[string]protocol.GetEventsResponse{
+		"": {Events: page, Cursor: validCursor},
+	}}
+	rpc2 := &fakeRPC{latest: 5468159, oldest: 5347200}
+
+	logHandler := &testLogHandler{}
+	logger := slog.New(logHandler)
+
+	db := &fakeStore{progress: store.Progress{Cursor: ""}}
+	ingester := &Ingester{
+		RPCs:        []EventSource{rpc0, rpc1, rpc2},
+		RPCURLs:     []string{"http://rpc0", "http://rpc1", "http://rpc2"},
+		Store:       db,
+		ContractIDs: []string{"CC2QQ7R4FLPHZP7KA5AO4IASXXICTG6N4GQXCXITTEBNYQEYTYXKMN4D"},
+		StartLedger: 5347200,
+		Log:         logger,
+	}
+
+	if err := ingester.Run(context.Background()); err != nil {
+		t.Fatalf("Run should have succeeded via failover, got: %v", err)
+	}
+
+	if len(db.applied) != 1 || len(db.applied[0]) != 1 {
+		t.Fatalf("want events applied from rpc1, got %v", db.applied)
+	}
+	if ingester.currentRPC != 1 {
+		t.Errorf("currentRPC = %d, want 1", ingester.currentRPC)
+	}
+
+	// Verify failover was logged at WARN level
+	warnFound := false
+	for _, rec := range logHandler.records {
+		if rec.Level == slog.LevelWarn && strings.Contains(rec.Message, "failing over") {
+			warnFound = true
+			break
+		}
+	}
+	if !warnFound {
+		t.Error("expected failover to be logged at WARN level")
+	}
+
+	// Second run should use rpc1 without failing over again
+	rpc1.pages[validCursor] = protocol.GetEventsResponse{Events: nil, Cursor: validCursor2}
+	db.progress.Cursor = validCursor
+	if err := ingester.Run(context.Background()); err != nil {
+		t.Fatalf("second Run failed: %v", err)
+	}
+	if ingester.currentRPC != 1 {
+		t.Errorf("expected to stay on rpc1, currentRPC = %d", ingester.currentRPC)
+	}
+}
+
+func TestFailoverCyclesBackToFirstAfterAllFail(t *testing.T) {
+	cursor := "0023421401557905408-0000000000"
+	rpc0 := &fakeRPC{latest: 5468159, oldest: 5347200, errs: map[string]error{cursor: errors.New("conn 0 failed")}}
+	rpc1 := &fakeRPC{latest: 5468159, oldest: 5347200, errs: map[string]error{cursor: errors.New("conn 1 failed")}}
+	rpc2 := &fakeRPC{latest: 5468159, oldest: 5347200, errs: map[string]error{cursor: errors.New("conn 2 failed")}}
+
+	logHandler := &testLogHandler{}
+	db := &fakeStore{progress: store.Progress{Cursor: cursor}}
+	ingester := &Ingester{
+		RPCs:        []EventSource{rpc0, rpc1, rpc2},
+		RPCURLs:     []string{"http://rpc0", "http://rpc1", "http://rpc2"},
+		Store:       db,
+		ContractIDs: []string{"CC2QQ7R4FLPHZP7KA5AO4IASXXICTG6N4GQXCXITTEBNYQEYTYXKMN4D"},
+		StartLedger: 5347200,
+		Log:         slog.New(logHandler),
+	}
+
+	err := ingester.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected Run to fail when all RPCs fail")
+	}
+	if !strings.Contains(err.Error(), "all 3 RPC endpoints failed") {
+		t.Errorf("error = %v, want 'all 3 RPC endpoints failed'", err)
+	}
+
+	// Acceptance criteria: cycling back to the first after all fail
+	if ingester.currentRPC != 0 {
+		t.Errorf("expected currentRPC to cycle back to 0, got %d", ingester.currentRPC)
+	}
+
+	// Check warn logs count for all 3 failovers
+	warnCount := 0
+	for _, rec := range logHandler.records {
+		if rec.Level == slog.LevelWarn && strings.Contains(rec.Message, "failing over") {
+			warnCount++
+		}
+	}
+	if warnCount != 3 {
+		t.Errorf("warnCount = %d, want 3", warnCount)
+	}
+}
+
+func TestFailoverGetLatestLedger(t *testing.T) {
+	page := supplyPostedPage(t)
+	rpc0 := &fakeRPC{errs: map[string]error{"latest": errors.New("network down")}}
+	rpc1 := &fakeRPC{latest: 5468159, oldest: 5347200, pages: map[string]protocol.GetEventsResponse{
+		"": {Events: page, Cursor: "c1"},
+	}}
+
+	logHandler := &testLogHandler{}
+	db := &fakeStore{progress: store.Progress{Cursor: ""}}
+	ingester := &Ingester{
+		RPCs:        []EventSource{rpc0, rpc1},
+		RPCURLs:     []string{"http://rpc0", "http://rpc1"},
+		Store:       db,
+		ContractIDs: []string{"CC2QQ7R4FLPHZP7KA5AO4IASXXICTG6N4GQXCXITTEBNYQEYTYXKMN4D"},
+		StartLedger: 0, // forces calling startLedger -> getLatestLedger
+		Log:         slog.New(logHandler),
+	}
+
+	if err := ingester.Run(context.Background()); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if len(db.applied) != 1 {
+		t.Fatalf("want 1 page applied, got %d", len(db.applied))
+	}
+	if ingester.currentRPC != 1 {
+		t.Errorf("expected currentRPC = 1, got %d", ingester.currentRPC)
+	}
+
+	warnFound := false
+	for _, rec := range logHandler.records {
+		if rec.Level == slog.LevelWarn && strings.Contains(rec.Message, "failing over") {
+			warnFound = true
+			break
+		}
+	}
+	if !warnFound {
+		t.Error("expected failover to be logged at WARN level")
 	}
 }
