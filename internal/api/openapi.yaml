@@ -31,9 +31,22 @@ paths:
                   ingested_to_ledger:
                     type: integer
                     example: 42
+                  last_event_ledger:
+                    type: integer
+                    example: 40
+                  last_event_at:
+                    type: [string, "null"]
+                    format: date-time
+                    example: "2026-10-05T11:58:30Z"
+                  last_event_age_seconds:
+                    type: [integer, "null"]
+                    example: 90
                 required:
                   - status
                   - ingested_to_ledger
+                  - last_event_ledger
+                  - last_event_at
+                  - last_event_age_seconds
         '503':
           description: Storage is unreachable or the ingest cursor cannot be read
           content:
@@ -75,6 +88,21 @@ paths:
             type: integer
             enum: [1, 2, 3]
             default: 1
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of assets to return (1-200)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque cursor returned as next_cursor by a previous page
+          schema:
+            type: string
       responses:
         '200':
           description: List of tracked assets
@@ -87,6 +115,9 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/Asset'
+                  next_cursor:
+                    type: string
+                    description: Opaque cursor for the next page, present only when another page exists
                 required:
                   - assets
         '400':
@@ -328,16 +359,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-  /v1/assets/{sac}/disputes:
+  /v1/assets/{sac}/reports/export.csv:
     get:
-      summary: List disputes for an asset
-      description: >
-        Returns disputes opened against the asset's reserve reports, newest
-        first. A dispute is keyed by the report's as_of timestamp and records
-        the reporter who signed the report and the watcher who challenged it.
-        The current contracts do not emit dispute events yet
-        (plimsoll-contracts#91); until a deployment does, the list is empty.
-      operationId: listAssetDisputes
+      summary: Export complete reserve report history for an asset
+      operationId: exportReportHistory
       parameters:
         - name: sac
           in: path
@@ -346,49 +371,125 @@ paths:
           schema:
             type: string
             pattern: '^C[A-Z2-7]{55}$'
-        - name: status
+        - name: from
           in: query
           required: false
-          description: Restrict to open or resolved disputes; omit for both
+          description: Include reports posted on or after this UTC date
           schema:
             type: string
-            enum: [open, resolved]
-        - name: limit
+            format: date
+        - name: to
           in: query
           required: false
-          description: Maximum number of disputes to return (1-1000)
+          description: Include reports posted through this UTC date
           schema:
-            type: integer
-            minimum: 1
-            maximum: 1000
-            default: 100
-        - name: offset
-          in: query
-          required: false
-          description: Number of disputes to skip
-          schema:
-            type: integer
-            minimum: 0
-            default: 0
+            type: string
+            format: date
       responses:
         '200':
-          description: Disputes for the asset
+          description: CSV report history, paginated internally
+          headers:
+            Content-Disposition:
+              description: Indicates that the CSV is an attachment
+              schema:
+                type: string
+          content:
+            text/csv:
+              schema:
+                type: string
+                example: |-
+                  ledger,timestamp,reporter,bps,tier,doc_uri
+                  42,2026-10-05T12:00:00Z,G...,10200,issuer_signed,https://example.test/report
+        '400':
+          description: Invalid date parameter, or sac is not a contract strkey
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  disputes:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/Dispute'
-                  next_offset:
-                    type: integer
-                    description: Present when another page exists; pass it as offset.
-                required:
-                  - disputes
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Asset not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/assets/{sac}/coverage/now:
+    get:
+      summary: Get the current coverage figure without the asset document
+      operationId: getCoverageNow
+      description: >-
+        Returns the bps, tier, as_of and reporter of the live reserve report the
+        coverage-ledger contract selects: the newest report per tier, ties going
+        to the stronger tier, with bps rounded by the contract's own rule. It is
+        the same figure as `coverage` on /v1/assets/{sac}, without the supply,
+        reports and history payload.
+      parameters:
+        - name: sac
+          in: path
+          required: true
+          description: Stellar Asset Contract (SAC) address
+          schema:
+            type: string
+            pattern: '^C[A-Z2-7]{55}$'
+            example: "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
+      responses:
+        '200':
+          description: Current coverage figure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CoverageNow'
         '400':
-          description: Invalid status, limit, offset, or sac
+          description: sac is not a contract strkey
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Asset is not listed, or no live report exists to measure coverage
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      parameters:
+        - name: sac
+          in: path
+          required: true
+          description: Stellar Asset Contract (SAC) address
+          schema:
+            type: string
+            pattern: '^C[A-Z2-7]{55}$'
+        - name: from
+          in: query
+          required: false
+          description: Include reports posted on or after this UTC date
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          required: false
+          description: Include reports posted through this UTC date
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: CSV report history, paginated internally
+          headers:
+            Content-Disposition:
+              description: Indicates that the CSV is an attachment
+              schema:
+                type: string
+          content:
+            text/csv:
+              schema:
+                type: string
+                example: |-
+                  ledger,timestamp,reporter,bps,tier,doc_uri
+                  42,2026-10-05T12:00:00Z,G...,10200,issuer_signed,https://example.test/report
+        '400':
+          description: Invalid date parameter, or sac is not a contract strkey
+
           content:
             application/json:
               schema:
@@ -446,6 +547,7 @@ paths:
       operationId: createWebhook
       security:
         - WebhookAdminAuth: []
+        - WebhookOwnerAuth: []
       requestBody:
         required: true
         content:
@@ -472,7 +574,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '401':
-          description: Missing or invalid administrator token
+          description: Missing or invalid API key
           content:
             application/json:
               schema:
@@ -515,10 +617,11 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
   /v1/webhooks/{id}:
     delete:
-      summary: Delete a registered webhook
+      summary: Delete a webhook owned by the API key
       operationId: deleteWebhook
       security:
         - WebhookAdminAuth: []
+        - WebhookOwnerAuth: []
       parameters:
         - name: id
           in: path
@@ -536,13 +639,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '401':
-          description: Missing or invalid administrator token
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: The API key does not own this webhook
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
-          description: Webhook not found
+          description: Webhook not found or already deleted
           content:
             application/json:
               schema:
@@ -573,7 +682,98 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
-          description: Breakdown hash not found
+          description: >-
+            No breakdown with this hash backs an on-chain snapshot. The poster
+            saves a breakdown before it posts it; one whose post has not been
+            confirmed (by the transaction, the supply_posted event or the
+            ledger's current snapshot) is not served, and is deleted after a
+            grace period if the post never lands.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/coverage-webhooks:
+    post:
+      summary: Register a coverage-threshold webhook
+      description: >-
+        Requires `Authorization: Bearer <WEBHOOK_ADMIN_TOKEN>`. When the
+        asset's coverage falls below `min_bps`, using reports of at least
+        `min_tier`, the indexer POSTs JSON to `url` with
+        `X-Plimsoll-Signature: sha256=<hex HMAC-SHA256 of the body keyed with
+        WEBHOOK_SIGNING_SECRET>` and `X-Plimsoll-Delivery: <delivery id>`.
+        One alert is sent per crossing, re-armed when coverage recovers;
+        failed deliveries are retried with exponential backoff, at most five
+        attempts in total.
+      operationId: createCoverageWebhook
+      security:
+        - WebhookAdminAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CoverageWebhookRequest'
+      responses:
+        '201':
+          description: Webhook registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CoverageWebhook'
+        '400':
+          description: Invalid body or thresholds
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing or invalid admin token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Webhook administration is disabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/coverage-webhooks/{id}:
+    delete:
+      summary: Remove a webhook registration
+      description: 'Requires `Authorization: Bearer <WEBHOOK_ADMIN_TOKEN>`.'
+      operationId: deleteCoverageWebhook
+      security:
+        - WebhookAdminAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '204':
+          description: Webhook and its delivery log removed
+        '400':
+          description: Invalid id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing or invalid admin token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Webhook not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Webhook administration is disabled
           content:
             application/json:
               schema:
@@ -583,6 +783,11 @@ components:
     WebhookAdminAuth:
       type: http
       scheme: bearer
+      description: Configured administrator bearer token; required to list webhooks.
+    WebhookOwnerAuth:
+      type: http
+      scheme: bearer
+      description: One of the configured owner API keys; can create and delete its own webhooks.
   schemas:
     NetworkInfo:
       type: object
@@ -667,6 +872,10 @@ components:
         tx_hash:
           type: string
           example: "tx456..."
+        doc_check:
+          type: [string, "null"]
+          description: "Document hash check result, or null if not yet checked."
+          enum: [match, mismatch, unreachable, null]
       required:
         - tier
         - amount
@@ -676,6 +885,33 @@ components:
         - doc_hash
         - doc_uri
         - tx_hash
+        - doc_check
+    CoverageNow:
+      type: object
+      description: >-
+        The current coverage figure alone: which live report the contract
+        selects, and the bps that report gives against the latest supply.
+      properties:
+        bps:
+          type: [integer, "null"]
+          description: Current basis points, or null when nothing is owed (zero supply).
+          example: 10200
+        tier:
+          type: string
+          enum: [transcribed, issuer_signed, auditor_signed]
+          example: "issuer_signed"
+        as_of:
+          type: string
+          format: date-time
+          example: "2026-10-05T10:00:00Z"
+        reporter:
+          type: string
+          example: "GISS..."
+      required:
+        - bps
+        - tier
+        - as_of
+        - reporter
     Coverage:
       type: object
       properties:
@@ -718,6 +954,8 @@ components:
           type: string
           example: "https://x"
       required:
+        - bps
+        - ratio
         - tier
         - supply
         - reserves
@@ -749,6 +987,18 @@ components:
           example: "2026-10-01T00:00:00Z"
         toml:
           type: [object, "null"]
+          description: >-
+            The issuer's SEP-1 data. When the asset's stellar.toml lists
+            `attestation_of_reserve`, the object also carries
+            `attestation_hash` (SHA-256 of the document, lower-case hex) and,
+            once an earlier document has been replaced, `attestation_changed_at`.
+          properties:
+            attestation_hash:
+              type: string
+              example: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+            attestation_changed_at:
+              type: [string, "null"]
+              format: date-time
         toml_checked_at:
           type: [string, "null"]
           format: date-time
@@ -772,7 +1022,12 @@ components:
         - issuer
         - listed_ledger
         - listed_at
+        - toml
+        - toml_checked_at
+        - toml_error
+        - supply
         - reports
+        - coverage
     Reporter:
       type: object
       properties:
@@ -794,6 +1049,30 @@ components:
         - address
         - name
         - updated_at
+    CoverageWebhookRequest:
+      type: object
+      properties:
+        url:
+          type: string
+          format: uri
+          example: "https://integrator.example/plimsoll"
+        sac:
+          type: string
+          example: "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
+        min_bps:
+          type: integer
+          minimum: 1
+          maximum: 10000
+          example: 9500
+        min_tier:
+          type: integer
+          enum: [1, 2, 3]
+          example: 2
+      required:
+        - url
+        - sac
+        - min_bps
+        - min_tier
     ChangelogEntry:
       type: object
       properties:
@@ -895,6 +1174,31 @@ components:
               type: string
               description: Returned once; store it securely.
           required: [secret]
+    CoverageWebhook:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 1
+        url:
+          type: string
+          format: uri
+        sac:
+          type: string
+        min_bps:
+          type: integer
+        min_tier:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+      required:
+        - id
+        - url
+        - sac
+        - min_bps
+        - min_tier
+        - created_at
     ErrorResponse:
       type: object
       description: |
@@ -907,9 +1211,9 @@ components:
             Machine-readable error identifier. Match on this value, not on
             `message`. Handlers use: not_found, invalid_sac,
             asset_not_listed, invalid_breakdown_hash, breakdown_not_found,
-            invalid_min_tier, invalid_limit, invalid_offset, invalid_status,
-            invalid_min_bps, invalid_max_age, invalid_body,
+            coverage_not_found, invalid_min_tier, invalid_limit, invalid_body,
             invalid_webhook_url, invalid_webhook_id, webhook_not_found,
+            webhook_forbidden,
             webhooks_not_configured, unauthorized, internal_error,
             db_unavailable and progress_unavailable. The router uses
             not_found, method_not_allowed and internal_error.

@@ -334,14 +334,16 @@ func printVerificationResult(out io.Writer, code, sac string, snapshot, current 
 
 	match := true
 
+	// An amount that does not parse is reported as such and counts as a
+	// mismatch. Reading it as zero would let two unreadable figures "match".
 	calcDiff := func(snapStr, curStr string) (string, bool) {
-		snapInt, _ := new(big.Int).SetString(snapStr, 10)
-		if snapInt == nil {
-			snapInt = new(big.Int)
+		snapInt, ok := new(big.Int).SetString(snapStr, 10)
+		if !ok {
+			return "unparseable snapshot amount", false
 		}
-		curInt, _ := new(big.Int).SetString(curStr, 10)
-		if curInt == nil {
-			curInt = new(big.Int)
+		curInt, ok := new(big.Int).SetString(curStr, 10)
+		if !ok {
+			return "unparseable current amount", false
 		}
 		diff := new(big.Int).Sub(curInt, snapInt)
 		isSame := diff.Sign() == 0

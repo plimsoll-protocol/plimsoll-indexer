@@ -13,14 +13,15 @@
 # Plimsoll indexer
 
 The off-chain half of [Plimsoll](https://github.com/plimsoll-protocol/plimsoll-contracts).
-One Go binary with four jobs and an HTTP API:
+One Go binary with five jobs and an HTTP API:
 
 | Job | What it does |
 | --- | --- |
 | **Supply poster** | For every listed asset, sums Horizon's per-bucket holdings (trustlines in every auth state, claimable balances, liquidity pools, contract balances) and calls `post_supply` on the coverage ledger with the total and the SHA-256 of the breakdown. Posts when supply changes, or every `REPOST_AFTER` so freshness checks keep passing. Whether a post is due is read from the coverage ledger itself, so a stalled event ingest cannot make it repost on every tick. |
 | **Event ingester** | Reads `asset_listed`, `supply_posted`, `reserve_posted`, `reporter_set` and `reporter_revoked` from Soroban RPC into Postgres, keeping history past RPC's ~7-day retention. |
 | **State reconciler** | Reads each listed asset's `get_supply` and `get_report` back from the coverage ledger and stores anything newer than ingestion has. RPC serves only about seven days of events, so a longer ingestion gap cannot be repaired from events; the contracts always hold the latest figure. Recovered rows are marked `"source": "chain"` and carry no `tx_hash`. Reading is simulation, so it needs no key and runs even on an instance that cannot sign. |
-| **stellar.toml sync** | Resolves each issuer's `home_domain`, reads its SEP-1 `stellar.toml`, and stores the matching `[[CURRENCIES]]` entry, including `attestation_of_reserve`. Successful fetches are SHA-256 tracked per issuer; changes are logged and can be delivered to registered webhooks. |
+| **stellar.toml sync** | Resolves each issuer's `home_domain`, reads its SEP-1 `stellar.toml`, and stores the matching `[[CURRENCIES]]` entry, including `attestation_of_reserve`. Successful fetches are SHA-256 tracked per issuer; changes are logged and can be delivered to registered webhooks. The linked attestation document is downloaded under the same size, time and SSRF limits as reserve documents, hashed, and kept as version history; the asset response exposes `toml.attestation_hash` and `toml.attestation_changed_at`. |
+| **Coverage alerts** | Posts a signed alert to each registered integrator URL when an asset's coverage falls below the registration's `min_bps`, selecting reports of at least `min_tier`. One alert per crossing, re-armed when coverage recovers; failed deliveries are retried with exponential backoff, at most 5 attempts in total. |
 
 **Live API:** https://plimsoll-indexer.onrender.com/v1/assets  
 **Docs:** https://plimsoll-protocol.gitbook.io/plimsoll-protocol-docs/
@@ -54,23 +55,42 @@ go run ./cmd/plimsoll-indexer verify --sac <SAC_ADDRESS> [--indexer http://local
 
 The command fetches the asset's snapshot breakdown from the indexer, verifies the snapshot on-chain via Soroban RPC simulation (`get_supply`), checks its SHA-256 hash integrity, recomputes balances directly from Horizon, prints a formatted diff table, and exits `0` on match or `1` on mismatch. Network discovery is fetched automatically from `/v1/network`.
 
+### Raw events and replay
+
+Ingestion keeps every event the two contracts emit in `raw_events` (id,
+contract, ledger, close time, transaction hash, topic and value XDR), written
+in the same transaction as the decoded rows, including events the decoder does
+not track yet. RPC only serves about seven days of events, so this is what lets
+a decoder change apply to older history:
+
+```bash
+DATABASE_URL=postgres://... go run ./cmd/plimsoll-indexer replay [-batch 500]
+```
+
+`replay` decodes every raw event again, in chain order, with the binary's
+decoder and applies the typed rows. Rows that already exist are left as they
+are, so it is safe on a live database, and on an empty one that holds only
+`raw_events` it rebuilds `assets`, `supply_snapshots`, `reserve_reports` and
+`reporters`. The ingest cursor is not touched.
+
 ## API
 
 | Method and path | Returns |
 | --- | --- |
 | `GET /healthz` | `{status, ingested_to_ledger, last_event_ledger, last_event_at, last_event_age_seconds}` |
 | `GET /v1/network` | Contract ids, RPC and Horizon URLs |
-| `GET /v1/assets?min_tier=1` | Every asset with latest supply, latest report per tier, coverage and stellar.toml data |
-| `GET /v1/assets/covered?min_bps=10000&max_age=24h&min_tier=1` | Only assets that currently pass the contract's `is_covered` rule, with the same shape. `min_bps` and `max_age` default to 100% backing and 24 hours; `limit`/`offset` page the result. |
+| `GET /v1/assets?limit=50&cursor=<opaque>&min_tier=1` | Paginated assets (default limit 50, maximum 200) with latest supply, latest report per tier, coverage and stellar.toml data. Responses include `next_cursor` while another page exists. |
 | `GET /v1/assets/{sac}?min_tier=1` | One asset, same shape |
 | `HEAD /v1/assets/{sac}` | Status only, no response body: `200` if the asset is listed, `404` if not |
 | `GET /v1/assets/{sac}/supply?limit=100` | Supply snapshot history. Each row carries `source`: `event` for a figure decoded from a contract event, with the `tx_hash` that produced it, or `chain` for one recovered from contract state after an ingestion gap, where `tx_hash` is empty. |
 | `GET /v1/assets/{sac}/reports?limit=100` | Reserve report history |
-| `GET /v1/assets/{sac}/disputes?status=open&limit=100&offset=0` | Disputes opened against the asset's reserve reports, newest first; omit `status` for both open and resolved. The current contracts do not emit dispute events yet, so this is empty until a deployment does (plimsoll-contracts#91). |
+| `GET /v1/assets/{sac}/coverage/now` | The `bps`, `tier`, `as_of` and `reporter` of the live report `coverage()` selects, without the asset document. `404` when no live report exists |
 | `GET /v1/reporters` | Active registered reporters |
 | `GET /v1/changelog` | Breaking API changes per released version, newest first |
-| `GET /v1/breakdowns/{hash}` | Exact bytes of a supply breakdown |
+| `GET /v1/breakdowns/{hash}` | Exact bytes of a supply breakdown that backs an on-chain snapshot |
 | `POST /v1/webhooks`, `GET /v1/webhooks`, `DELETE /v1/webhooks/{id}` | Manage authenticated issuer TOML change subscriptions |
+| `POST /v1/coverage-webhooks` | Register a coverage threshold (admin token required) |
+| `DELETE /v1/coverage-webhooks/{id}` | Remove a registration and its delivery log (admin token required) |
 
 Every `4xx` and `5xx` response has the same body:
 `{"code":"asset_not_listed","message":"…"}`, with an optional `details` object.
@@ -90,6 +110,34 @@ that file is malformed.
 Coverage in the API uses the same selection and rounding rules as the contract
 (`internal/coverage`), so the API and `coverage()` on-chain agree.
 
+### Coverage alerts
+
+Set `WEBHOOK_ADMIN_TOKEN` and `WEBHOOK_SIGNING_SECRET` to enable coverage
+threshold alerts. Register one with:
+
+```bash
+curl -X POST localhost:8080/v1/coverage-webhooks \
+  -H "Authorization: Bearer $WEBHOOK_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://integrator.example/plimsoll","sac":"C...","min_bps":9500,"min_tier":2}'
+```
+
+When coverage crosses below `min_bps`, the indexer POSTs JSON to `url` with
+`Content-Type: application/json` and
+
+```
+X-Plimsoll-Signature: sha256=<lower-case hex HMAC-SHA256 of the raw body keyed with WEBHOOK_SIGNING_SECRET>
+X-Plimsoll-Delivery: <delivery id>
+```
+
+Verify the signature over the exact bytes received before trusting the body.
+The payload carries `event` (`coverage_dropped`), `webhook_id`, `sac`,
+`min_bps`, `min_tier`, `bps`, `tier`, `supply`, `reserves`,
+`supply_posted_at`, `report_as_of` and `sent_at`; amounts are decimal strings
+and timestamps are UTC. Deliveries are logged in `coverage_webhook_deliveries` and
+retried with exponential backoff (30s, 1m, 2m, 4m) until they succeed or five
+attempts have been made.
+
 ## Quick start
 
 Go 1.27+. No Postgres or Docker needed locally:
@@ -104,6 +152,10 @@ go run ./cmd/plimsoll-indexer
 curl localhost:8080/v1/assets
 ```
 
+To override any value locally, put it in `.env.local` in the repository root.
+The indexer loads that file automatically, after the shell has exported `.env`,
+and skips it entirely when `GO_ENV=production`.
+
 Leave `SUPPLY_POSTER_SECRET` empty to run read-only. To post supply, use the
 secret of an account registered in the reporter registry with the
 `SupplyPoster` role.
@@ -115,7 +167,9 @@ go test ./...
 ## Configuration
 
 Every variable is documented in [.env.example](.env.example). Required:
-`DATABASE_URL`, `COVERAGE_LEDGER_ID`, `REPORTER_REGISTRY_ID`.
+`DATABASE_URL`, `COVERAGE_LEDGER_ID`, `REPORTER_REGISTRY_ID`. A `.env.local`
+file in the working directory is applied over the environment (see
+[Quick start](#quick-start)); set `GO_ENV=production` to disable it.
 
 `NETWORK` selects a preset (`testnet`, the default, `mainnet` or `standalone`)
 that supplies defaults for `STELLAR_RPC_URL`, `HORIZON_URL` and
@@ -163,14 +217,10 @@ plimsoll-indexer healthcheck
 
 ## Deploying
 
-[render.yaml](render.yaml) defines a Render web service plus a Postgres
-database in the same region, connected over the internal URL. Set
-`SUPPLY_POSTER_SECRET` in the Render dashboard; it is never committed.
-
-On Render the indexer requests its own `/healthz` every 10 minutes
-(`KEEP_AWAKE_URL`, derived from `RENDER_EXTERNAL_URL`), so the free tier does
-not put it to sleep and supply posting keeps running. One always-on service
-uses about 744 of the free tier's 750 monthly instance hours.
+[Deployment guide](docs/deploy.md) covers Docker, required configuration,
+Postgres provisioning, Render and Railway setup, and safe secret management.
+The [Render blueprint](render.yaml) provisions a web service and Postgres
+database and can be launched with the one-click button in the guide.
 
 [.github/workflows/keepalive.yml](.github/workflows/keepalive.yml) watches the
 deployment from outside: it wakes the service, fails if nothing has been

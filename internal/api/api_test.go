@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/base64"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -45,11 +47,21 @@ func contractAddress(t *testing.T, tag byte) string {
 func unlistedSAC(t *testing.T) string { return contractAddress(t, 0x01) }
 
 type fake struct {
-	assets   []coverage.Asset
-	supply   map[string]*coverage.Supply
-	reports  map[string]map[uint32]coverage.Report
-	bodies   map[string][]byte
-	disputes map[string][]coverage.Dispute
+	assets           []coverage.Asset
+	supply           map[string]*coverage.Supply
+	reports          map[string]map[uint32]coverage.Report
+	bodies           map[string][]byte
+	batchSupplyCalls int
+	batchReportCalls int
+	exportPages      [][]store.ReportExportRow
+	exportCalls      int
+	exportFrom       *time.Time
+	exportTo         *time.Time
+	exportCursors    []*store.ReportExportCursor
+	progress         map[string]store.Progress
+	attestation      map[string]store.Attestation
+	created          []coverage.Webhook
+	deleted          []int64
 }
 
 func (f *fake) Ping(context.Context) error { return nil }
@@ -64,8 +76,15 @@ func (f *fake) GetAsset(_ context.Context, s string) (coverage.Asset, error) {
 	}
 	return coverage.Asset{}, store.ErrNotFound
 }
-func (f *fake) LatestSupply(_ context.Context, s string) (*coverage.Supply, error) {
-	return f.supply[s], nil
+func (f *fake) LatestSupplies(_ context.Context, sacs []string) (map[string]*coverage.Supply, error) {
+	f.batchSupplyCalls++
+	out := make(map[string]*coverage.Supply)
+	for _, s := range sacs {
+		if sp := f.supply[s]; sp != nil {
+			out[s] = sp
+		}
+	}
+	return out, nil
 }
 func (f *fake) SupplyHistory(_ context.Context, s string, _ int) ([]coverage.Supply, error) {
 	if sp := f.supply[s]; sp != nil {
@@ -73,11 +92,15 @@ func (f *fake) SupplyHistory(_ context.Context, s string, _ int) ([]coverage.Sup
 	}
 	return nil, nil
 }
-func (f *fake) LatestReports(_ context.Context, s string) (map[uint32]coverage.Report, error) {
-	if r := f.reports[s]; r != nil {
-		return r, nil
+func (f *fake) LatestReportsBySAC(_ context.Context, sacs []string) (map[string]map[uint32]coverage.Report, error) {
+	f.batchReportCalls++
+	out := make(map[string]map[uint32]coverage.Report)
+	for _, s := range sacs {
+		if r := f.reports[s]; r != nil {
+			out[s] = r
+		}
 	}
-	return map[uint32]coverage.Report{}, nil
+	return out, nil
 }
 func (f *fake) ReportHistory(_ context.Context, s string, _ int) ([]coverage.Report, error) {
 	var out []coverage.Report
@@ -85,6 +108,18 @@ func (f *fake) ReportHistory(_ context.Context, s string, _ int) ([]coverage.Rep
 		out = append(out, r)
 	}
 	return out, nil
+}
+func (f *fake) ReportExportPage(_ context.Context, _ string, from, to *time.Time, after *store.ReportExportCursor, _ int) ([]store.ReportExportRow, error) {
+	if f.exportCalls == 0 {
+		f.exportFrom, f.exportTo = from, to
+	}
+	f.exportCalls++
+	f.exportCursors = append(f.exportCursors, after)
+	pageIndex := f.exportCalls - 1
+	if pageIndex >= len(f.exportPages) {
+		return nil, nil
+	}
+	return f.exportPages[pageIndex], nil
 }
 func (f *fake) Reporters(context.Context) ([]coverage.Reporter, error) {
 	return []coverage.Reporter{{Address: "GAUD", Role: coverage.RoleAuditor, Name: "Acme"}}, nil
@@ -108,6 +143,32 @@ func (f *fake) Breakdown(_ context.Context, h string) ([]byte, error) {
 	}
 	return nil, store.ErrNotFound
 }
+func (f *fake) Progress(_ context.Context, name string) (store.Progress, error) {
+	if p, ok := f.progress[name]; ok {
+		return p, nil
+	}
+
+func (f *fake) CreateCoverageWebhook(_ context.Context, w coverage.Webhook) (coverage.Webhook, error) {
+	w.ID = int64(len(f.created) + 1)
+	w.CreatedAt = now
+	f.created = append(f.created, w)
+	return w, nil
+}
+func (f *fake) DeleteCoverageWebhook(_ context.Context, id int64) error {
+	for _, w := range f.created {
+		if w.ID == id {
+			f.deleted = append(f.deleted, id)
+			return nil
+		}
+	}
+	return store.ErrNotFound
+}
+func (f *fake) Attestation(_ context.Context, s string) (store.Attestation, error) {
+	if a, ok := f.attestation[s]; ok {
+		return a, nil
+	}
+	return store.Attestation{}, store.ErrNotFound
+}
 func (f *fake) Progress(context.Context, string) (store.Progress, error) {
 	return store.Progress{
 		Cursor:        "c",
@@ -117,14 +178,56 @@ func (f *fake) Progress(context.Context, string) (store.Progress, error) {
 	}, nil
 }
 
+func TestHealthAggregatesContractStreamProgress(t *testing.T) {
+	f := &fake{
+		progress: map[string]store.Progress{
+			store.LegacyIngestCursorName: {
+				ScannedLedger: 90,
+				EventLedger:   80,
+				EventAt:       now.Add(-time.Hour),
+			},
+			store.ContractIngestCursorName("coverage"): {
+				ScannedLedger: 120,
+				EventLedger:   100,
+				EventAt:       now.Add(-2 * time.Minute),
+			},
+			store.ContractIngestCursorName("registry"): {
+				ScannedLedger: 110,
+				EventLedger:   105,
+				EventAt:       now.Add(-time.Minute),
+			},
+		},
+	}
+	srv := httptest.NewServer((&Server{
+		Store: f,
+		Network: NetworkInfo{
+			CoverageLedgerID:   "coverage",
+			ReporterRegistryID: "registry",
+		},
+		Now: func() time.Time { return now },
+	}).Handler())
+	defer srv.Close()
+
+	body := get(t, srv, "/healthz", http.StatusOK)
+	if body["ingested_to_ledger"].(float64) != 110 {
+		t.Errorf("ingested_to_ledger = %v, want lagging stream ledger 110", body["ingested_to_ledger"])
+	}
+	if body["last_event_ledger"].(float64) != 105 {
+		t.Errorf("last_event_ledger = %v, want 105", body["last_event_ledger"])
+	}
+	if body["last_event_age_seconds"].(float64) != 60 {
+		t.Errorf("last_event_age_seconds = %v, want 60", body["last_event_age_seconds"])
+	}
+}
+
 type webhookManagerFake struct {
 	webhooks []store.Webhook
 }
 
-func (f *webhookManagerFake) CreateWebhook(_ context.Context, url, hash string, ciphertext []byte) (store.Webhook, error) {
+func (f *webhookManagerFake) CreateWebhook(_ context.Context, url, hash string, ciphertext []byte, ownerKeyHash string) (store.Webhook, error) {
 	item := store.Webhook{
 		ID: int64(len(f.webhooks) + 1), URL: url, SecretHash: hash,
-		SecretCiphertext: ciphertext, CreatedAt: now,
+		SecretCiphertext: ciphertext, OwnerKeyHash: ownerKeyHash, CreatedAt: now,
 	}
 	f.webhooks = append(f.webhooks, item)
 	return item, nil
@@ -134,33 +237,24 @@ func (f *webhookManagerFake) ListWebhooks(context.Context) ([]store.Webhook, err
 	return f.webhooks, nil
 }
 
-func (f *webhookManagerFake) DeleteWebhook(_ context.Context, id int64) (bool, error) {
+func (f *webhookManagerFake) DeleteWebhook(_ context.Context, id int64, ownerKeyHash string, allowLegacyAdmin bool) error {
 	for i, item := range f.webhooks {
 		if item.ID == id {
+			if item.OwnerKeyHash != ownerKeyHash && !(item.OwnerKeyHash == "" && allowLegacyAdmin) {
+				return store.ErrForbidden
+			}
 			f.webhooks = append(f.webhooks[:i], f.webhooks[i+1:]...)
-			return true, nil
+			return nil
 		}
 	}
-	return false, nil
+	return store.ErrNotFound
 }
 
 func server() *httptest.Server {
 	return serverWithWebhooks(nil, nil, "")
 }
 
-// serverFor serves an arbitrary fake, so a test can set up more assets or
-// disputes than the default fixture.
-func serverFor(f *fake) *httptest.Server {
-	s := &Server{
-		Store: f,
-		CORS:  []string{"*"},
-		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Now:   func() time.Time { return now },
-	}
-	return httptest.NewServer(s.Handler())
-}
-
-func serverWithWebhooks(manager WebhookManager, codec *webhook.SecretCodec, token string) *httptest.Server {
+func newFake() *fake {
 	f := &fake{
 		assets: []coverage.Asset{{SAC: sac, Code: "PUSD", Issuer: "GISS"}},
 		supply: map[string]*coverage.Supply{
@@ -173,16 +267,53 @@ func serverWithWebhooks(manager WebhookManager, codec *webhook.SecretCodec, toke
 			}},
 		},
 		bodies: map[string][]byte{breakdownHash: []byte(`{"total":"1"}`)},
+		attestation: map[string]store.Attestation{
+			sac: {Hash: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", ChangedAt: &now},
+		},
 	}
+	return f
+}
+
+// coverageServer enables the coverage alert administration endpoints, which
+// need the admin token and the shared signing secret.
+func coverageServer(token string) *httptest.Server {
+	f := newFake()
+	s := &Server{
+		Store:                f,
+		CoverageWebhooks:     f,
+		WebhookAdminToken:    token,
+		WebhookSigningSecret: "test-signing-secret",
+		Log:                  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:                  func() time.Time { return now },
+	}
+	return httptest.NewServer(s.Handler())
+}
+
+func serverWithWebhooks(manager WebhookManager, codec *webhook.SecretCodec, token string) *httptest.Server {
+	f := newFake()
 	s := &Server{
 		Store:             f,
 		WebhookStore:      manager,
 		WebhookCodec:      codec,
 		WebhookAdminToken: token,
+		WebhookAPIKeys:    []string{"owner-token", "other-owner-token"},
 		CORS:              []string{"*"},
 		Log:               slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Now:               func() time.Time { return now },
 		Changelog:         testChangelog,
+	}
+	return httptest.NewServer(s.Handler())
+}
+
+// serverFor runs the API over a specific store, so a test can vary the supply
+// and reports behind an asset.
+func serverFor(f *fake) *httptest.Server {
+	s := &Server{
+		Store:     f,
+		CORS:      []string{"*"},
+		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:       func() time.Time { return now },
+		Changelog: testChangelog,
 	}
 	return httptest.NewServer(s.Handler())
 }
@@ -206,6 +337,16 @@ func TestGetAssetCoverage(t *testing.T) {
 	srv := server()
 	defer srv.Close()
 	body := get(t, srv, "/v1/assets/"+sac, 200)
+	for _, field := range []string{"toml", "toml_checked_at", "toml_error"} {
+		value, ok := body[field]
+		if !ok || value != nil {
+			t.Errorf("%s = %v (present: %t), want null", field, value, ok)
+		}
+	}
+	report := body["reports"].(map[string]any)["issuer_signed"].(map[string]any)
+	if value, ok := report["doc_check"]; !ok || value != nil {
+		t.Errorf("doc_check = %v (present: %t), want null", value, ok)
+	}
 	cov := body["coverage"].(map[string]any)
 	if cov["bps"].(float64) != 10_200 || cov["ratio"] != "102.00%" || cov["tier"] != "issuer_signed" {
 		t.Fatalf("coverage %+v", cov)
@@ -215,6 +356,92 @@ func TestGetAssetCoverage(t *testing.T) {
 	}
 	if body["supply"].(map[string]any)["amount"] != "10000000000" {
 		t.Errorf("supply %+v", body["supply"])
+	}
+}
+
+// The shortcut carries the same figure as the coverage object on the asset
+// document, and nothing else.
+func TestCoverageNow(t *testing.T) {
+	srv := server()
+	defer srv.Close()
+	body := get(t, srv, "/v1/assets/"+sac+"/coverage/now", 200)
+	if body["bps"].(float64) != 10_200 {
+		t.Errorf("bps = %v, want 10200", body["bps"])
+	}
+	if body["tier"] != "issuer_signed" {
+		t.Errorf("tier = %v, want issuer_signed", body["tier"])
+	}
+	if body["as_of"] != "2026-10-05T10:00:00Z" {
+		t.Errorf("as_of = %v, want the report's as_of in UTC", body["as_of"])
+	}
+	if body["reporter"] != "GISS" {
+		t.Errorf("reporter = %v, want GISS", body["reporter"])
+	}
+	if len(body) != 4 {
+		t.Errorf("body has %d fields, want only bps, tier, as_of and reporter: %+v", len(body), body)
+	}
+}
+
+// Zero supply means nothing is owed, which the asset document reports as a
+// null bps rather than a number; the shortcut does the same.
+func TestCoverageNowNullBpsWhenNothingIsOwed(t *testing.T) {
+	srv := serverFor(&fake{
+		assets: []coverage.Asset{{SAC: sac, Code: "PUSD", Issuer: "GISS"}},
+		supply: map[string]*coverage.Supply{sac: {Amount: big.NewInt(0), Ledger: 1, PostedAt: now}},
+		reports: map[string]map[uint32]coverage.Report{sac: {
+			coverage.TierTranscribed: {
+				Tier: coverage.TierTranscribed, Amount: big.NewInt(0), AsOf: now, Reporter: "GISS",
+			},
+		}},
+	})
+	defer srv.Close()
+	body := get(t, srv, "/v1/assets/"+sac+"/coverage/now", 200)
+	if body["bps"] != nil {
+		t.Errorf("bps = %v, want null for zero supply", body["bps"])
+	}
+	if body["tier"] != "transcribed" {
+		t.Errorf("tier = %v", body["tier"])
+	}
+}
+
+// Without a live report, or without supply to measure it against, there is no
+// coverage figure to return.
+func TestCoverageNowNotFound(t *testing.T) {
+	asset := coverage.Asset{SAC: sac, Code: "PUSD", Issuer: "GISS"}
+	cases := map[string]*fake{
+		"no reports": {
+			assets: []coverage.Asset{asset},
+			supply: map[string]*coverage.Supply{sac: {Amount: big.NewInt(1), Ledger: 1, PostedAt: now}},
+		},
+		"no supply": {
+			assets: []coverage.Asset{asset},
+			reports: map[string]map[uint32]coverage.Report{sac: {
+				coverage.TierIssuerSigned: {
+					Tier: coverage.TierIssuerSigned, Amount: big.NewInt(1), AsOf: now, Reporter: "GISS",
+				},
+			}},
+		},
+	}
+	for name, f := range cases {
+		srv := serverFor(f)
+		body := get(t, srv, "/v1/assets/"+sac+"/coverage/now", 404)
+		srv.Close()
+		if body["code"] != "coverage_not_found" || body["message"] == nil {
+			t.Errorf("%s: body %+v, want a coverage_not_found error", name, body)
+		}
+	}
+}
+
+// The path id is checked before any coverage lookup, exactly as on the asset
+// document it summarises.
+func TestCoverageNowPathValidation(t *testing.T) {
+	srv := server()
+	defer srv.Close()
+	if body := get(t, srv, "/v1/assets/not-a-sac/coverage/now", 400); body["code"] != "invalid_sac" {
+		t.Errorf("malformed sac: body %+v", body)
+	}
+	if body := get(t, srv, "/v1/assets/"+unlistedSAC(t)+"/coverage/now", 404); body["code"] != "asset_not_listed" {
+		t.Errorf("unlisted asset: body %+v", body)
 	}
 }
 
@@ -258,7 +485,7 @@ func TestMinTierExcludesWeakerReports(t *testing.T) {
 	srv := server()
 	defer srv.Close()
 	body := get(t, srv, "/v1/assets/"+sac+"?min_tier=3", 200)
-	if body["coverage"] != nil {
+	if value, ok := body["coverage"]; !ok || value != nil {
 		t.Fatalf("expected no coverage at auditor tier, got %+v", body["coverage"])
 	}
 	get(t, srv, "/v1/assets/"+sac+"?min_tier=9", 400)
@@ -288,8 +515,123 @@ func TestListAndMisc(t *testing.T) {
 	if h["last_event_age_seconds"].(float64) != 90 {
 		t.Errorf("last_event_age_seconds = %v", h["last_event_age_seconds"])
 	}
+}
+
+func TestListAssetsUsesConstantBatchReads(t *testing.T) {
+	f := &fake{
+		assets: []coverage.Asset{
+			{SAC: sac, Code: "PUSD", Issuer: "GISS"},
+			{SAC: "CSAC2", Code: "USDC", Issuer: "GISS2"},
+			{SAC: "CSAC3", Code: "EUR", Issuer: "GISS3"},
+		},
+		supply:  map[string]*coverage.Supply{},
+		reports: map[string]map[uint32]coverage.Report{},
+		bodies:  map[string][]byte{},
+	}
+	s := &Server{
+		Store: f,
+		CORS:  []string{"*"},
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:   func() time.Time { return now },
+	}
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	list := get(t, srv, "/v1/assets", 200)
+	if len(list["assets"].([]any)) != 3 {
+		t.Fatalf("assets = %d, want 3", len(list["assets"].([]any)))
+	}
+	if f.batchSupplyCalls != 1 || f.batchReportCalls != 1 {
+		t.Fatalf("batch calls: supply=%d reports=%d, want 1 each", f.batchSupplyCalls, f.batchReportCalls)
+	}
 	get(t, srv, "/v1/assets/"+sac+"/supply?limit=0", 400)
 	get(t, srv, "/v1/assets/"+sac+"/reports", 200)
+}
+
+func TestAssetPagination(t *testing.T) {
+	f := &fake{
+		assets: []coverage.Asset{
+			{SAC: "C3", Code: "USDX", Issuer: "G3"},
+			{SAC: "C1", Code: "PUSD", Issuer: "G1"},
+			{SAC: "C5", Code: "USDX", Issuer: "G5"},
+			{SAC: "C2", Code: "PUSD", Issuer: "G2"},
+			{SAC: "C4", Code: "USDX", Issuer: "G4"},
+		},
+		supply:  map[string]*coverage.Supply{},
+		reports: map[string]map[uint32]coverage.Report{},
+		bodies:  map[string][]byte{},
+	}
+	s := &Server{
+		Store: f, CORS: []string{"*"},
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now: func() time.Time { return now },
+	}
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	seen := make(map[string]int)
+	cursor := ""
+	pages := 0
+	for {
+		path := "/v1/assets?limit=2"
+		if cursor != "" {
+			path += "&cursor=" + cursor
+		}
+		body := get(t, srv, path, 200)
+		pages++
+		assets := body["assets"].([]any)
+		if len(assets) == 0 {
+			break
+		}
+		for _, raw := range assets {
+			asset := raw.(map[string]any)
+			code := asset["code"].(string)
+			issuer := asset["issuer"].(string)
+			seen[code+"/"+issuer]++
+		}
+		next, hasNext := body["next_cursor"].(string)
+		if !hasNext {
+			break
+		}
+		cursor = next
+	}
+	if pages != 3 {
+		t.Fatalf("pages = %d, want 3", pages)
+	}
+	for _, key := range []string{"PUSD/G1", "PUSD/G2", "USDX/G3", "USDX/G4", "USDX/G5"} {
+		if seen[key] != 1 {
+			t.Errorf("%s returned %d times", key, seen[key])
+		}
+	}
+
+	first := get(t, srv, "/v1/assets?limit=2", 200)
+	if len(first["assets"].([]any)) != 2 || first["next_cursor"] == nil {
+		t.Fatalf("first page = %+v", first)
+	}
+	cursor = first["next_cursor"].(string)
+	middle := get(t, srv, "/v1/assets?limit=2&cursor="+cursor, 200)
+	if len(middle["assets"].([]any)) != 2 || middle["next_cursor"] == nil {
+		t.Fatalf("middle page = %+v", middle)
+	}
+	cursor = middle["next_cursor"].(string)
+	last := get(t, srv, "/v1/assets?limit=2&cursor="+cursor, 200)
+	if len(last["assets"].([]any)) != 1 || last["next_cursor"] != nil {
+		t.Fatalf("last page = %+v", last)
+	}
+
+	empty := &fake{assets: nil, supply: map[string]*coverage.Supply{}, reports: map[string]map[uint32]coverage.Report{}, bodies: map[string][]byte{}}
+	emptyServer := &Server{Store: empty, CORS: []string{"*"}, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Now: func() time.Time { return now }}
+	emptySrv := httptest.NewServer(emptyServer.Handler())
+	defer emptySrv.Close()
+	emptyBody := get(t, emptySrv, "/v1/assets?limit=50", 200)
+	if got := len(emptyBody["assets"].([]any)); got != 0 || emptyBody["next_cursor"] != nil {
+		t.Fatalf("empty page = %+v", emptyBody)
+	}
+
+	get(t, srv, "/v1/assets?limit=0", 400)
+	get(t, srv, "/v1/assets?limit=201", 400)
+	get(t, srv, "/v1/assets?limit=nope", 400)
+	get(t, srv, "/v1/assets?cursor=not-a-cursor", 400)
 }
 
 func TestBreakdownServedVerbatim(t *testing.T) {
@@ -431,108 +773,152 @@ func TestListedAssetHistory(t *testing.T) {
 	}
 }
 
-func TestCoveredAssetsEndpoint(t *testing.T) {
-	second := contractAddress(t, 0x02)
-	stale := contractAddress(t, 0x03)
-	under := contractAddress(t, 0x04)
+func TestReportExportStreamsPagesAndAppliesDateFilters(t *testing.T) {
 	f := &fake{
-		assets: []coverage.Asset{
-			{SAC: sac, Code: "PUSD", Issuer: "GISS"},
-			{SAC: second, Code: "QUSD", Issuer: "GISS"},
-			{SAC: stale, Code: "STALE", Issuer: "GISS"},
-			{SAC: under, Code: "UNDER", Issuer: "GISS"},
-		},
-		supply: map[string]*coverage.Supply{
-			sac:    {Amount: big.NewInt(1_000), Ledger: 100, PostedAt: now.Add(-time.Hour)},
-			second: {Amount: big.NewInt(1_000), Ledger: 100, PostedAt: now.Add(-time.Hour)},
-			stale:  {Amount: big.NewInt(1_000), Ledger: 100, PostedAt: now.Add(-48 * time.Hour)},
-			under:  {Amount: big.NewInt(1_000), Ledger: 100, PostedAt: now.Add(-time.Hour)},
-		},
-		reports: map[string]map[uint32]coverage.Report{
-			sac:    {coverage.TierIssuerSigned: {Tier: coverage.TierIssuerSigned, Amount: big.NewInt(1_000), AsOf: now.Add(-2 * time.Hour), Reporter: "GISS"}},
-			second: {coverage.TierIssuerSigned: {Tier: coverage.TierIssuerSigned, Amount: big.NewInt(2_000), AsOf: now.Add(-2 * time.Hour), Reporter: "GISS"}},
-			stale:  {coverage.TierIssuerSigned: {Tier: coverage.TierIssuerSigned, Amount: big.NewInt(1_000), AsOf: now.Add(-2 * time.Hour), Reporter: "GISS"}},
-			under:  {coverage.TierIssuerSigned: {Tier: coverage.TierIssuerSigned, Amount: big.NewInt(500), AsOf: now.Add(-2 * time.Hour), Reporter: "GISS"}},
+		assets: []coverage.Asset{{SAC: sac}},
+		exportPages: [][]store.ReportExportRow{
+			makeExportRows(500),
+			makeExportRows(1),
 		},
 	}
-	srv := serverFor(f)
+	f.exportPages[0][len(f.exportPages[0])-1].Cursor = store.ReportExportCursor{Ledger: 599, EventID: "event-599"}
+	f.exportPages[1][0].Cursor = store.ReportExportCursor{Ledger: 600, EventID: "event-600"}
+	srv := httptest.NewServer((&Server{
+		Store: f,
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}).Handler())
 	defer srv.Close()
 
-	body := get(t, srv, "/v1/assets/covered", 200)
-	assets := body["assets"].([]any)
-	if len(assets) != 2 {
-		t.Fatalf("covered assets = %d, want sac and second", len(assets))
-	}
-	if assets[0].(map[string]any)["sac"] != sac || assets[1].(map[string]any)["sac"] != second {
-		t.Fatalf("covered assets = %+v, want the two fresh, backed assets", assets)
-	}
+	resp, err := http.Get(srv.URL + "/v1/assets/" + sac + "/reports/export.csv?from=2026-10-01&to=2026-10-05")
 
-	if got := get(t, srv, "/v1/assets/covered?min_bps=10001", 200)["assets"].([]any); len(got) != 1 {
-		t.Fatalf("min_bps=10001 returned %d assets, want only the over-backed one", len(got))
+// adminRequest sends a webhook-administration request and returns the status
+// and decoded body (nil for 204).
+func adminRequest(t *testing.T, srv *httptest.Server, method, path, token, body string) (int, map[string]any) {
+	t.Helper()
+	var r io.Reader
+	if body != "" {
+		r = strings.NewReader(body)
 	}
-	if got := get(t, srv, "/v1/assets/covered?max_age=1h", 200)["assets"].([]any); len(got) != 0 {
-		t.Fatalf("max_age=1h returned %d assets, want none", len(got))
+	req, err := http.NewRequest(method, srv.URL+path, r)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := get(t, srv, "/v1/assets/covered?min_tier=3", 200)["assets"].([]any); len(got) != 0 {
-		t.Fatalf("min_tier=3 returned %d assets, want none", len(got))
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
-
-	page := get(t, srv, "/v1/assets/covered?limit=1", 200)
-	if len(page["assets"].([]any)) != 1 || page["next_offset"].(float64) != 1 {
-		t.Fatalf("first page = %+v, want one asset and next_offset 1", page)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
 	}
-	page = get(t, srv, "/v1/assets/covered?limit=1&offset=1", 200)
-	if len(page["assets"].([]any)) != 1 || page["next_offset"] != nil {
-		t.Fatalf("second page = %+v, want one asset and no next page", page)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200", resp.StatusCode)
 	}
-
-	get(t, srv, "/v1/assets/covered?min_bps=abc", 400)
-	get(t, srv, "/v1/assets/covered?max_age=0", 400)
-	get(t, srv, "/v1/assets/covered?offset=-1", 400)
+	if got := resp.Header.Get("Content-Disposition"); got != `attachment; filename="reports-`+sac+`.csv"` {
+		t.Fatalf("Content-Disposition = %q", got)
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/csv") {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	records, err := csv.NewReader(resp.Body).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 502 || strings.Join(records[0], ",") != "ledger,timestamp,reporter,bps,tier,doc_uri" {
+		t.Fatalf("CSV has %d records and header %v", len(records), records[0])
+	}
+	if got := strings.Join(records[1], ","); got != "100,2026-10-05T10:00:00Z,GREPORTER,10200,issuer_signed,https://example.test/report" {
+		t.Fatalf("first report record = %q", got)
+	}
+	if f.exportCalls != 2 || f.exportCursors[1] == nil ||
+		f.exportCursors[1].Ledger != 599 || f.exportCursors[1].EventID != "event-599" {
+		t.Fatalf("page calls/cursor = %d / %+v", f.exportCalls, f.exportCursors)
+	}
+	if f.exportFrom == nil || !f.exportFrom.Equal(time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)) ||
+		f.exportTo == nil || !f.exportTo.Equal(time.Date(2026, 10, 6, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("date bounds = %v / %v", f.exportFrom, f.exportTo)
+	}
 }
 
-func TestAssetDisputes(t *testing.T) {
-	resolvedLedger := uint32(160)
-	resolvedAt := now.Add(-time.Hour)
-	f := &fake{
-		assets: []coverage.Asset{{SAC: sac, Code: "PUSD", Issuer: "GISS"}},
-		disputes: map[string][]coverage.Dispute{
-			sac: {
-				{SAC: sac, Reporter: "GISS", Disputer: "GWATCH", Status: "open",
-					ReportAsOf: now.Add(-3 * time.Hour), HoldUntilLedger: 200,
-					OpenedLedger: 150, OpenedAt: now.Add(-2 * time.Hour), TxHash: "tx-open"},
-				{SAC: sac, Reporter: "GISS", Disputer: "GWATCH", Status: "resolved",
-					Resolution: "upheld", ReportAsOf: now.Add(-6 * time.Hour), HoldUntilLedger: 190,
-					OpenedLedger: 140, OpenedAt: now.Add(-3 * time.Hour),
-					ResolvedLedger: &resolvedLedger, ResolvedAt: &resolvedAt, TxHash: "tx-resolved"},
-			},
-		},
+func makeExportRows(n int) []store.ReportExportRow {
+	rows := make([]store.ReportExportRow, n)
+	bps := uint32(10_200)
+	for i := range rows {
+		rows[i] = store.ReportExportRow{
+			Ledger: uint32(100 + i), Timestamp: now.Add(-2 * time.Hour),
+			Reporter: "GREPORTER", Bps: &bps,
+			Tier: coverage.TierIssuerSigned, DocURI: "https://example.test/report",
+			Cursor: store.ReportExportCursor{Ledger: int64(100 + i), EventID: "event"},
+		}
 	}
-	srv := serverFor(f)
+	return rows
+
+	if resp.StatusCode == http.StatusNoContent {
+		return resp.StatusCode, nil
+	}
+	var out map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return resp.StatusCode, out
+}
+
+func TestWebhookAdminEndpoints(t *testing.T) {
+	srv := coverageServer("test-admin")
 	defer srv.Close()
 
-	all := get(t, srv, "/v1/assets/"+sac+"/disputes", 200)["disputes"].([]any)
-	if len(all) != 2 {
-		t.Fatalf("disputes = %d, want 2", len(all))
+	valid := `{"url":"https://integrator.example/hook","sac":"CSAC","min_bps":9500,"min_tier":2}`
+	if got, _ := adminRequest(t, srv, http.MethodPost, "/v1/coverage-webhooks", "", valid); got != http.StatusUnauthorized {
+		t.Fatalf("no token: status %d, want 401", got)
 	}
-	open := get(t, srv, "/v1/assets/"+sac+"/disputes?status=open", 200)["disputes"].([]any)
-	if len(open) != 1 || open[0].(map[string]any)["status"] != "open" {
-		t.Fatalf("open disputes = %+v, want one open", open)
-	}
-	if open[0].(map[string]any)["disputer"] != "GWATCH" || open[0].(map[string]any)["reporter"] != "GISS" {
-		t.Errorf("dispute actors missing: %+v", open[0])
-	}
-	resolved := get(t, srv, "/v1/assets/"+sac+"/disputes?status=resolved", 200)["disputes"].([]any)
-	if len(resolved) != 1 || resolved[0].(map[string]any)["resolution"] != "upheld" {
-		t.Fatalf("resolved disputes = %+v, want the upheld one", resolved)
+	if got, _ := adminRequest(t, srv, http.MethodPost, "/v1/coverage-webhooks", "wrong", valid); got != http.StatusUnauthorized {
+		t.Fatalf("wrong token: status %d, want 401", got)
 	}
 
-	page := get(t, srv, "/v1/assets/"+sac+"/disputes?limit=1", 200)
-	if len(page["disputes"].([]any)) != 1 || page["next_offset"].(float64) != 1 {
-		t.Fatalf("first page = %+v, want one dispute and next_offset 1", page)
+	status, body := adminRequest(t, srv, http.MethodPost, "/v1/coverage-webhooks", "test-admin", valid)
+	if status != http.StatusCreated {
+		t.Fatalf("create: status %d (%v), want 201", status, body)
 	}
-	if body := get(t, srv, "/v1/assets/"+sac+"/disputes?status=pending", 400); body["code"] != "invalid_status" {
-		t.Fatalf("invalid status body = %+v", body)
+	if body["id"].(float64) != 1 || body["url"] != "https://integrator.example/hook" ||
+		body["sac"] != "CSAC" || body["min_bps"].(float64) != 9500 || body["min_tier"].(float64) != 2 {
+		t.Fatalf("created webhook = %+v", body)
+	}
+	if body["created_at"] == nil {
+		t.Fatal("created webhook has no created_at")
+	}
+
+	for name, payload := range map[string]string{
+		"non-http url": `{"url":"ftp://integrator.example/hook","sac":"CSAC","min_bps":9500,"min_tier":2}`,
+		"no sac":       `{"url":"https://integrator.example/hook","min_bps":9500,"min_tier":2}`,
+		"bad bps":      `{"url":"https://integrator.example/hook","sac":"CSAC","min_bps":0,"min_tier":2}`,
+		"bad tier":     `{"url":"https://integrator.example/hook","sac":"CSAC","min_bps":9500,"min_tier":4}`,
+		"not json":     `nope`,
+	} {
+		if got, _ := adminRequest(t, srv, http.MethodPost, "/v1/coverage-webhooks", "test-admin", payload); got != http.StatusBadRequest {
+			t.Errorf("%s: status %d, want 400", name, got)
+		}
+	}
+
+	if got, _ := adminRequest(t, srv, http.MethodDelete, "/v1/coverage-webhooks/1", "test-admin", ""); got != http.StatusNoContent {
+		t.Fatalf("delete: status %d, want 204", got)
+	}
+	if got, _ := adminRequest(t, srv, http.MethodDelete, "/v1/coverage-webhooks/99", "test-admin", ""); got != http.StatusNotFound {
+		t.Fatalf("delete unknown: status %d, want 404", got)
+	}
+	if got, _ := adminRequest(t, srv, http.MethodDelete, "/v1/coverage-webhooks/abc", "test-admin", ""); got != http.StatusBadRequest {
+		t.Fatalf("delete non-numeric: status %d, want 400", got)
+	}
+}
+
+func TestWebhookAdminDisabled(t *testing.T) {
+	s := &Server{
+		Store: &fake{},
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:   func() time.Time { return now },
+	}
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+	status, body := adminRequest(t, srv, http.MethodPost, "/v1/coverage-webhooks", "anything", `{}`)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("disabled administration: status %d (%v), want 503", status, body)
 	}
 }
 
@@ -572,6 +958,53 @@ func TestOpenAPISpec(t *testing.T) {
 	if !strings.Contains(string(body), "operationId: headAsset") {
 		t.Error("expected the spec to document the HEAD asset operation")
 	}
+	if !strings.Contains(string(body), "operationId: getCoverageNow") ||
+		!strings.Contains(string(body), "CoverageNow:") {
+		t.Error("expected the spec to document the current coverage endpoint and its schema")
+	}
+}
+
+// unreadable is a store whose amount reads fail, as the real store's do when a
+// stored NUMERIC does not parse.
+type unreadable struct{ *fake }
+
+var errUnreadable = errors.New(`supply snapshot at ledger 100: amount "NaN" is not an integer`)
+
+func (unreadable) LatestSupply(context.Context, string) (*coverage.Supply, error) {
+	return nil, errUnreadable
+}
+func (unreadable) SupplyHistory(context.Context, string, int) ([]coverage.Supply, error) {
+	return nil, errUnreadable
+}
+func (unreadable) LatestReports(context.Context, string) (map[uint32]coverage.Report, error) {
+	return nil, errUnreadable
+}
+func (unreadable) ReportHistory(context.Context, string, int) ([]coverage.Report, error) {
+	return nil, errUnreadable
+}
+
+// An amount the store cannot read fails the request instead of being served,
+// so no endpoint reports a corrupted figure as zero supply or zero reserves.
+func TestUnreadableAmountsFailTheRequest(t *testing.T) {
+	s := &Server{
+		Store: unreadable{&fake{assets: []coverage.Asset{{SAC: sac, Code: "PUSD", Issuer: "GISS"}}}},
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:   func() time.Time { return now },
+	}
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	for _, path := range []string{
+		"/v1/assets",
+		"/v1/assets/" + sac,
+		"/v1/assets/" + sac + "/supply",
+		"/v1/assets/" + sac + "/reports",
+	} {
+		body := get(t, srv, path, http.StatusInternalServerError)
+		if body["supply"] != nil || body["coverage"] != nil {
+			t.Errorf("%s served figures alongside the error: %+v", path, body)
+		}
+	}
 }
 
 func TestWebhookSecretReturnedOnlyAtCreation(t *testing.T) {
@@ -583,7 +1016,7 @@ func TestWebhookSecretReturnedOnlyAtCreation(t *testing.T) {
 	srv := serverWithWebhooks(manager, codec, "admin-token")
 	defer srv.Close()
 
-	request := func(method, path, body string, authorized bool) *http.Response {
+	request := func(method, path, body, token string) *http.Response {
 		t.Helper()
 		req, err := http.NewRequest(method, srv.URL+path, strings.NewReader(body))
 		if err != nil {
@@ -592,8 +1025,8 @@ func TestWebhookSecretReturnedOnlyAtCreation(t *testing.T) {
 		if body != "" {
 			req.Header.Set("Content-Type", "application/json")
 		}
-		if authorized {
-			req.Header.Set("Authorization", "Bearer admin-token")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
 		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -602,7 +1035,7 @@ func TestWebhookSecretReturnedOnlyAtCreation(t *testing.T) {
 		return resp
 	}
 
-	unauthorized := request(http.MethodPost, "/v1/webhooks", `{"url":"https://receiver.example/hook"}`, false)
+	unauthorized := request(http.MethodPost, "/v1/webhooks", `{"url":"https://receiver.example/hook"}`, "")
 	var unauthorizedBody errorBody
 	if err := json.NewDecoder(unauthorized.Body).Decode(&unauthorizedBody); err != nil {
 		t.Fatal(err)
@@ -612,7 +1045,7 @@ func TestWebhookSecretReturnedOnlyAtCreation(t *testing.T) {
 		t.Fatalf("unauthorized create = %d %+v, want 401 unauthorized", unauthorized.StatusCode, unauthorizedBody)
 	}
 
-	created := request(http.MethodPost, "/v1/webhooks", `{"url":"https://receiver.example/hook"}`, true)
+	created := request(http.MethodPost, "/v1/webhooks", `{"url":"https://receiver.example/hook"}`, "owner-token")
 	defer created.Body.Close()
 	if created.StatusCode != http.StatusCreated {
 		t.Fatalf("create status = %d, want 201", created.StatusCode)
@@ -631,12 +1064,15 @@ func TestWebhookSecretReturnedOnlyAtCreation(t *testing.T) {
 	if stored.SecretHash != webhook.SecretHash(response.Secret) {
 		t.Fatal("stored secret hash does not match the one-time returned secret")
 	}
+	if stored.OwnerKeyHash != webhook.SecretHash("owner-token") {
+		t.Fatal("stored owner key hash does not match the creating API key")
+	}
 	decrypted, err := codec.Decrypt(stored.SecretCiphertext)
 	if err != nil || decrypted != response.Secret {
 		t.Fatalf("stored signing secret = %q, %v", decrypted, err)
 	}
 
-	list := request(http.MethodGet, "/v1/webhooks", "", true)
+	list := request(http.MethodGet, "/v1/webhooks", "", "admin-token")
 	defer list.Body.Close()
 	listBody, err := io.ReadAll(list.Body)
 	if err != nil {
@@ -645,5 +1081,40 @@ func TestWebhookSecretReturnedOnlyAtCreation(t *testing.T) {
 	if list.StatusCode != http.StatusOK || strings.Contains(string(listBody), response.Secret) ||
 		strings.Contains(string(listBody), "secret_hash") || strings.Contains(string(listBody), "secret_ciphertext") {
 		t.Fatalf("list response disclosed secret or failed: status=%d body=%s", list.StatusCode, listBody)
+	}
+
+	deleteWebhook := func(token, path string) *http.Response {
+		t.Helper()
+		return request(http.MethodDelete, path, "", token)
+	}
+	notOwner := deleteWebhook("other-owner-token", "/v1/webhooks/"+strconv.FormatInt(response.ID, 10))
+	var forbidden errorBody
+	if err := json.NewDecoder(notOwner.Body).Decode(&forbidden); err != nil {
+		t.Fatal(err)
+	}
+	notOwner.Body.Close()
+	if notOwner.StatusCode != http.StatusForbidden || forbidden.Code != "webhook_forbidden" {
+		t.Fatalf("non-owner delete = %d %+v, want 403 webhook_forbidden", notOwner.StatusCode, forbidden)
+	}
+
+	unknown := deleteWebhook("owner-token", "/v1/webhooks/999")
+	unknown.Body.Close()
+	if unknown.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown webhook delete = %d, want 404", unknown.StatusCode)
+	}
+
+	deleted := deleteWebhook("owner-token", "/v1/webhooks/"+strconv.FormatInt(response.ID, 10))
+	deleted.Body.Close()
+	if deleted.StatusCode != http.StatusNoContent {
+		t.Fatalf("owner delete = %d, want 204", deleted.StatusCode)
+	}
+	again := deleteWebhook("owner-token", "/v1/webhooks/"+strconv.FormatInt(response.ID, 10))
+	var missing errorBody
+	if err := json.NewDecoder(again.Body).Decode(&missing); err != nil {
+		t.Fatal(err)
+	}
+	again.Body.Close()
+	if again.StatusCode != http.StatusNotFound || missing.Code != "webhook_not_found" {
+		t.Fatalf("repeated delete = %d %+v, want 404 webhook_not_found", again.StatusCode, missing)
 	}
 }

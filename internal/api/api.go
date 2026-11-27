@@ -3,16 +3,22 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	_ "embed"
+	"encoding/base64"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
 	"mime"
 	"net/http"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -40,14 +46,32 @@ type Reader interface {
 	Ping(ctx context.Context) error
 	ListAssets(ctx context.Context) ([]coverage.Asset, error)
 	GetAsset(ctx context.Context, sac string) (coverage.Asset, error)
-	LatestSupply(ctx context.Context, sac string) (*coverage.Supply, error)
+	LatestSupplies(ctx context.Context, sacs []string) (map[string]*coverage.Supply, error)
 	SupplyHistory(ctx context.Context, sac string, limit int) ([]coverage.Supply, error)
-	LatestReports(ctx context.Context, sac string) (map[uint32]coverage.Report, error)
+	LatestReportsBySAC(ctx context.Context, sacs []string) (map[string]map[uint32]coverage.Report, error)
 	ReportHistory(ctx context.Context, sac string, limit int) ([]coverage.Report, error)
+	ReportExportPage(ctx context.Context, sac string, from, to *time.Time, after *store.ReportExportCursor, limit int) ([]store.ReportExportRow, error)
 	Reporters(ctx context.Context) ([]coverage.Reporter, error)
 	Disputes(ctx context.Context, sac, status string, limit, offset int) ([]coverage.Dispute, error)
 	Breakdown(ctx context.Context, hash string) ([]byte, error)
+	Attestation(ctx context.Context, sac string) (store.Attestation, error)
 	Progress(ctx context.Context, name string) (store.Progress, error)
+}
+
+// CoverageWebhookStore is what the API needs to manage coverage threshold
+// registrations.
+type CoverageWebhookStore interface {
+	CreateCoverageWebhook(ctx context.Context, w coverage.Webhook) (coverage.Webhook, error)
+	DeleteCoverageWebhook(ctx context.Context, id int64) error
+
+type assetPageReader interface {
+	ListAssetsPage(ctx context.Context, limit int, afterCode, afterIssuer string) ([]coverage.Asset, error)
+}
+
+type assetCursor struct {
+	Version int    `json:"v"`
+	Code    string `json:"code"`
+	Issuer  string `json:"issuer"`
 }
 
 // NetworkInfo is served at /v1/network so clients can discover contract ids.
@@ -60,23 +84,35 @@ type NetworkInfo struct {
 }
 
 type Server struct {
-	Store             Reader
+	Store   Reader
+	Network NetworkInfo
+	CORS    []string
+	Log     *slog.Logger
+	Now     func() time.Time
+
+	// WebhookStore, WebhookCodec and WebhookAdminToken manage issuer TOML
+	// change subscriptions at /v1/webhooks. All three must be set; otherwise
+	// those endpoints answer 503.
 	WebhookStore      WebhookManager
 	WebhookAdminToken string
+	WebhookAPIKeys    []string
 	WebhookCodec      *webhook.SecretCodec
-	Network           NetworkInfo
-	CORS              []string
-	Log               *slog.Logger
-	Now               func() time.Time
+	WebhookAdminToken string
+
+	// CoverageWebhooks and WebhookSigningSecret enable coverage threshold
+	// alerts at /v1/coverage-webhooks, administered with the same token.
+	CoverageWebhooks     CoverageWebhookStore
+	WebhookSigningSecret string
+
 	// Changelog is the breaking-change history served at /v1/changelog. It is
 	// loaded from the hand-maintained CHANGELOG.yaml at start-up.
 	Changelog []changelog.Entry
 }
 
 type WebhookManager interface {
-	CreateWebhook(context.Context, string, string, []byte) (store.Webhook, error)
+	CreateWebhook(context.Context, string, string, []byte, string) (store.Webhook, error)
 	ListWebhooks(context.Context) ([]store.Webhook, error)
-	DeleteWebhook(context.Context, int64) (bool, error)
+	DeleteWebhook(ctx context.Context, id int64, ownerKeyHash string, allowLegacyAdmin bool) error
 }
 
 func (s *Server) Handler() http.Handler {
@@ -89,13 +125,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("HEAD /v1/assets/{sac}", s.headAsset)
 	mux.HandleFunc("GET /v1/assets/{sac}/supply", s.supplyHistory)
 	mux.HandleFunc("GET /v1/assets/{sac}/reports", s.reportHistory)
-	mux.HandleFunc("GET /v1/assets/{sac}/disputes", s.disputeHistory)
+	mux.HandleFunc("GET /v1/assets/{sac}/reports/export.csv", s.reportExport)
+	mux.HandleFunc("GET /v1/assets/{sac}/coverage/now", s.coverageNow)
 	mux.HandleFunc("GET /v1/reporters", s.reporters)
 	mux.HandleFunc("GET /v1/changelog", s.changelog)
 	mux.HandleFunc("GET /v1/breakdowns/{hash}", s.breakdown)
 	mux.HandleFunc("POST /v1/webhooks", s.createWebhook)
 	mux.HandleFunc("GET /v1/webhooks", s.listWebhooks)
 	mux.HandleFunc("DELETE /v1/webhooks/{id}", s.deleteWebhook)
+	mux.HandleFunc("POST /v1/coverage-webhooks", s.createCoverageWebhook)
+	mux.HandleFunc("DELETE /v1/coverage-webhooks/{id}", s.deleteCoverageWebhook)
 	return s.cors(errorEnvelope(mux))
 }
 
@@ -107,8 +146,9 @@ type supplyJSON struct {
 }
 
 type reportJSON struct {
-	Tier   string `json:"tier"`
-	Amount string `json:"amount"`
+	Tier     string  `json:"tier"`
+	Amount   string  `json:"amount"`
+	DocCheck *string `json:"doc_check"`
 	coverage.Report
 }
 
@@ -130,10 +170,23 @@ type coverageJSON struct {
 
 type assetJSON struct {
 	coverage.Asset
-	Toml     json.RawMessage        `json:"toml"`
-	Supply   *supplyJSON            `json:"supply"`
-	Reports  map[string]*reportJSON `json:"reports"`
-	Coverage *coverageJSON          `json:"coverage"`
+	Toml          json.RawMessage        `json:"toml"`
+	TomlCheckedAt *time.Time             `json:"toml_checked_at"`
+	TomlError     *string                `json:"toml_error"`
+	Supply        *supplyJSON            `json:"supply"`
+	Reports       map[string]*reportJSON `json:"reports"`
+	Coverage      *coverageJSON          `json:"coverage"`
+}
+
+// coverageNowJSON is the shortcut view of the live coverage figure: the bps,
+// tier, as_of and reporter that /v1/assets/{sac} reports under "coverage",
+// without the supply, reports and history behind them.
+type coverageNowJSON struct {
+	// Bps is null when nothing is owed (zero supply), as in coverageJSON.
+	Bps      *uint32   `json:"bps"`
+	Tier     string    `json:"tier"`
+	AsOf     time.Time `json:"as_of"`
+	Reporter string    `json:"reporter"`
 }
 
 type reporterJSON struct {
@@ -160,7 +213,11 @@ func toSupply(sp *coverage.Supply) *supplyJSON {
 }
 
 func toReport(r coverage.Report) *reportJSON {
-	return &reportJSON{Tier: coverage.TierName(r.Tier), Amount: r.Amount.String(), Report: r}
+	out := &reportJSON{Tier: coverage.TierName(r.Tier), Amount: r.Amount.String(), Report: r}
+	if r.DocCheck != "" {
+		out.DocCheck = &r.DocCheck
+	}
+	return out
 }
 
 func (s *Server) toCoverage(r *coverage.Result) *coverageJSON {
@@ -198,15 +255,47 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, codeDBUnavailable, "database is unavailable")
 		return
 	}
-	p, err := s.Store.Progress(r.Context(), "plimsoll-events")
+	p, err := s.Store.Progress(r.Context(), store.LegacyIngestCursorName)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, codeProgressUnavailable, "ingest progress is unavailable")
 		return
 	}
+	if s.Network.CoverageLedgerID != "" && s.Network.ReporterRegistryID != "" {
+		ids := []string{s.Network.CoverageLedgerID, s.Network.ReporterRegistryID}
+		scanned := make([]uint32, 0, len(ids))
+		var eventLedger uint32
+		eventAt := p.EventAt
+		for _, id := range ids {
+			stream, err := s.Store.Progress(r.Context(), store.ContractIngestCursorName(id))
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, codeProgressUnavailable, "ingest progress is unavailable")
+				return
+			}
+			scanned = append(scanned, stream.ScannedLedger)
+			if stream.EventLedger > eventLedger {
+				eventLedger = stream.EventLedger
+			}
+			if stream.EventAt.After(eventAt) {
+				eventAt = stream.EventAt
+			}
+		}
+		p.ScannedLedger = scanned[0]
+		for _, ledger := range scanned[1:] {
+			if ledger < p.ScannedLedger {
+				p.ScannedLedger = ledger
+			}
+		}
+		if eventLedger > p.EventLedger {
+			p.EventLedger = eventLedger
+		}
+		p.EventAt = eventAt
+	}
 	body := map[string]any{
-		"status":             "ok",
-		"ingested_to_ledger": p.ScannedLedger,
-		"last_event_ledger":  p.EventLedger,
+		"status":                 "ok",
+		"ingested_to_ledger":     p.ScannedLedger,
+		"last_event_ledger":      p.EventLedger,
+		"last_event_at":          nil,
+		"last_event_age_seconds": nil,
 	}
 	// A scan that keeps advancing while no event lands is how ingestion failed
 	// silently before, so say when an event was last written and let callers
@@ -233,21 +322,85 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	assets, err := s.Store.ListAssets(r.Context())
+	limit, ok := parseAssetLimit(w, r)
+	if !ok {
+		return
+	}
+	cursor, ok := parseAssetCursor(w, r)
+	if !ok {
+		return
+	}
+
+	var assets []coverage.Asset
+	var err error
+	if pageStore, ok := s.Store.(assetPageReader); ok {
+		afterCode, afterIssuer := "", ""
+		if cursor != nil {
+			afterCode, afterIssuer = cursor.Code, cursor.Issuer
+		}
+		assets, err = pageStore.ListAssetsPage(r.Context(), limit+1, afterCode, afterIssuer)
+	} else {
+		all, listErr := s.Store.ListAssets(r.Context())
+		if listErr != nil {
+			err = listErr
+		} else {
+			sortAssets(all)
+			start := 0
+			if cursor != nil {
+				for i := range all {
+					if all[i].Code > cursor.Code ||
+						(all[i].Code == cursor.Code && all[i].Issuer > cursor.Issuer) {
+						start = i
+						break
+					}
+					if i == len(all)-1 {
+						start = len(all)
+					}
+				}
+			}
+			end := start + limit + 1
+			if end > len(all) {
+				end = len(all)
+			}
+			assets = all[start:end]
+		}
+	}
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	hasNext := len(assets) > limit
+	if hasNext {
+		assets = assets[:limit]
+	}
+	sacs := make([]string, 0, len(assets))
+	for _, a := range assets {
+		sacs = append(sacs, a.SAC)
+	}
+	supplies, err := s.Store.LatestSupplies(r.Context(), sacs)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	reports, err := s.Store.LatestReportsBySAC(r.Context(), sacs)
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
 	out := make([]assetJSON, 0, len(assets))
 	for _, a := range assets {
-		aj, err := s.assemble(r.Context(), a, minTier)
-		if err != nil {
-			s.fail(w, err)
-			return
-		}
-		out = append(out, aj)
+		out = append(out, s.assembleWithData(a, supplies[a.SAC], reports[a.SAC], minTier))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"assets": out})
+	body := map[string]any{"assets": out}
+	if hasNext {
+		last := assets[len(assets)-1]
+		body["next_cursor"] = encodeAssetCursor(assetCursor{
+			Version: 1,
+			Code:    last.Code,
+			Issuer:  last.Issuer,
+		})
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (s *Server) getAsset(w http.ResponseWriter, r *http.Request) {
@@ -305,22 +458,19 @@ func (s *Server) headAsset(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) assemble(ctx context.Context, a coverage.Asset, minTier uint32) (assetJSON, error) {
-	sp, reports, err := s.coverageInputs(ctx, a.SAC)
+	supplies, err := s.Store.LatestSupplies(ctx, []string{a.SAC})
 	if err != nil {
 		return assetJSON{}, err
 	}
-	return s.assembleFrom(a, minTier, sp, reports), nil
-}
-
-// coverageInputs loads the two facts every coverage answer needs. Keeping it
-// separate lets /v1/assets/covered compute coverage to filter an asset and then
-// build the same document without asking for them twice.
-func (s *Server) coverageInputs(ctx context.Context, sac string) (*coverage.Supply, map[uint32]coverage.Report, error) {
-	sp, err := s.Store.LatestSupply(ctx, sac)
+	reportsBySAC, err := s.Store.LatestReportsBySAC(ctx, []string{a.SAC})
 	if err != nil {
-		return nil, nil, err
+		return assetJSON{}, err
 	}
-	reports, err := s.Store.LatestReports(ctx, sac)
+	att, attErr := s.Store.Attestation(ctx, a.SAC)
+	if attErr != nil && !errors.Is(attErr, store.ErrNotFound) {
+		return assetJSON{}, attErr
+	}
+	tomlBody, err := withAttestation(a.Toml, att, attErr == nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -330,18 +480,43 @@ func (s *Server) coverageInputs(ctx context.Context, sac string) (*coverage.Supp
 func (s *Server) assembleFrom(a coverage.Asset, minTier uint32, sp *coverage.Supply, reports map[uint32]coverage.Report) assetJSON {
 	out := assetJSON{
 		Asset:    a,
-		Toml:     json.RawMessage("null"),
+		Toml:     tomlBody,
 		Supply:   toSupply(sp),
 		Reports:  map[string]*reportJSON{},
 		Coverage: s.toCoverage(coverage.Compute(sp, reports, minTier)),
-	}
-	if len(a.Toml) > 0 {
-		out.Toml = a.Toml
 	}
 	for tier, rep := range reports {
 		out.Reports[coverage.TierName(tier)] = toReport(rep)
 	}
 	return out
+}
+
+// withAttestation adds the issuer's attestation document fields to the stored
+// SEP-1 object. The object is re-encoded, so its key order is that of
+// encoding/json; nothing else about it changes.
+func withAttestation(raw []byte, att store.Attestation, found bool) (json.RawMessage, error) {
+	if !found && len(raw) == 0 {
+		return json.RawMessage("null"), nil
+	}
+	obj := map[string]json.RawMessage{}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return nil, fmt.Errorf("decode stored stellar.toml: %w", err)
+		}
+	}
+	if found {
+		hash, _ := json.Marshal(att.Hash)
+		obj["attestation_hash"] = hash
+		if att.ChangedAt != nil {
+			changed, _ := json.Marshal(att.ChangedAt.UTC().Format(time.RFC3339))
+			obj["attestation_changed_at"] = changed
+		}
+	}
+	body, err := json.Marshal(obj)
+	if err != nil {
+		return nil, fmt.Errorf("encode asset toml: %w", err)
+	}
+	return body, nil
 }
 
 func (s *Server) supplyHistory(w http.ResponseWriter, r *http.Request) {
@@ -390,6 +565,109 @@ func (s *Server) reportHistory(w http.ResponseWriter, r *http.Request) {
 		out = append(out, toReport(rep))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"reports": out})
+}
+
+const reportExportPageSize = 500
+
+func (s *Server) reportExport(w http.ResponseWriter, r *http.Request) {
+	sac, ok := parseSAC(w, r)
+	if !ok {
+		return
+	}
+	from, to, ok := parseDateRange(w, r)
+	if !ok {
+		return
+	}
+	if !s.requireAsset(w, r, sac) {
+		return
+	}
+
+	page, err := s.Store.ReportExportPage(r.Context(), sac, from, to, nil, reportExportPageSize)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="reports-`+sac+`.csv"`)
+	writer := csv.NewWriter(w)
+	if err := writer.Write([]string{"ledger", "timestamp", "reporter", "bps", "tier", "doc_uri"}); err != nil {
+		s.Log.Error("write report export", "err", err)
+		return
+	}
+
+	var cursor *store.ReportExportCursor
+	for {
+		for _, row := range page {
+			bps := ""
+			if row.Bps != nil {
+				bps = strconv.FormatUint(uint64(*row.Bps), 10)
+			}
+			record := []string{
+				strconv.FormatUint(uint64(row.Ledger), 10),
+				row.Timestamp.UTC().Format(time.RFC3339Nano),
+				row.Reporter,
+				bps,
+				coverage.TierName(row.Tier),
+				row.DocURI,
+			}
+			if err := writer.Write(record); err != nil {
+				s.Log.Error("write report export", "err", err)
+				return
+			}
+		}
+		if len(page) < reportExportPageSize {
+			break
+		}
+		next := page[len(page)-1].Cursor
+		cursor = &next
+		page, err = s.Store.ReportExportPage(r.Context(), sac, from, to, cursor, reportExportPageSize)
+		if err != nil {
+			s.Log.Error("read report export page", "err", err)
+			return
+		}
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		s.Log.Error("flush report export", "err", err)
+	}
+}
+
+// coverageNow answers the current coverage figure alone, for clients that poll
+// bps and do not need the asset document or the history behind it.
+func (s *Server) coverageNow(w http.ResponseWriter, r *http.Request) {
+	sac, ok := parseSAC(w, r)
+	if !ok {
+		return
+	}
+	if !s.requireAsset(w, r, sac) {
+		return
+	}
+	supply, err := s.Store.LatestSupply(r.Context(), sac)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	reports, err := s.Store.LatestReports(r.Context(), sac)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	res := coverage.Compute(supply, reports, coverage.TierTranscribed)
+	if res == nil {
+		writeError(w, http.StatusNotFound, codeCoverageNotFound, "no live coverage report")
+		return
+	}
+	out := coverageNowJSON{
+		Tier:     coverage.TierName(res.Tier),
+		AsOf:     res.ReportAsOf.UTC(),
+		Reporter: res.ReportReporter,
+	}
+	if !res.NothingIsOwed {
+		bps := res.Bps
+		out.Bps = &bps
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) reporters(w http.ResponseWriter, r *http.Request) {
@@ -530,8 +808,14 @@ func (s *Server) breakdown(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
+// ---- webhooks -------------------------------------------------------------
+
 func (s *Server) createWebhook(w http.ResponseWriter, r *http.Request) {
-	if !s.webhookConfigured(w) || !s.authorizeWebhookAdmin(w, r) {
+	if !s.webhookConfigured(w) {
+		return
+	}
+	ownerKeyHash, _, ok := s.authorizeWebhookAPIKey(w, r)
+	if !ok {
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 4097))
@@ -567,7 +851,7 @@ func (s *Server) createWebhook(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	created, err := s.WebhookStore.CreateWebhook(r.Context(), input.URL, webhook.SecretHash(secret), ciphertext)
+	created, err := s.WebhookStore.CreateWebhook(r.Context(), input.URL, webhook.SecretHash(secret), ciphertext, ownerKeyHash)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -595,7 +879,11 @@ func (s *Server) listWebhooks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteWebhook(w http.ResponseWriter, r *http.Request) {
-	if !s.webhookConfigured(w) || !s.authorizeWebhookAdmin(w, r) {
+	if !s.webhookConfigured(w) {
+		return
+	}
+	ownerKeyHash, isAdmin, ok := s.authorizeWebhookAPIKey(w, r)
+	if !ok {
 		return
 	}
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
@@ -604,13 +892,17 @@ func (s *Server) deleteWebhook(w http.ResponseWriter, r *http.Request) {
 			"webhook id must be a positive integer", map[string]any{"id": r.PathValue("id")})
 		return
 	}
-	deleted, err := s.WebhookStore.DeleteWebhook(r.Context(), id)
-	if err != nil {
-		s.fail(w, err)
+	err = s.WebhookStore.DeleteWebhook(r.Context(), id, ownerKeyHash, isAdmin)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, codeWebhookNotFound, "webhook not found")
 		return
 	}
-	if !deleted {
-		writeError(w, http.StatusNotFound, codeWebhookNotFound, "webhook not found")
+	if errors.Is(err, store.ErrForbidden) {
+		writeError(w, http.StatusForbidden, codeWebhookForbidden, "API key does not own this webhook")
+		return
+	}
+	if err != nil {
+		s.fail(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -625,13 +917,142 @@ func (s *Server) webhookConfigured(w http.ResponseWriter) bool {
 }
 
 func (s *Server) authorizeWebhookAdmin(w http.ResponseWriter, r *http.Request) bool {
-	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if token == r.Header.Get("Authorization") || len(token) != len(s.WebhookAdminToken) ||
-		subtle.ConstantTimeCompare([]byte(token), []byte(s.WebhookAdminToken)) != 1 {
+	token, ok := bearerToken(r)
+	if !ok || !sameToken(token, s.WebhookAdminToken) {
 		writeError(w, http.StatusUnauthorized, codeUnauthorized, "unauthorized")
 		return false
 	}
 	return true
+}
+
+func (s *Server) authorizeWebhookAPIKey(w http.ResponseWriter, r *http.Request) (string, bool, bool) {
+	token, ok := bearerToken(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, codeUnauthorized, "unauthorized")
+		return "", false, false
+	}
+	if sameToken(token, s.WebhookAdminToken) {
+		return webhookAPIKeyHash(token), true, true
+	}
+	for _, key := range s.WebhookAPIKeys {
+		if sameToken(token, key) {
+			return webhookAPIKeyHash(token), false, true
+		}
+	}
+	writeError(w, http.StatusUnauthorized, codeUnauthorized, "unauthorized")
+	return "", false, false
+}
+
+func bearerToken(r *http.Request) (string, bool) {
+	header := r.Header.Get("Authorization")
+	token := strings.TrimPrefix(header, "Bearer ")
+	return token, token != header && token != ""
+}
+
+func sameToken(token, expected string) bool {
+	return len(token) == len(expected) &&
+		subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1
+}
+
+func webhookAPIKeyHash(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
+
+// ---- coverage webhooks ----------------------------------------------------
+
+// coverageWebhookRequest is the body of POST /v1/coverage-webhooks.
+type coverageWebhookRequest struct {
+	URL     string `json:"url"`
+	SAC     string `json:"sac"`
+	MinBps  uint32 `json:"min_bps"`
+	MinTier uint32 `json:"min_tier"`
+}
+
+func (s *Server) createCoverageWebhook(w http.ResponseWriter, r *http.Request) {
+	if !s.requireCoverageAdmin(w, r) {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req coverageWebhookRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, codeInvalidBody, "body must be a JSON object")
+		return
+	}
+	req.URL = strings.TrimSpace(req.URL)
+	if code, msg := validateCoverageWebhook(req); code != "" {
+		writeError(w, http.StatusBadRequest, code, msg)
+		return
+	}
+	wh, err := s.CoverageWebhooks.CreateCoverageWebhook(r.Context(), coverage.Webhook{
+		URL: req.URL, SAC: req.SAC, MinBps: req.MinBps, MinTier: req.MinTier,
+	})
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, wh)
+}
+
+func (s *Server) deleteCoverageWebhook(w http.ResponseWriter, r *http.Request) {
+	if !s.requireCoverageAdmin(w, r) {
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeErrorDetails(w, http.StatusBadRequest, codeInvalidWebhookID,
+			"webhook id must be a positive integer", map[string]any{"id": r.PathValue("id")})
+		return
+	}
+	err = s.CoverageWebhooks.DeleteCoverageWebhook(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, codeWebhookNotFound, "webhook not found")
+		return
+	}
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// requireCoverageAdmin checks the bearer token on coverage alert
+// administration requests. It writes the response itself and returns false
+// when the request is refused.
+func (s *Server) requireCoverageAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if s.WebhookAdminToken == "" || s.CoverageWebhooks == nil || s.WebhookSigningSecret == "" {
+		writeError(w, http.StatusServiceUnavailable, codeWebhooksNotConfigured, "coverage webhook administration is disabled")
+		return false
+	}
+	const prefix = "Bearer "
+	token := ""
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, prefix) {
+		token = strings.TrimSpace(auth[len(prefix):])
+	}
+	if subtle.ConstantTimeCompare([]byte(token), []byte(s.WebhookAdminToken)) != 1 {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeError(w, http.StatusUnauthorized, codeUnauthorized, "invalid admin token")
+		return false
+	}
+	return true
+}
+
+// validateCoverageWebhook returns an error code and message, both empty when
+// the request is valid.
+func validateCoverageWebhook(req coverageWebhookRequest) (code, msg string) {
+	u, err := url.Parse(req.URL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return codeInvalidWebhookURL, "url must be an absolute http or https URL"
+	}
+	if req.SAC == "" {
+		return codeInvalidSAC, "sac is required"
+	}
+	if req.MinBps < 1 || req.MinBps > 10_000 {
+		return codeInvalidBody, "min_bps must be between 1 and 10000"
+	}
+	if req.MinTier < 1 || req.MinTier > 3 {
+		return codeInvalidBody, "min_tier must be 1, 2 or 3"
+	}
+	return "", ""
 }
 
 // ---- helpers --------------------------------------------------------------
@@ -686,6 +1107,58 @@ func parseTier(w http.ResponseWriter, r *http.Request) (uint32, bool) {
 	return uint32(n), true
 }
 
+func parseAssetLimit(w http.ResponseWriter, r *http.Request) (int, bool) {
+	v := r.URL.Query().Get("limit")
+	if v == "" {
+		return 50, true
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 || n > 200 {
+		writeError(w, http.StatusBadRequest, "limit must be between 1 and 200")
+		return 0, false
+	}
+	return n, true
+}
+
+func parseAssetCursor(w http.ResponseWriter, r *http.Request) (*assetCursor, bool) {
+	v := r.URL.Query().Get("cursor")
+	if v == "" {
+		return nil, true
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(v)
+	if err != nil || base64.RawURLEncoding.EncodeToString(raw) != v {
+		writeError(w, http.StatusBadRequest, "invalid cursor")
+		return nil, false
+	}
+	var cursor assetCursor
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cursor); err != nil || cursor.Version != 1 || cursor.Code == "" || cursor.Issuer == "" {
+		writeError(w, http.StatusBadRequest, "invalid cursor")
+		return nil, false
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		writeError(w, http.StatusBadRequest, "invalid cursor")
+		return nil, false
+	}
+	return &cursor, true
+}
+
+func encodeAssetCursor(cursor assetCursor) string {
+	raw, _ := json.Marshal(cursor)
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func sortAssets(assets []coverage.Asset) {
+	sort.Slice(assets, func(i, j int) bool {
+		if assets[i].Code != assets[j].Code {
+			return assets[i].Code < assets[j].Code
+		}
+		return assets[i].Issuer < assets[j].Issuer
+	})
+}
+
 func parseLimit(w http.ResponseWriter, r *http.Request) (int, bool) {
 	v := r.URL.Query().Get("limit")
 	if v == "" {
@@ -700,74 +1173,36 @@ func parseLimit(w http.ResponseWriter, r *http.Request) (int, bool) {
 	return n, true
 }
 
-func parseOffset(w http.ResponseWriter, r *http.Request) (int, bool) {
-	v := r.URL.Query().Get("offset")
-	if v == "" {
-		return 0, true
+func parseDateRange(w http.ResponseWriter, r *http.Request) (*time.Time, *time.Time, bool) {
+	parse := func(name string) (*time.Time, bool) {
+		value := r.URL.Query().Get(name)
+		if value == "" {
+			return nil, true
+		}
+		date, err := time.Parse("2006-01-02", value)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, name+" must be a date in YYYY-MM-DD format")
+			return nil, false
+		}
+		date = date.UTC()
+		if name == "to" {
+			date = date.AddDate(0, 0, 1)
+		}
+		return &date, true
 	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n < 0 {
-		writeErrorDetails(w, http.StatusBadRequest, codeInvalidOffset,
-			"offset must be a non-negative integer", map[string]any{"parameter": "offset", "value": v})
-		return 0, false
+	from, ok := parse("from")
+	if !ok {
+		return nil, nil, false
 	}
-	return n, true
-}
-
-func parseDisputeStatus(w http.ResponseWriter, r *http.Request) (string, bool) {
-	v := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("status")))
-	switch v {
-	case "", "open", "resolved":
-		return v, true
-	default:
-		writeErrorDetails(w, http.StatusBadRequest, codeInvalidStatus,
-			"status must be open or resolved", map[string]any{"parameter": "status", "value": v})
-		return "", false
+	to, ok := parse("to")
+	if !ok {
+		return nil, nil, false
 	}
-}
-
-func parseMinBps(w http.ResponseWriter, r *http.Request) (uint32, bool) {
-	v := r.URL.Query().Get("min_bps")
-	if v == "" {
-		return defaultCoveredMinBps, true
+	if from != nil && to != nil && !from.Before(*to) {
+		writeError(w, http.StatusBadRequest, "from must be on or before to")
+		return nil, nil, false
 	}
-	n, err := strconv.ParseUint(v, 10, 32)
-	if err != nil {
-		writeErrorDetails(w, http.StatusBadRequest, codeInvalidMinBps,
-			"min_bps must be an integer between 0 and 4294967295",
-			map[string]any{"parameter": "min_bps", "value": v})
-		return 0, false
-	}
-	return uint32(n), true
-}
-
-func parseMaxAge(w http.ResponseWriter, r *http.Request) (time.Duration, bool) {
-	v := r.URL.Query().Get("max_age")
-	if v == "" {
-		return defaultCoveredMaxAge, true
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil || d <= 0 {
-		writeErrorDetails(w, http.StatusBadRequest, codeInvalidMaxAge,
-			"max_age must be a positive duration such as 24h",
-			map[string]any{"parameter": "max_age", "value": v})
-		return 0, false
-	}
-	return d, true
-}
-
-// pageOf applies offset and limit to an already-filtered list and reports the
-// offset of the next page, or nil when this is the last page.
-func pageOf[T any](list []T, limit, offset int) ([]T, *int) {
-	if offset >= len(list) {
-		return []T{}, nil
-	}
-	list = list[offset:]
-	if len(list) <= limit {
-		return list, nil
-	}
-	next := offset + limit
-	return list[:limit], &next
+	return from, to, true
 }
 
 func (s *Server) cors(next http.Handler) http.Handler {
@@ -821,6 +1256,7 @@ const (
 	codeAssetNotListed        = "asset_not_listed"
 	codeInvalidBreakdownHash  = "invalid_breakdown_hash"
 	codeBreakdownNotFound     = "breakdown_not_found"
+	codeCoverageNotFound      = "coverage_not_found"
 	codeInvalidMinTier        = "invalid_min_tier"
 	codeInvalidLimit          = "invalid_limit"
 	codeInvalidOffset         = "invalid_offset"
@@ -831,6 +1267,7 @@ const (
 	codeInvalidWebhookURL     = "invalid_webhook_url"
 	codeInvalidWebhookID      = "invalid_webhook_id"
 	codeWebhookNotFound       = "webhook_not_found"
+	codeWebhookForbidden      = "webhook_forbidden"
 	codeWebhooksNotConfigured = "webhooks_not_configured"
 	codeUnauthorized          = "unauthorized"
 	codeInternal              = "internal_error"

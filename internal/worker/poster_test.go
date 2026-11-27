@@ -29,10 +29,11 @@ const (
 var postedAt = time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
 
 type fakeContracts struct {
-	supply   xdr.ScVal // what get_supply returns
-	readErr  error
-	invoked  []string
-	postArgs [][]xdr.ScVal
+	supply    xdr.ScVal // what get_supply returns
+	readErr   error
+	invokeErr error // what post_supply returns
+	invoked   []string
+	postArgs  [][]xdr.ScVal
 }
 
 func (f *fakeContracts) Read(_ context.Context, _, fn string, _ []xdr.ScVal) (xdr.ScVal, error) {
@@ -48,6 +49,9 @@ func (f *fakeContracts) Read(_ context.Context, _, fn string, _ []xdr.ScVal) (xd
 func (f *fakeContracts) Invoke(_ context.Context, _, fn string, args []xdr.ScVal) (soroban.Result, error) {
 	f.invoked = append(f.invoked, fn)
 	f.postArgs = append(f.postArgs, args)
+	if f.invokeErr != nil {
+		return soroban.Result{}, f.invokeErr
+	}
 	return soroban.Result{TxHash: "deadbeef"}, nil
 }
 
@@ -63,24 +67,34 @@ func (f *fakeHorizon) Supply(context.Context, string, string) (horizon.Breakdown
 }
 
 type fakeBreakdowns struct {
-	have  map[string]bool
-	saved []string
+	have      map[string]bool
+	saved     []string
+	confirmed []string
+	pruned    []time.Duration // olderThan of each DeleteUnconfirmedBreakdowns call
+	pruneErr  error
 }
 
 func (f *fakeBreakdowns) ListAssets(context.Context) ([]coverage.Asset, error) {
 	return []coverage.Asset{{SAC: testSAC, Code: "PUSD", Issuer: "GISSUER"}}, nil
 }
 
-func (f *fakeBreakdowns) Breakdown(_ context.Context, hash string) ([]byte, error) {
-	if f.have[hash] {
-		return []byte("{}"), nil
-	}
-	return nil, store.ErrNotFound
+func (f *fakeBreakdowns) HasBreakdown(_ context.Context, hash string) (bool, error) {
+	return f.have[hash], nil
 }
 
 func (f *fakeBreakdowns) SaveBreakdown(_ context.Context, hash, _ string, _ []byte) error {
 	f.saved = append(f.saved, hash)
 	return nil
+}
+
+func (f *fakeBreakdowns) ConfirmBreakdown(_ context.Context, hash string) error {
+	f.confirmed = append(f.confirmed, hash)
+	return nil
+}
+
+func (f *fakeBreakdowns) DeleteUnconfirmedBreakdowns(_ context.Context, olderThan time.Duration) (int64, error) {
+	f.pruned = append(f.pruned, olderThan)
+	return 0, f.pruneErr
 }
 
 type fakeLedger struct{ seq uint32 }
@@ -417,5 +431,93 @@ func TestPosterSkipsZeroSnapshotWhenFresh(t *testing.T) {
 	}
 	if len(c.invoked) != 0 {
 		t.Errorf("invoked %v, want nothing (zero snapshot is fresh)", c.invoked)
+	}
+}
+
+// A successful post confirms its breakdown, so the API starts serving it.
+func TestPosterConfirmsTheBreakdownOfASuccessfulPost(t *testing.T) {
+	b := testBreakdown("9999000000000", 5_469_000)
+	db := &fakeBreakdowns{}
+	c := &fakeContracts{supply: xdr.ScVal{Type: xdr.ScValTypeScvVoid}}
+	if err := newPoster(&fakeHorizon{breakdown: b}, c, db).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(db.saved) != 1 || db.saved[0] != b.Hash() {
+		t.Fatalf("saved %v, want [%s]", db.saved, b.Hash())
+	}
+	if len(db.confirmed) != 1 || db.confirmed[0] != b.Hash() {
+		t.Fatalf("confirmed %v, want [%s]", db.confirmed, b.Hash())
+	}
+}
+
+// A post that fails leaves its breakdown saved but unconfirmed: never served,
+// and deleted once the grace period passes.
+func TestPosterLeavesTheBreakdownOfAFailedPostUnconfirmed(t *testing.T) {
+	b := testBreakdown("9999000000000", 5_469_000)
+	db := &fakeBreakdowns{}
+	c := &fakeContracts{
+		supply:    xdr.ScVal{Type: xdr.ScValTypeScvVoid},
+		invokeErr: errors.New("send post_supply: status ERROR"),
+	}
+	err := newPoster(&fakeHorizon{breakdown: b}, c, db).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "post_supply") {
+		t.Fatalf("err = %v, want the post_supply failure", err)
+	}
+	if len(db.saved) != 1 || db.saved[0] != b.Hash() {
+		t.Fatalf("saved %v, want [%s]", db.saved, b.Hash())
+	}
+	if len(db.confirmed) != 0 {
+		t.Fatalf("confirmed %v after a failed post", db.confirmed)
+	}
+	if len(db.pruned) != 1 {
+		t.Fatalf("pruned %d times, want once even when a post fails", len(db.pruned))
+	}
+}
+
+// A post that looked like it failed may still land. The next tick reads the
+// hash back from the ledger and confirms the breakdown it already has.
+func TestPosterConfirmsTheBreakdownTheLedgerHolds(t *testing.T) {
+	b := testBreakdown("9999000000000", 5_469_000)
+	db := &fakeBreakdowns{have: map[string]bool{b.Hash(): true}}
+	c := &fakeContracts{supply: onChainSnapshot(t, 9_999_000000000, 5_468_000, postedAt.Add(-time.Hour), b.Hash())}
+	if err := newPoster(&fakeHorizon{breakdown: b}, c, db).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.invoked) != 0 {
+		t.Fatalf("invoked %v; the fresh snapshot needs no repost", c.invoked)
+	}
+	if len(db.confirmed) != 1 || db.confirmed[0] != b.Hash() {
+		t.Fatalf("confirmed %v, want [%s]", db.confirmed, b.Hash())
+	}
+}
+
+func TestPosterPrunesUnconfirmedBreakdowns(t *testing.T) {
+	b := testBreakdown("9999000000000", 5_469_000)
+	snapshot := func() *fakeContracts {
+		return &fakeContracts{supply: onChainSnapshot(t, 9_999_000000000, 5_468_000, postedAt.Add(-time.Hour), b.Hash())}
+	}
+
+	db := &fakeBreakdowns{have: map[string]bool{b.Hash(): true}}
+	if err := newPoster(&fakeHorizon{breakdown: b}, snapshot(), db).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(db.pruned) != 1 || db.pruned[0] != DefaultBreakdownGrace {
+		t.Fatalf("pruned %v, want [%s]", db.pruned, DefaultBreakdownGrace)
+	}
+
+	db = &fakeBreakdowns{have: map[string]bool{b.Hash(): true}}
+	p := newPoster(&fakeHorizon{breakdown: b}, snapshot(), db)
+	p.BreakdownGrace = 2 * time.Hour
+	if err := p.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(db.pruned) != 1 || db.pruned[0] != 2*time.Hour {
+		t.Fatalf("pruned %v, want [2h]", db.pruned)
+	}
+
+	db = &fakeBreakdowns{have: map[string]bool{b.Hash(): true}, pruneErr: errors.New("connection reset")}
+	err := newPoster(&fakeHorizon{breakdown: b}, snapshot(), db).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "prune breakdowns: connection reset") {
+		t.Fatalf("err = %v, want the prune failure reported", err)
 	}
 }

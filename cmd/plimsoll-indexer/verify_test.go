@@ -62,6 +62,23 @@ func TestPrintVerificationResult(t *testing.T) {
 			t.Fatalf("expected +2000000000 diff, got:\n%s", str)
 		}
 	})
+
+	// Two amounts that do not parse used to both read as zero and "match".
+	t.Run("unparseable amounts are a mismatch, not zero", func(t *testing.T) {
+		bad := snap
+		bad.Unauthorized = "NaN"
+		badCur := curMatch
+		badCur.Unauthorized = "NaN"
+		var out bytes.Buffer
+		code := printVerificationResult(&out, "PUSD", "CSAC", bad, badCur)
+		if code != 1 {
+			t.Fatalf("expected code 1, got %d", code)
+		}
+		str := out.String()
+		if !strings.Contains(str, "Result: MISMATCH") || !strings.Contains(str, "unparseable snapshot amount") {
+			t.Fatalf("expected an unparseable MISMATCH, got:\n%s", str)
+		}
+	})
 }
 
 func TestRunVerifyCommand(t *testing.T) {
