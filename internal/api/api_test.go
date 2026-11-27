@@ -64,6 +64,13 @@ type fake struct {
 	bodies  map[string][]byte
 	// stored is what EventsSince replays, as if it had been ingested.
 	stored []any
+	assets             []coverage.Asset
+	supply             map[string]*coverage.Supply
+	reports            map[string]map[uint32]coverage.Report
+	bodies             map[string][]byte
+	getAssetCalls      int
+	supplyHistoryCalls int
+	reportHistoryCalls int
 }
 
 func (f *fake) Ping(context.Context) error { return nil }
@@ -85,6 +92,7 @@ func (f *fake) SearchAssets(_ context.Context, q string) ([]coverage.Asset, erro
 	return out, nil
 }
 func (f *fake) GetAsset(_ context.Context, s string) (coverage.Asset, error) {
+	f.getAssetCalls++
 	for _, a := range f.assets {
 		if a.SAC == s {
 			return a, nil
@@ -103,6 +111,7 @@ func (f *fake) LatestSupplies(_ context.Context, sacs []string) (map[string]*cov
 	return out, nil
 }
 func (f *fake) SupplyHistory(_ context.Context, s string, _ int) ([]coverage.Supply, error) {
+	f.supplyHistoryCalls++
 	if sp := f.supply[s]; sp != nil {
 		return []coverage.Supply{*sp}, nil
 	}
@@ -115,6 +124,17 @@ func (f *fake) LatestReportsBySAC(_ context.Context, sacs []string) (map[string]
 		if r := f.reports[s]; r != nil {
 			out[s] = r
 		}
+func (f *fake) LatestReports(_ context.Context, s string) (map[uint32]coverage.Report, error) {
+	if r := f.reports[s]; r != nil {
+		return r, nil
+	}
+	return map[uint32]coverage.Report{}, nil
+}
+func (f *fake) ReportHistory(_ context.Context, s string, _ int) ([]coverage.Report, error) {
+	f.reportHistoryCalls++
+	var out []coverage.Report
+	for _, r := range f.reports[s] {
+		out = append(out, r)
 	}
 	return out, nil
 }
@@ -390,6 +410,10 @@ func coverageServer(token string) *httptest.Server {
 
 func serverWithWebhooks(manager WebhookManager, codec *webhook.SecretCodec, token string) *httptest.Server {
 	f := newFake()
+	return serverWithFake(f, manager, codec, token)
+}
+
+func serverWithFake(f Reader, manager WebhookManager, codec *webhook.SecretCodec, token string) *httptest.Server {
 	s := &Server{
 		Store:             f,
 		WebhookStore:      manager,
@@ -575,6 +599,26 @@ func TestMalformedPathIDs(t *testing.T) {
 		if body["code"] != "invalid_breakdown_hash" || body["message"] == nil {
 			t.Errorf("hash %q: expected an invalid_breakdown_hash error, got %+v", hash, body)
 		}
+	}
+}
+
+func TestMalformedHistorySACDoesNotQueryStore(t *testing.T) {
+	f := &fake{}
+	srv := serverWithFake(f, nil, nil, "")
+	defer srv.Close()
+
+	for _, path := range []string{
+		"/v1/assets/" + strings.Repeat("a", 63) + "/supply",
+		"/v1/assets/" + strings.Repeat("a", 63) + "/reports",
+	} {
+		body := get(t, srv, path, 400)
+		if body["error"] != "sac must be a 32-byte contract strkey" {
+			t.Errorf("%s: unexpected error: %v", path, body["error"])
+		}
+	}
+	if f.getAssetCalls != 0 || f.supplyHistoryCalls != 0 || f.reportHistoryCalls != 0 {
+		t.Fatalf("malformed SAC reached store: GetAsset=%d SupplyHistory=%d ReportHistory=%d",
+			f.getAssetCalls, f.supplyHistoryCalls, f.reportHistoryCalls)
 	}
 }
 
