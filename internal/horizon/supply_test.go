@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
+	"strings"
 	"testing"
 )
 
@@ -157,6 +158,98 @@ func TestHashIsSha256OfCanonical(t *testing.T) {
 	want := `{"asset":"X:G","ledger":7,"authorized":"","authorized_to_maintain_liabilities":"","unauthorized":"","claimable_balances":"","liquidity_pools":"","contracts":"","total":"1"}`
 	if string(b.Canonical()) != want {
 		t.Fatalf("canonical form changed:\n%s", b.Canonical())
+	}
+}
+
+// A 404 from /accounts/{id} says the account does not exist. It used to be
+// reported as ErrAssetNotFound, which made a missing issuer look like an asset
+// with no holders.
+func TestHomeDomainAccountNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/accounts/GONE" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	_, err := NewClient(srv.URL).HomeDomain(context.Background(), "GONE")
+	if !errors.Is(err, ErrAccountNotFound) {
+		t.Fatalf("want ErrAccountNotFound, got %v", err)
+	}
+	if errors.Is(err, ErrAssetNotFound) {
+		t.Fatalf("a missing account reported as a missing asset: %v", err)
+	}
+}
+
+func TestNativeBalanceAccountNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	_, err := NewClient(srv.URL).NativeBalance(context.Background(), "GONE")
+	if !errors.Is(err, ErrAccountNotFound) {
+		t.Fatalf("want ErrAccountNotFound, got %v", err)
+	}
+	if errors.Is(err, ErrAssetNotFound) {
+		t.Fatalf("a missing account reported as a missing asset: %v", err)
+	}
+}
+
+// A 404 from the root means HORIZON_URL does not point at a Horizon root, which
+// is a configuration problem rather than a fact about an asset.
+func TestRootNotFoundIsAConfigurationProblem(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	_, err := NewClient(srv.URL + "/api/v1").LatestLedger(context.Background())
+	if !errors.Is(err, ErrBadHorizonURL) {
+		t.Fatalf("want ErrBadHorizonURL, got %v", err)
+	}
+	if errors.Is(err, ErrAssetNotFound) || errors.Is(err, ErrAccountNotFound) {
+		t.Fatalf("a bad base URL was reported as a missing record: %v", err)
+	}
+	if !strings.Contains(err.Error(), "/api/v1") {
+		t.Errorf("error %q does not name the base URL it tried", err)
+	}
+}
+
+// Supply reads the root first, so a bad base URL fails there as a configuration
+// problem instead of naming an asset.
+func TestSupplyReportsABadBaseURLAsConfiguration(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	_, err := NewClient(srv.URL).Supply(context.Background(), "USDC", "GISSUER")
+	if !errors.Is(err, ErrBadHorizonURL) {
+		t.Fatalf("want ErrBadHorizonURL, got %v", err)
+	}
+	if errors.Is(err, ErrAssetNotFound) {
+		t.Fatalf("a bad base URL was reported as a missing asset: %v", err)
+	}
+}
+
+// /assets answers an unknown asset with an empty records list, so a 404 there
+// means the request was not understood; the supply read still has only one
+// meaning for it: no asset to report.
+func TestSupplyAssetsNotFoundIsAssetNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			_, _ = w.Write([]byte(`{"history_latest_ledger": 61000000}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	_, err := NewClient(srv.URL).Supply(context.Background(), "NOPE", "GISSUER")
+	if !errors.Is(err, ErrAssetNotFound) {
+		t.Fatalf("want ErrAssetNotFound, got %v", err)
 	}
 }
 
