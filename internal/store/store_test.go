@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
 )
 
@@ -57,7 +58,7 @@ func TestApplyEventsIsIdempotent(t *testing.T) {
 		soroban.ReporterRevoked{Meta: eventMeta("ev-revoked", 14, base.Add(4*time.Minute)), Reporter: "GREP"},
 	}
 
-	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-1", 12, events); err != nil {
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-1", 12, nil, events); err != nil {
 		t.Fatalf("first apply: %v", err)
 	}
 	tables := []string{"assets", "supply_snapshots", "reserve_reports", "reporters", "ingest_cursor"}
@@ -71,7 +72,7 @@ func TestApplyEventsIsIdempotent(t *testing.T) {
 	}
 
 	// The same page delivered twice by a retried RPC call must be a no-op.
-	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-1", 12, events); err != nil {
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-1", 12, nil, events); err != nil {
 		t.Fatalf("second apply: %v", err)
 	}
 	second := tableCounts(t, url, tables...)
@@ -124,7 +125,7 @@ func TestLatestReportsReturnsNewestPerTier(t *testing.T) {
 		report("ev-t2", 2, 980, base.Add(24*time.Hour)),
 		report("ev-t3", 3, 1_000, base.Add(12*time.Hour)),
 	}
-	if err := s.ApplyEvents(ctx, "plimsoll-events", "c", 20, events); err != nil {
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "c", 20, nil, events); err != nil {
 		t.Fatal(err)
 	}
 
@@ -178,5 +179,99 @@ func TestBreakdownBytesRoundTripExactly(t *testing.T) {
 		t.Fatal(err)
 	} else if !bytes.Equal(got, body) {
 		t.Fatalf("Breakdown after duplicate save = %q, want the original", got)
+	}
+}
+
+func TestListIssuersPageOrdersByAssetCount(t *testing.T) {
+	s, _ := openStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+
+	events := []any{
+		soroban.AssetListed{Meta: eventMeta("ev-issuer-a", 10, base), SAC: "CSAC1", Code: "AAA", Issuer: "GISS"},
+		soroban.AssetListed{Meta: eventMeta("ev-issuer-b", 11, base), SAC: "CSAC2", Code: "BBB", Issuer: "GISS"},
+		soroban.AssetListed{Meta: eventMeta("ev-issuer-c", 12, base), SAC: "CSAC3", Code: "CCC", Issuer: "GAUD"},
+	}
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "c", 12, nil, events); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := s.ListIssuersPage(ctx, 1, -1, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 || first[0].Address != "GISS" || len(first[0].Assets) != 2 {
+		t.Fatalf("first page = %+v, want GISS with two assets", first)
+	}
+	if first[0].Assets[0].Code != "AAA" || first[0].Assets[1].Code != "BBB" {
+		t.Errorf("GISS assets = %+v, want them in code order", first[0].Assets)
+	}
+
+	second, err := s.ListIssuersPage(ctx, 1, len(first[0].Assets), first[0].Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != 1 || second[0].Address != "GAUD" || len(second[0].Assets) != 1 {
+		t.Fatalf("second page = %+v, want GAUD with one asset", second)
+	}
+
+	empty, err := s.ListIssuersPage(ctx, 1, len(second[0].Assets), second[0].Address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("page after the last issuer = %+v, want none", empty)
+	}
+}
+
+func TestReportersSoftDeleteKeepsTheRow(t *testing.T) {
+	s, url := openStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+
+	set := soroban.ReporterSet{Meta: eventMeta("ev-reporter-set", 10, base), Reporter: "GREP", Role: 2, Name: "Reporter"}
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "c1", 10, nil, []any{set}); err != nil {
+		t.Fatal(err)
+	}
+	live, err := s.Reporters(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(live) != 1 || live[0].Address != "GREP" || live[0].DeletedAt != nil {
+		t.Fatalf("live reporters = %+v, want GREP with no deleted_at", live)
+	}
+
+	revokedAt := base.Add(time.Minute)
+	revoke := soroban.ReporterRevoked{Meta: eventMeta("ev-reporter-revoked", 11, revokedAt), Reporter: "GREP"}
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "c2", 11, nil, []any{revoke}); err != nil {
+		t.Fatal(err)
+	}
+	if live, err = s.Reporters(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(live) != 0 {
+		t.Fatalf("live reporters = %+v, want the revoked reporter hidden by default", live)
+	}
+	all, err := s.Reporters(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 || all[0].DeletedAt == nil || !all[0].DeletedAt.Equal(revokedAt) {
+		t.Fatalf("reporters with deleted = %+v, want GREP deleted at %v", all, revokedAt)
+	}
+	if counts := tableCounts(t, url, "reporters"); counts["reporters"] != 1 {
+		t.Fatalf("reporters table has %d rows, want the soft-deleted row kept", counts["reporters"])
+	}
+
+	// Re-registering the address brings the reporter back.
+	again := soroban.ReporterSet{Meta: eventMeta("ev-reporter-back", 12, base.Add(2*time.Minute)), Reporter: "GREP", Role: 3, Name: "Reporter"}
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "c3", 12, nil, []any{again}); err != nil {
+		t.Fatal(err)
+	}
+	if live, err = s.Reporters(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(live) != 1 || live[0].DeletedAt != nil || live[0].Role != coverage.RoleSupplyPoster {
+		t.Fatalf("live reporters after re-registration = %+v, want GREP live again as a supply poster", live)
 	}
 }

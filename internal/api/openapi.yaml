@@ -64,6 +64,21 @@ paths:
             application/yaml:
               schema:
                 type: string
+  /metrics:
+    get:
+      summary: Prometheus metrics for the indexer
+      operationId: getMetrics
+      description: >-
+        Gauges in the Prometheus text exposition format. Includes
+        `plimsoll_rpc_last_seen_ledger` per Soroban RPC endpoint and
+        `plimsoll_rpc_ledger_drift_ledgers`, the spread between them.
+      responses:
+        '200':
+          description: Prometheus text exposition format
+          content:
+            text/plain:
+              schema:
+                type: string
   /v1/network:
     get:
       summary: Discover network parameters and contract IDs
@@ -428,6 +443,14 @@ paths:
     get:
       summary: List registered reporters and their roles
       operationId: listReporters
+      parameters:
+        - name: include_deleted
+          in: query
+          required: false
+          description: Include reporters the registry de-registered, which are soft-deleted rather than removed
+          schema:
+            type: boolean
+            default: false
       responses:
         '200':
           description: List of registered reporters
@@ -442,6 +465,60 @@ paths:
                       $ref: '#/components/schemas/Reporter'
                 required:
                   - reporters
+  /v1/issuers:
+    get:
+      summary: List indexed issuers with their assets and coverage status
+      operationId: listIssuers
+      description: >-
+        Issuers are derived from the listed assets. They are ordered by asset
+        count, most first, and ties are broken by issuer address. An issuer is
+        covered only when every one of its assets has a live coverage figure
+        and all of them are at 100% or more.
+      parameters:
+        - name: covered
+          in: query
+          required: false
+          description: Keep only issuers that are covered (true) or only those that are not (false)
+          schema:
+            type: boolean
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of issuers to return (1-200)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque cursor returned as next_cursor by a previous page
+          schema:
+            type: string
+      responses:
+        '200':
+          description: List of indexed issuers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  issuers:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Issuer'
+                  next_cursor:
+                    type: string
+                    description: Opaque cursor for the next page, present only when another page exists
+                required:
+                  - issuers
+        '400':
+          description: Invalid request parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/changelog:
     get:
       summary: List breaking changes per released API version
@@ -952,6 +1029,75 @@ components:
         - supply
         - reports
         - coverage
+    Issuer:
+      type: object
+      properties:
+        issuer:
+          type: string
+          example: "GISS..."
+        asset_count:
+          type: integer
+          example: 2
+        covered:
+          type: boolean
+          description: True when every listed asset has live coverage at 100% or more
+        assets:
+          type: array
+          items:
+            $ref: '#/components/schemas/IssuerAsset'
+      required:
+        - issuer
+        - asset_count
+        - covered
+        - assets
+    IssuerAsset:
+      type: object
+      properties:
+        sac:
+          type: string
+          example: "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
+        code:
+          type: string
+          example: "PUSD"
+        listed_at:
+          type: string
+          format: date-time
+          example: "2026-10-01T00:00:00Z"
+        coverage:
+          oneOf:
+            - $ref: '#/components/schemas/IssuerCoverage'
+            - type: "null"
+      required:
+        - sac
+        - code
+        - listed_at
+        - coverage
+    IssuerCoverage:
+      type: object
+      properties:
+        bps:
+          type: [integer, "null"]
+          description: Null when nothing is owed (zero supply)
+          example: 10200
+        tier:
+          type: string
+          example: "issuer_signed"
+        as_of:
+          type: string
+          format: date-time
+          example: "2026-10-01T00:00:00Z"
+        reporter:
+          type: string
+          example: "GREP..."
+        covered:
+          type: boolean
+          description: True when bps is 10000 or more, or when nothing is owed
+      required:
+        - bps
+        - tier
+        - as_of
+        - reporter
+        - covered
     Reporter:
       type: object
       properties:
@@ -964,6 +1110,11 @@ components:
         name:
           type: string
           example: "Acme"
+        deleted_at:
+          type: [string, "null"]
+          format: date-time
+          description: When the registry de-registered the reporter; null while it is live
+          example: null
         updated_at:
           type: string
           format: date-time
@@ -972,6 +1123,7 @@ components:
         - role
         - address
         - name
+        - deleted_at
         - updated_at
     CoverageWebhookRequest:
       type: object

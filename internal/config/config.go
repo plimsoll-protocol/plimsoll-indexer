@@ -47,17 +47,24 @@ type Config struct {
 	DatabaseURL string
 	Port        string
 	RPCURL      string
-	HorizonURL  string
+	// RPCURLs is every Soroban RPC endpoint the indexer compares: RPCURL
+	// followed by any STELLAR_RPC_URLS entries. More than one lets the drift
+	// monitor see an endpoint fall behind the others.
+	RPCURLs    []string
+	HorizonURL string
 	// HorizonCheckURL is a second, independent Horizon the poster compares the
 	// supply against before signing it on chain. One Horizon is one point of
 	// trust for the only figure this indexer asserts itself. Empty disables the
 	// comparison.
-	HorizonCheckURL      string
-	NetworkPassphrase    string
-	CoverageLedgerID     string
-	ReporterRegistryID   string
-	StartLedger          uint32
-	IngestWorkers        int
+	HorizonCheckURL    string
+	NetworkPassphrase  string
+	CoverageLedgerID   string
+	ReporterRegistryID string
+	StartLedger        uint32
+	IngestWorkers      int
+	// MaxRPCDriftLedgers is how many ledgers the RPC endpoints may differ by
+	// before the drift monitor warns (MAX_RPC_DRIFT_LEDGERS, default 10).
+	MaxRPCDriftLedgers   uint32
 	PosterSecret         string
 	WebhookAdminToken    string
 	WebhookAPIKeys       []string
@@ -131,6 +138,29 @@ func Load() (Config, error) {
 		LogLevel:             envOr("LOG_LEVEL", "info"),
 		IngestWorkers:        2,
 		KeepAwakeURL:         keepAwakeURL(os.Getenv("KEEP_AWAKE_URL"), os.Getenv("RENDER_EXTERNAL_URL")),
+	}
+	if c.RPCURL != "" {
+		c.RPCURLs = []string{c.RPCURL}
+	}
+	for _, url := range strings.Split(os.Getenv("STELLAR_RPC_URLS"), ",") {
+		url = strings.TrimSpace(url)
+		if url == "" {
+			continue
+		}
+		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+			errs = append(errs, fmt.Errorf("STELLAR_RPC_URLS: %q is not an http(s) URL", url))
+			continue
+		}
+		duplicate := false
+		for _, known := range c.RPCURLs {
+			if known == url {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			c.RPCURLs = append(c.RPCURLs, url)
+		}
 	}
 	if rawKeys := os.Getenv("WEBHOOK_API_KEYS"); rawKeys != "" {
 		keys, err := parseWebhookAPIKeys(rawKeys, c.WebhookAdminToken)
@@ -232,6 +262,16 @@ func Load() (Config, error) {
 				continue
 			}
 			*f.dst = n
+		}
+	}
+
+	c.MaxRPCDriftLedgers = 10
+	if v := os.Getenv("MAX_RPC_DRIFT_LEDGERS"); v != "" {
+		n, err := strconv.ParseUint(v, 10, 32)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("MAX_RPC_DRIFT_LEDGERS: %w", err))
+		} else {
+			c.MaxRPCDriftLedgers = uint32(n)
 		}
 	}
 

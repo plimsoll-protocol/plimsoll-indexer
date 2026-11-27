@@ -78,6 +78,7 @@ are, so it is safe on a live database, and on an empty one that holds only
 | Method and path | Returns |
 | --- | --- |
 | `GET /healthz` | `{status, ingested_to_ledger, last_event_ledger, last_event_at, last_event_age_seconds}` |
+| `GET /metrics` | Prometheus gauges: `plimsoll_rpc_last_seen_ledger` per RPC endpoint and `plimsoll_rpc_ledger_drift_ledgers`, the spread between them |
 | `GET /v1/network` | Contract ids, RPC and Horizon URLs |
 | `GET /v1/assets?limit=50&cursor=<opaque>&min_tier=1` | Paginated assets (default limit 50, maximum 200) with latest supply, latest report per tier, coverage and stellar.toml data. Responses include `next_cursor` while another page exists. |
 | `GET /v1/assets/{sac}?min_tier=1` | One asset, same shape |
@@ -85,7 +86,8 @@ are, so it is safe on a live database, and on an empty one that holds only
 | `GET /v1/assets/{sac}/supply?limit=100` | Supply snapshot history. Each row carries `source`: `event` for a figure decoded from a contract event, with the `tx_hash` that produced it, or `chain` for one recovered from contract state after an ingestion gap, where `tx_hash` is empty. |
 | `GET /v1/assets/{sac}/reports?limit=100` | Reserve report history |
 | `GET /v1/assets/{sac}/coverage/now` | The `bps`, `tier`, `as_of` and `reporter` of the live report `coverage()` selects, without the asset document. `404` when no live report exists |
-| `GET /v1/reporters` | Active registered reporters |
+| `GET /v1/reporters?include_deleted=true` | Registered reporters. De-registered reporters are soft-deleted and left out unless `include_deleted=true`, which also reports their `deleted_at` |
+| `GET /v1/issuers?limit=50&covered=true&cursor=<opaque>` | Issuers derived from the listed assets, most assets first, each with its assets and their live coverage. `covered=true` keeps only issuers whose assets all carry a live figure at 100% or more (default limit 50, maximum 200). |
 | `GET /v1/changelog` | Breaking API changes per released version, newest first |
 | `GET /v1/breakdowns/{hash}` | Exact bytes of a supply breakdown that backs an on-chain snapshot |
 | `POST /v1/webhooks`, `GET /v1/webhooks`, `DELETE /v1/webhooks/{id}` | Manage authenticated issuer TOML change subscriptions |

@@ -15,6 +15,7 @@ One process (`cmd/plimsoll-indexer`) runs these jobs and an HTTP server on
 | State reconciler | `reconcile` | `RECONCILE_INTERVAL` (15m) | no |
 | stellar.toml sync | `toml` | checked every minute, each asset refreshed every `TOML_INTERVAL` (6h) | no |
 | Supply poster | `poster` | `POST_INTERVAL` (15m), reposts after `REPOST_AFTER` (6h) | yes, `SUPPLY_POSTER_SECRET` |
+| RPC drift monitor | `rpc-drift` | `INGEST_INTERVAL` (10s) | no |
 | Keep-awake | `keepawake` | `KEEP_AWAKE_INTERVAL` (10m) | no |
 
 Ingest and reconcile run once before the server starts listening. A job that
@@ -32,6 +33,8 @@ values are reported together at startup.
 | --- | --- | --- |
 | `NETWORK` | `testnet` | Preset: `testnet`, `mainnet` or `standalone`. Sets the next three defaults. |
 | `STELLAR_RPC_URL` | preset | Required for `mainnet` (no public SDF RPC). |
+| `STELLAR_RPC_URLS` | empty | Extra RPC endpoints, comma separated, compared with `STELLAR_RPC_URL` for ledger drift. |
+| `MAX_RPC_DRIFT_LEDGERS` | `10` | How far the RPC endpoints may differ before the drift monitor logs a warning. |
 | `HORIZON_URL` | preset | |
 | `STELLAR_NETWORK_PASSPHRASE` | preset | Must match the network, or signed posts are rejected. |
 | `HORIZON_CHECK_URL` | empty | Second, independently operated Horizon. Empty disables the cross-check. |
@@ -110,7 +113,13 @@ Other checks:
   `go run ./cmd/plimsoll-indexer verify --sac <SAC> --indexer http://localhost:8080`;
   it exits `0` on match and `1` on mismatch.
 
-There is no metrics endpoint. Monitoring is `/healthz`, the API and the logs.
+`GET /metrics` serves Prometheus gauges in the text exposition format. Today
+that is the RPC drift pair: `plimsoll_rpc_last_seen_ledger{endpoint="…"}`, the
+latest ledger each configured endpoint reported, and
+`plimsoll_rpc_ledger_drift_ledgers`, the spread between the endpoints that
+answered. Alert when the drift stays above `MAX_RPC_DRIFT_LEDGERS`: a lagging
+endpoint serves stale events. Monitoring is otherwise `/healthz`, the API and
+the logs.
 
 ## Logs to watch
 
@@ -122,6 +131,9 @@ Logs are JSON (`log/slog`). Key messages:
 | error | `horizons disagree about supply` | The two Horizons reported different totals for the same ledger. The post is refused. Do not override: find out which Horizon is wrong. |
 | warn | `supply cross-check unavailable` | `HORIZON_CHECK_URL` is down. Posting continues unchecked. |
 | warn | `supply not cross-checked: horizons are at different ledgers` | Ledger skew after a retry. Posting continues. Frequent occurrences mean the two Horizons lag each other. |
+| warn | `rpc endpoints have drifted apart` (`drift_ledgers`, `newest_endpoint`, `oldest_endpoint`) | One RPC endpoint is more than `MAX_RPC_DRIFT_LEDGERS` behind another. Logged once per episode. Compare `plimsoll_rpc_last_seen_ledger` and remove or replace the endpoint that is behind. |
+| info | `rpc endpoints agree again` | The spread fell back within `MAX_RPC_DRIFT_LEDGERS`; the episode is over. |
+| warn | `rpc endpoint did not report its latest ledger` (`endpoint`, `err`) | One endpoint failed a `getLatestLedger` call. The drift figure covers the endpoints that answered. |
 | warn | `ingest cursor is older than RPC retention...` | Ingestion was down longer than RPC's ~7 days. Events in the gap are gone from RPC; the reconciler repairs the latest state. |
 | warn | `start ledger is outside RPC retention` | `START_LEDGER` is too old and was clamped. |
 | warn | `rpc node is rate limiting; backing off` (`attempt`, `wait`) | The RPC node answered `429 Too Many Requests`. The request is retried after `Retry-After` when the node sends it, otherwise after a delay that doubles per attempt. Frequent entries mean the node's limit is too low for the ingest interval. |

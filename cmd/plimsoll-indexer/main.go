@@ -21,6 +21,7 @@ import (
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/changelog"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/config"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/horizon"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/metrics"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/stellartoml"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
@@ -75,6 +76,10 @@ func run(cfg config.Config, log *slog.Logger) error {
 	defer rpc.Close()
 	hz := horizon.NewClient(cfg.HorizonURL)
 
+	// The gauges the API serves at /metrics. The drift monitor fills them from
+	// the workers below.
+	registry := metrics.NewRegistry()
+
 	var webhookCodec *webhook.SecretCodec
 	var webhookDispatcher *webhook.Dispatcher
 	if cfg.WebhookEncryptionKey != "" {
@@ -93,6 +98,25 @@ func run(cfg config.Config, log *slog.Logger) error {
 		Workers:     cfg.IngestWorkers,
 		Log:         log.With("job", "ingest"),
 	}
+	// Every configured endpoint is asked for its latest ledger on each tick, so
+	// an endpoint that falls behind the others is visible before it serves
+	// stale events.
+	rpcEndpoints := make(map[string]worker.LedgerSource, len(cfg.RPCURLs))
+	for _, url := range cfg.RPCURLs {
+		if url == cfg.RPCURL {
+			rpcEndpoints[url] = rpc
+			continue
+		}
+		extra := rpcclient.NewClient(url, rpcHTTP)
+		defer extra.Close()
+		rpcEndpoints[url] = extra
+	}
+	driftMonitor := worker.NewDriftMonitor(rpcEndpoints, cfg.MaxRPCDriftLedgers, registry, log.With("job", "rpc-drift"))
+	if len(rpcEndpoints) > 1 {
+		log.Info("RPC drift detection enabled", "endpoints", len(rpcEndpoints), "max_drift_ledgers", cfg.MaxRPCDriftLedgers)
+	}
+	go every(ctx, cfg.IngestInterval, log.With("job", "rpc-drift"), driftMonitor.Run)
+
 	// Ingest once before the other jobs start, so they see the listed assets.
 	if err := ingester.Run(ctx); err != nil {
 		log.Error("initial ingest failed", "err", err)
@@ -209,6 +233,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 			},
 			CoverageWebhooks:     db,
 			WebhookSigningSecret: cfg.WebhookSigningSecret,
+			Metrics:              registry,
 			CORS:                 cfg.CORSOrigins,
 			Log:                  log.With("component", "api"),
 			Now:                  time.Now,

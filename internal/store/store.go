@@ -306,12 +306,14 @@ func applyEvent(ctx context.Context, tx pgx.Tx, ev any) error {
 			INSERT INTO reporters (address, role, name, active, updated_ledger, updated_at)
 			VALUES ($1, $2, $3, true, $4, $5)
 			ON CONFLICT (address) DO UPDATE
-			SET role = EXCLUDED.role, name = EXCLUDED.name, active = true,
+			SET role = EXCLUDED.role, name = EXCLUDED.name, active = true, deleted_at = NULL,
 			    updated_ledger = EXCLUDED.updated_ledger, updated_at = EXCLUDED.updated_at`,
 			e.Reporter, int16(e.Role), e.Name, int64(e.Ledger), e.ClosedAt)
 	case soroban.ReporterRevoked:
+		// A revocation is a soft delete: the row stays so the reports the
+		// reporter posted still name an address the API can resolve.
 		_, err = tx.Exec(ctx, `
-			UPDATE reporters SET active = false, updated_ledger = $2, updated_at = $3
+			UPDATE reporters SET active = false, deleted_at = $3, updated_ledger = $2, updated_at = $3
 			WHERE address = $1`,
 			e.Reporter, int64(e.Ledger), e.ClosedAt)
 	}
@@ -374,6 +376,61 @@ func (s *Store) ListAssetsPage(ctx context.Context, limit int, afterCode, afterI
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// Issuer is one issuer address with every asset it has listed.
+type Issuer struct {
+	Address string
+	Assets  []coverage.Asset
+}
+
+// ListIssuersPage returns issuers ordered by how many assets they have listed,
+// most first and ties broken by address, each with its assets in code order.
+//
+// afterCount is the asset count of the last issuer of the previous page and
+// afterAddress its address; pass a negative afterCount to start at the first
+// page. The API asks for one issuer more than it serves to learn whether
+// another page exists.
+func (s *Store) ListIssuersPage(ctx context.Context, limit, afterCount int, afterAddress string) ([]Issuer, error) {
+	rows, err := s.pool.Query(ctx, `
+		WITH page AS (
+			SELECT issuer, count(*) AS asset_count
+			FROM assets
+			GROUP BY issuer
+			HAVING $1 < 0
+			    OR count(*) < $1
+			    OR (count(*) = $1 AND issuer > $2)
+			ORDER BY asset_count DESC, issuer
+			LIMIT $3
+		)
+		SELECT p.issuer, a.sac, a.code, a.listed_ledger, a.listed_at
+		FROM page p
+		JOIN assets a ON a.issuer = p.issuer
+		ORDER BY p.asset_count DESC, p.issuer, a.code, a.sac`,
+		afterCount, afterAddress, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query issuers: %w", err)
+	}
+	defer rows.Close()
+	var out []Issuer
+	for rows.Next() {
+		var address string
+		var a coverage.Asset
+		var listed int64
+		if err := rows.Scan(&address, &a.SAC, &a.Code, &listed, &a.ListedAt); err != nil {
+			return nil, fmt.Errorf("scan issuer asset: %w", err)
+		}
+		a.Issuer = address
+		a.ListedLedger = uint32(listed)
+		if len(out) == 0 || out[len(out)-1].Address != address {
+			out = append(out, Issuer{Address: address})
+		}
+		out[len(out)-1].Assets = append(out[len(out)-1].Assets, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read issuers: %w", err)
+	}
+	return out, nil
 }
 
 func (s *Store) GetAsset(ctx context.Context, sac string) (coverage.Asset, error) {
@@ -650,10 +707,14 @@ func (s *Store) queryReports(ctx context.Context, sql string, args ...any) ([]co
 	return out, rows.Err()
 }
 
-func (s *Store) Reporters(ctx context.Context) ([]coverage.Reporter, error) {
+// Reporters returns the registered reporters. Soft-deleted rows, those the
+// registry revoked, are left out unless includeDeleted is set; the migration
+// that added deleted_at backfilled it for rows that were only inactive.
+func (s *Store) Reporters(ctx context.Context, includeDeleted bool) ([]coverage.Reporter, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT address, role, name, updated_at FROM reporters
-		WHERE active ORDER BY role, name`)
+		SELECT address, role, name, updated_at, deleted_at FROM reporters
+		WHERE $1 OR deleted_at IS NULL
+		ORDER BY role, name`, includeDeleted)
 	if err != nil {
 		return nil, err
 	}
@@ -662,10 +723,12 @@ func (s *Store) Reporters(ctx context.Context) ([]coverage.Reporter, error) {
 	for rows.Next() {
 		var r coverage.Reporter
 		var role int16
-		if err := rows.Scan(&r.Address, &role, &r.Name, &r.UpdatedAt); err != nil {
+		var deletedAt *time.Time
+		if err := rows.Scan(&r.Address, &role, &r.Name, &r.UpdatedAt, &deletedAt); err != nil {
 			return nil, err
 		}
 		r.Role = uint32(role)
+		r.DeletedAt = deletedAt
 		out = append(out, r)
 	}
 	return out, rows.Err()
@@ -1047,7 +1110,7 @@ func (s *Store) SaveChainReporter(ctx context.Context, r coverage.Reporter) (boo
 		INSERT INTO reporters (address, role, name, active, updated_ledger, updated_at)
 		VALUES ($1, $2, $3, true, 0, now())
 		ON CONFLICT (address) DO UPDATE
-		SET role = EXCLUDED.role, name = EXCLUDED.name, active = true,
+		SET role = EXCLUDED.role, name = EXCLUDED.name, active = true, deleted_at = NULL,
 		    updated_at = now()
 		WHERE reporters.active = false
 		   OR reporters.role <> EXCLUDED.role
@@ -1063,7 +1126,7 @@ func (s *Store) SaveChainReporter(ctx context.Context, r coverage.Reporter) (boo
 // row existed and was changed (i.e., the reporter was previously active).
 func (s *Store) MarkReporterInactive(ctx context.Context, address string) (bool, error) {
 	tag, err := s.pool.Exec(ctx, `
-		UPDATE reporters SET active = false, updated_at = now()
+		UPDATE reporters SET active = false, deleted_at = now(), updated_at = now()
 		WHERE address = $1 AND active = true`,
 		address)
 	if err != nil {
