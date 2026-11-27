@@ -71,7 +71,7 @@ type Server struct {
 // list and delete its own endpoints.
 type WebhookManager interface {
 	CreateWebhook(ctx context.Context, apiKey, url, secretHash string, ciphertext []byte) (store.Webhook, error)
-	ListWebhooks(ctx context.Context, apiKey string) ([]store.Webhook, error)
+	ListWebhooksForKey(ctx context.Context, apiKey string) ([]store.Webhook, error)
 	DeleteWebhook(ctx context.Context, apiKey string, id int64) (bool, error)
 }
 
@@ -498,7 +498,7 @@ func (s *Server) listWebhooks(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	webhooks, err := s.WebhookStore.ListWebhooks(r.Context(), apiKey)
+	webhooks, err := s.WebhookStore.ListWebhooksForKey(r.Context(), apiKey)
 	if err != nil {
 		s.fail(w, err)
 		return

@@ -116,7 +116,7 @@ func (f *webhookManagerFake) CreateWebhook(_ context.Context, apiKey, url, hash 
 	return item, nil
 }
 
-func (f *webhookManagerFake) ListWebhooks(_ context.Context, apiKey string) ([]store.Webhook, error) {
+func (f *webhookManagerFake) ListWebhooksForKey(_ context.Context, apiKey string) ([]store.Webhook, error) {
 	var out []store.Webhook
 	for _, item := range f.webhooks {
 		if item.APIKey == apiKey || item.APIKey == "" {

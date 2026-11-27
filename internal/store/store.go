@@ -453,7 +453,7 @@ func (s *Store) CreateWebhook(ctx context.Context, apiKey, url, secretHash strin
 	}
 	var count int
 	if err := tx.QueryRow(ctx,
-		`SELECT count(*) FROM webhooks WHERE api_key = $1 OR api_key = ''`, apiKey).Scan(&count); err != nil {
+		`SELECT count(*) FROM webhooks WHERE api_key = $1`, apiKey).Scan(&count); err != nil {
 		return Webhook{}, fmt.Errorf("count webhooks: %w", err)
 	}
 	if count >= MaxWebhooksPerKey {

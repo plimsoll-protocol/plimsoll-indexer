@@ -50,9 +50,11 @@ func (r *Replayer) Run(ctx context.Context, from, to uint32, dryRun bool) (store
 
 	cursor := ""
 	// scanned is the highest ledger any returned event came from. Progress is
-	// reported off it, so an empty range still ends with a complete line.
-	scanned := from
-	nextProgress := from + replayProgressEvery
+	// reported off it, so an empty range still ends with a complete line. The
+	// counters are uint64 so a range ending near the largest ledger sequence
+	// cannot wrap.
+	scanned := uint64(from)
+	nextProgress := scanned + replayProgressEvery
 
 	for {
 		req := protocol.GetEventsRequest{
@@ -80,14 +82,14 @@ func (r *Replayer) Run(ctx context.Context, from, to uint32, dryRun bool) (store
 		page := make([]any, 0, len(resp.Events))
 		pastEnd := false
 		for _, e := range resp.Events {
-			ledger := uint32(e.Ledger)
+			ledger := uint64(e.Ledger)
 			if ledger > scanned {
 				scanned = ledger
 			}
-			if ledger < from {
+			if ledger < uint64(from) {
 				continue
 			}
-			if ledger > to {
+			if ledger > uint64(to) {
 				// RPC has no usable end bound once a cursor is supplied, so
 				// the range is enforced here: events past it are dropped and
 				// the walk stops after this page.
@@ -104,24 +106,26 @@ func (r *Replayer) Run(ctx context.Context, from, to uint32, dryRun bool) (store
 		}
 
 		if len(page) > 0 {
-			r.Log.Debug("replay batch", "from", from, "to", to,
-				"scanned_to", min(scanned, to), "events", len(page), "dry_run", dryRun)
 			if dryRun {
-				total.Add(store.SummarizeReplay(page))
+				pageSummary := store.SummarizeReplay(page)
+				total.Add(pageSummary)
+				r.Log.Info("replay would upsert",
+					"events", pageSummary.Total(), "assets", pageSummary.Assets,
+					"supply", pageSummary.Supplies, "reports", pageSummary.Reports,
+					"reporters", pageSummary.Reporters, "revoked_reporters", pageSummary.Revoked,
+					"scanned_to", min(scanned, uint64(to)))
 			} else {
 				applied, err := r.Store.ApplyReplayEvents(ctx, page)
 				if err != nil {
 					return total, fmt.Errorf("replay: apply events: %w", err)
 				}
 				total.Add(applied)
-			}
-			if dryRun {
-				r.Log.Info("replay would upsert", "events", len(page),
-					"scanned_to", min(scanned, to))
+				r.Log.Debug("replay batch", "from", from, "to", to,
+					"scanned_to", min(scanned, uint64(to)), "events", applied.Total())
 			}
 		}
 
-		for nextProgress <= scanned && nextProgress <= to {
+		for nextProgress <= scanned && nextProgress <= uint64(to) {
 			r.Log.Info("replay progress", "from", from, "to", to,
 				"scanned_to", nextProgress, "events", total.Total(), "dry_run", dryRun)
 			nextProgress += replayProgressEvery

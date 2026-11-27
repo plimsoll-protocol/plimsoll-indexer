@@ -96,18 +96,20 @@ func run(cfg config.Config, log *slog.Logger) error {
 	// waiting for the next reconcile pass. It runs once here, like the main
 	// ingester, so a registration made while the process was down is indexed
 	// before the API starts answering.
-	reporterIngester := &worker.Ingester{
-		RPC:         rpc,
-		Store:       db,
-		ContractIDs: []string{cfg.ReporterRegistryID},
-		RegistryID:  cfg.ReporterRegistryID,
-		StartLedger: cfg.StartLedger,
-		Log:         log.With("job", "reporters"),
+	if cfg.ReporterRegistryID != "" {
+		reporterIngester := &worker.Ingester{
+			RPC:         rpc,
+			Store:       db,
+			ContractIDs: []string{cfg.ReporterRegistryID},
+			RegistryID:  cfg.ReporterRegistryID,
+			StartLedger: cfg.StartLedger,
+			Log:         log.With("job", "reporters"),
+		}
+		if err := reporterIngester.RunReporters(ctx); err != nil {
+			log.Error("initial reporter ingest failed", "err", err)
+		}
+		go every(ctx, cfg.ReporterInterval, log.With("job", "reporters"), reporterIngester.RunReporters)
 	}
-	if err := reporterIngester.RunReporters(ctx); err != nil {
-		log.Error("initial reporter ingest failed", "err", err)
-	}
-	go every(ctx, cfg.ReporterInterval, log.With("job", "reporters"), reporterIngester.RunReporters)
 
 	// Repairs what an ingestion gap lost by reading contract state back.
 	// Reading is simulation, so this needs no key and runs even on an instance
