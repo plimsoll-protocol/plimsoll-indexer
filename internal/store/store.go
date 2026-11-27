@@ -62,12 +62,17 @@ type Webhook struct {
 // Open connects to the database and brings its schema up to date by applying
 // any pending migrations (see migrate.go).
 func Open(ctx context.Context, url string) (*Store, error) {
-	cfg, err := pgxpool.ParseConfig(url)
+	return OpenWithPassword(ctx, url, "")
+}
+
+// OpenWithPassword is Open with the connection password replaced by password
+// when it is non-empty. It is how a database password fetched from a secrets
+// backend is used without writing it into DATABASE_URL.
+func OpenWithPassword(ctx context.Context, url, password string) (*Store, error) {
+	cfg, err := poolConfig(url, password)
 	if err != nil {
-		return nil, fmt.Errorf("parse database url: %w", err)
+		return nil, err
 	}
-	// Timestamps leave the API in UTC regardless of the server's zone.
-	cfg.ConnConfig.RuntimeParams["timezone"] = "UTC"
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
@@ -81,6 +86,21 @@ func Open(ctx context.Context, url string) (*Store, error) {
 		return nil, fmt.Errorf("migrate schema: %w", err)
 	}
 	return &Store{pool: pool}, nil
+}
+
+// poolConfig parses DATABASE_URL and applies the secrets-backend password, if
+// any, before the pool connects.
+func poolConfig(url, password string) (*pgxpool.Config, error) {
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, fmt.Errorf("parse database url: %w", err)
+	}
+	if password != "" {
+		cfg.ConnConfig.Password = password
+	}
+	// Timestamps leave the API in UTC regardless of the server's zone.
+	cfg.ConnConfig.RuntimeParams["timezone"] = "UTC"
+	return cfg, nil
 }
 
 func (s *Store) Close() { s.pool.Close() }
@@ -1086,6 +1106,14 @@ func parseAmount(s string) (*big.Int, error) {
 		return nil, fmt.Errorf("amount %q is not an integer", s)
 	}
 	return n, nil
+}
+
+func mustBig(s string) *big.Int {
+	n, ok := new(big.Int).SetString(s, 10)
+	if !ok {
+		return new(big.Int)
+	}
+	return n
 }
 
 // ---- advisory lock --------------------------------------------------------

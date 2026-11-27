@@ -22,6 +22,7 @@ import (
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/config"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/horizon"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/netclient"
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/secrets"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/stellartoml"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/store"
@@ -61,7 +62,19 @@ func run(cfg config.Config, build buildinfo.Info, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	db, err := store.Open(ctx, cfg.DatabaseURL)
+	secretsProvider, err := secrets.New(ctx, cfg.SecretsProvider)
+	if err != nil {
+		return err
+	}
+	defer secretsProvider.Close()
+	if err := cfg.ResolveSecrets(ctx, secretsProvider); err != nil {
+		return fmt.Errorf("resolve secrets: %w", err)
+	}
+	if cfg.SecretsProvider != secrets.Env {
+		log.Info("secrets loaded", "provider", cfg.SecretsProvider)
+	}
+
+	db, err := store.OpenWithPassword(ctx, cfg.DatabaseURL, cfg.DatabasePassword)
 	if err != nil {
 		return err
 	}
@@ -213,7 +226,7 @@ func run(cfg config.Config, build buildinfo.Info, log *slog.Logger) error {
 		go every(ctx, cfg.PostInterval, log.With("job", "poster"), poster.Run)
 
 	} else {
-		log.Info("supply posting disabled (SUPPLY_POSTER_SECRET not set)")
+		log.Info("supply posting disabled (no poster secret configured)")
 	}
 
 	// A malformed changelog would break the published API contract, so refuse

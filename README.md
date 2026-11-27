@@ -187,6 +187,14 @@ Every variable is documented in [.env.example](.env.example). Required:
 file in the working directory is applied over the environment (see
 [Quick start](#quick-start)); set `GO_ENV=production` to disable it.
 
+The poster secret and the database password can come from a secrets backend
+instead of the environment. Set `SECRETS_PROVIDER=ssm` (AWS Systems Manager
+Parameter Store) or `gcp` (GCP Secret Manager) and name the parameter or secret
+in `SUPPLY_POSTER_SECRET_NAME` and `DATABASE_PASSWORD_SECRET_NAME`; both are
+fetched once at startup and never logged. `env`, the default, reads
+`SUPPLY_POSTER_SECRET` and the password in `DATABASE_URL`, and either credential
+falls back to its environment variable when its `*_SECRET_NAME` is empty.
+
 `NETWORK` selects a preset (`testnet`, the default, `mainnet` or `standalone`)
 that supplies defaults for `STELLAR_RPC_URL`, `HORIZON_URL` and
 `STELLAR_NETWORK_PASSPHRASE`. Setting any of those three overrides the preset.
@@ -216,8 +224,9 @@ To build the image locally instead, replace the `image:` line in
 `docker-compose.yml` with `build: .` and run `docker compose up --build`.
 
 The image is multi-stage (`golang:1.27-bookworm` → `gcr.io/distroless/static-debian12`)
-and stays well under 30 MB. Leave `SUPPLY_POSTER_SECRET` empty in
-`docker-compose.yml` for a read-only run.
+and is about 31 MB; most of that is the AWS and GCP SDKs behind
+`SECRETS_PROVIDER`. Leave `SUPPLY_POSTER_SECRET` empty in `docker-compose.yml`
+for a read-only run.
 
 The binary includes a `healthcheck` subcommand used by the Docker
 `HEALTHCHECK` instruction and by the Compose file. It requests `/healthz` on
@@ -233,6 +242,10 @@ plimsoll-indexer healthcheck
 Postgres provisioning, Render and Railway setup, and safe secret management.
 The [Render blueprint](render.yaml) provisions a web service and Postgres
 database and can be launched with the one-click button in the guide.
+
+`SUPPLY_POSTER_SECRET` is never committed: set it in the hosting provider's
+settings, or point `SECRETS_PROVIDER` at AWS SSM or GCP Secret Manager (see
+[.env.example](.env.example)).
 
 [.github/workflows/keepalive.yml](.github/workflows/keepalive.yml) watches the
 deployment from outside: it wakes the service, fails if nothing has been

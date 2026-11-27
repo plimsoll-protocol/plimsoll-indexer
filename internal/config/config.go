@@ -2,13 +2,17 @@
 package config
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/secrets"
 )
 
 const (
@@ -65,9 +69,12 @@ type Config struct {
 	SlackWebhookURL      string
 	DiscordWebhookURL    string
 	WebhookSigningSecret string
-	WebhookInterval      time.Duration
-	IngestInterval       time.Duration
-	PostInterval         time.Duration
+	// SlackWebhookURL and DiscordWebhookURL receive coverage drop alerts.
+	SlackWebhookURL   string
+	DiscordWebhookURL string
+	WebhookInterval   time.Duration
+	IngestInterval    time.Duration
+	PostInterval      time.Duration
 	// ReconcileInterval is how often contract state is read back to repair
 	// what event ingestion missed. Each pass is a handful of simulations per
 	// asset, so it can be infrequent.
@@ -131,6 +138,9 @@ func Load() (Config, error) {
 		NetworkPassphrase:    envOr("STELLAR_NETWORK_PASSPHRASE", preset.Passphrase),
 		CoverageLedgerID:     os.Getenv("COVERAGE_LEDGER_ID"),
 		ReporterRegistryID:   os.Getenv("REPORTER_REGISTRY_ID"),
+		SecretsProvider:      strings.ToLower(strings.TrimSpace(envOr("SECRETS_PROVIDER", secrets.Env))),
+		PosterSecretName:     strings.TrimSpace(os.Getenv("SUPPLY_POSTER_SECRET_NAME")),
+		DatabasePasswordName: strings.TrimSpace(os.Getenv("DATABASE_PASSWORD_SECRET_NAME")),
 		PosterSecret:         os.Getenv("SUPPLY_POSTER_SECRET"),
 		WebhookAdminToken:    os.Getenv("WEBHOOK_ADMIN_TOKEN"),
 		WebhookEncryptionKey: os.Getenv("WEBHOOK_ENCRYPTION_KEY"),
@@ -148,6 +158,12 @@ func Load() (Config, error) {
 		} else {
 			c.WebhookAPIKeys = keys
 		}
+	}
+
+	switch c.SecretsProvider {
+	case secrets.Env, secrets.SSM, secrets.GCP:
+	default:
+		errs = append(errs, fmt.Errorf("SECRETS_PROVIDER %q is not one of env, ssm, gcp", c.SecretsProvider))
 	}
 
 	if c.RPCURL == "" {
@@ -280,6 +296,44 @@ func keepAwakeURL(explicit, renderExternal string) string {
 	default:
 		return ""
 	}
+}
+
+// ResolveSecrets fills PosterSecret and DatabasePassword from p. A credential
+// with no *_SECRET_NAME keeps the value from the environment, so either one can
+// stay in env vars while the other comes from the backend.
+func (c *Config) ResolveSecrets(ctx context.Context, p secrets.Provider) error {
+	if p == nil {
+		return errors.New("resolve secrets: nil provider")
+	}
+	var errs []error
+	if c.PosterSecretName != "" {
+		v, err := p.Get(ctx, c.PosterSecretName)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("SUPPLY_POSTER_SECRET_NAME %q: %w", c.PosterSecretName, err))
+		} else {
+			c.PosterSecret = v
+		}
+	}
+	if c.DatabasePasswordName != "" {
+		v, err := p.Get(ctx, c.DatabasePasswordName)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("DATABASE_PASSWORD_SECRET_NAME %q: %w", c.DatabasePasswordName, err))
+		} else {
+			c.DatabasePassword = v
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// LogValue implements slog.LogValuer so that logging a Config records which
+// credentials were supplied, never their values.
+func (c Config) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("network", c.Network),
+		slog.String("secrets_provider", c.SecretsProvider),
+		slog.Bool("poster_secret_set", c.PosterSecret != ""),
+		slog.Bool("database_password_set", c.DatabasePassword != ""),
+	)
 }
 
 // PostingEnabled reports whether this instance should post supply snapshots.

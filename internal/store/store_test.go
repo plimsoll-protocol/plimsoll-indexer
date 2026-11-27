@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -183,5 +185,41 @@ func TestBreakdownBytesRoundTripExactly(t *testing.T) {
 		t.Fatal(err)
 	} else if !bytes.Equal(got, body) {
 		t.Fatalf("Breakdown after duplicate save = %q, want the original", got)
+	}
+}
+
+func TestPoolConfigAppliesSecretsPassword(t *testing.T) {
+	const url = "postgres://plimsoll:from-url@localhost:54329/plimsoll?sslmode=disable"
+
+	cfg, err := poolConfig(url, "from-secrets")
+	if err != nil {
+		t.Fatalf("poolConfig: %v", err)
+	}
+	if cfg.ConnConfig.Password != "from-secrets" {
+		t.Errorf("password = %q, want the secrets-backend password", cfg.ConnConfig.Password)
+	}
+	if cfg.ConnConfig.User != "plimsoll" || cfg.ConnConfig.Database != "plimsoll" {
+		t.Errorf("user/database changed: %q/%q", cfg.ConnConfig.User, cfg.ConnConfig.Database)
+	}
+	if cfg.ConnConfig.RuntimeParams["timezone"] != "UTC" {
+		t.Errorf("timezone = %q, want UTC", cfg.ConnConfig.RuntimeParams["timezone"])
+	}
+}
+
+func TestPoolConfigKeepsURLPassword(t *testing.T) {
+	cfg, err := poolConfig("postgres://plimsoll:from-url@localhost:54329/plimsoll", "")
+	if err != nil {
+		t.Fatalf("poolConfig: %v", err)
+	}
+	if cfg.ConnConfig.Password != "from-url" {
+		t.Errorf("password = %q, want the one DATABASE_URL carries", cfg.ConnConfig.Password)
+	}
+}
+
+func TestPoolConfigRejectsBadURL(t *testing.T) {
+	if _, err := poolConfig("://not-a-url", ""); err == nil {
+		t.Fatal("poolConfig on a malformed URL = nil error, want error")
+	} else if !strings.Contains(err.Error(), "parse database url") {
+		t.Errorf("error = %q, want it to name the failure", err)
 	}
 }
