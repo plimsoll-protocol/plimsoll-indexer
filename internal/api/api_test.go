@@ -71,6 +71,11 @@ type fake struct {
 	getAssetCalls      int
 	supplyHistoryCalls int
 	reportHistoryCalls int
+	assets     []coverage.Asset
+	supply     map[string]*coverage.Supply
+	reports    map[string]map[uint32]coverage.Report
+	bodies     map[string][]byte
+	batchCalls int
 }
 
 func (f *fake) Ping(context.Context) error { return nil }
@@ -109,6 +114,16 @@ func (f *fake) LatestSupplies(_ context.Context, sacs []string) (map[string]*cov
 		}
 	}
 	return out, nil
+func (f *fake) BatchCoverage(_ context.Context, sacs []string) (map[string]store.CoverageData, error) {
+	f.batchCalls++
+	out := make(map[string]store.CoverageData, len(sacs))
+	for _, sac := range sacs {
+		out[sac] = store.CoverageData{Supply: f.supply[sac], Reports: f.reports[sac]}
+	}
+	return out, nil
+}
+func (f *fake) LatestSupply(_ context.Context, s string) (*coverage.Supply, error) {
+	return f.supply[s], nil
 }
 func (f *fake) SupplyHistory(_ context.Context, s string, _ int) ([]coverage.Supply, error) {
 	f.supplyHistoryCalls++
@@ -541,12 +556,147 @@ func (m mockAPIStore) StreamAuditTrail(ctx context.Context, fn func(store.AuditR
 	for _, r := range m.audit {
 		if err := fn(r); err != nil {
 			return err
+
+func TestHeadAsset(t *testing.T) {
+	srv := server()
+	defer srv.Close()
+
+	unlisted := unlistedSAC(t)
+	for _, test := range []struct {
+		sac        string
+		wantStatus int
+	}{
+		{sac: sac, wantStatus: http.StatusOK},
+		{sac: unlisted, wantStatus: http.StatusNotFound},
+		{sac: "invalid", wantStatus: http.StatusBadRequest},
+	} {
+		req, err := http.NewRequest(http.MethodHead, srv.URL+"/v1/assets/"+test.sac, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		closeErr := resp.Body.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		if resp.StatusCode != test.wantStatus {
+			t.Errorf("HEAD %q: status %d, want %d", test.sac, resp.StatusCode, test.wantStatus)
+		}
+		if len(body) != 0 {
+			t.Errorf("HEAD %q returned body %q", test.sac, body)
 		}
 	}
 	return nil
 }
 func (m mockAPIStore) StreamCSVExports(ctx context.Context, fn func(store.ExportRecord) error) error {
 	return nil
+
+func TestBatchCoverage(t *testing.T) {
+	unlisted := unlistedSAC(t)
+	f := &fake{
+		supply: map[string]*coverage.Supply{
+			sac: {Amount: big.NewInt(1_000_0000000), Ledger: 100, PostedAt: now.Add(-time.Hour)},
+		},
+		reports: map[string]map[uint32]coverage.Report{
+			sac: {coverage.TierIssuerSigned: {
+				Tier: coverage.TierIssuerSigned, Amount: big.NewInt(1_020_0000000),
+				AsOf: now.Add(-2 * time.Hour), Reporter: "GISS", DocURI: "https://x",
+			}},
+		},
+	}
+	s := &Server{
+		Store: f,
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:   func() time.Time { return now },
+	}
+	handler := s.Handler()
+	req := httptest.NewRequest(http.MethodPost, "/v1/assets/batch-covered", strings.NewReader(`["`+sac+`","`+unlisted+`"]`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Assets []struct {
+			SAC      string         `json:"sac"`
+			Coverage map[string]any `json:"coverage"`
+		} `json:"assets"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if f.batchCalls != 1 {
+		t.Fatalf("BatchCoverage calls = %d, want 1", f.batchCalls)
+	}
+	if len(body.Assets) != 2 || body.Assets[0].SAC != sac || body.Assets[1].SAC != unlisted {
+		t.Fatalf("assets are not in request order: %+v", body.Assets)
+	}
+	if body.Assets[0].Coverage["bps"] != float64(10_200) || body.Assets[1].Coverage != nil {
+		t.Fatalf("unexpected coverage: %+v", body.Assets)
+	}
+}
+
+func TestBatchCoverageRejectsEmptyOversizedAndInvalidRequests(t *testing.T) {
+	f := &fake{}
+	s := &Server{
+		Store: f,
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:   func() time.Time { return now },
+	}
+	handler := s.Handler()
+	tooManyAssets := make([]string, 51)
+	for i := range tooManyAssets {
+		tooManyAssets[i] = sac
+	}
+	tooMany, err := json.Marshal(tooManyAssets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []string{
+		"", "[]", string(tooMany), `["not-a-contract"]`,
+		strings.Repeat(" ", 4097) + "[]",
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/assets/batch-covered", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("body %q: status %d, want 400", body, rec.Code)
+		}
+		var response struct {
+			Code string `json:"code"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Errorf("body %q: invalid error response: %v", body, err)
+		} else {
+			wantCode := codeInvalidBody
+			if body == `["not-a-contract"]` {
+				wantCode = codeInvalidSAC
+			}
+			if response.Code != wantCode {
+				t.Errorf("body %q: error code %q, want %q", body, response.Code, wantCode)
+			}
+		}
+	}
+	if f.batchCalls != 0 {
+		t.Fatalf("invalid requests reached storage %d times", f.batchCalls)
+	}
+}
+
+func TestMinTierExcludesWeakerReports(t *testing.T) {
+	srv := server()
+	defer srv.Close()
+	body := get(t, srv, "/v1/assets/"+sac+"?min_tier=3", 200)
+	if body["coverage"] != nil {
+		t.Fatalf("expected no coverage at auditor tier, got %+v", body["coverage"])
+	}
+	get(t, srv, "/v1/assets/"+sac+"?min_tier=9", 400)
 }
 
 func TestListAndMisc(t *testing.T) {
