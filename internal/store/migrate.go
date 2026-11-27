@@ -8,17 +8,18 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Versioned schema migrations.
 //
-// Each file in migrations/ is one migration named NNNN_description.sql, where
-// NNNN is its version: 0001, 0002, and so on, with no gaps. Open applies every
-// migration a database has not recorded yet, in version order, and records
-// each one in schema_migrations. A merged migration is never edited: a later
-// schema change is a new file.
+// Each file in migrations/ is named NNNN_description.sql, where NNNN is its
+// version: 0001, 0002, and so on, with no gaps. Files with the same version
+// form an ordered migration group. Open applies pending files in version/name
+// order and records their names in schema_migrations. A merged migration is
+// never edited: a later schema change is a new file.
 
 //go:embed migrations/*.sql
 var embeddedMigrations embed.FS
@@ -36,8 +37,9 @@ type migration struct {
 }
 
 // loadMigrations reads the migration files at the root of fsys and returns
-// them in version order. Misnamed files, duplicate versions and gaps are
-// errors, so a typo cannot silently skip a migration.
+// them in version order. Migrations sharing a version are applied by name in
+// one transaction; this supports independently prepared branches that used the
+// same next version without rewriting migration history.
 func loadMigrations(fsys fs.FS) ([]migration, error) {
 	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
@@ -62,13 +64,19 @@ func loadMigrations(fsys fs.FS) ([]migration, error) {
 		}
 		out = append(out, migration{Version: version, Name: m[2], SQL: string(body)})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Version < out[j].Version })
-	for i, m := range out {
-		if m.Version != i+1 {
-			if i > 0 && m.Version == out[i-1].Version {
-				return nil, fmt.Errorf("two migrations have version %04d", m.Version)
-			}
-			return nil, fmt.Errorf("migration %04d is missing", i+1)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Version == out[j].Version {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].Version < out[j].Version
+	})
+	for i, expected := 0, 1; i < len(out); expected++ {
+		version := out[i].Version
+		if version != expected {
+			return nil, fmt.Errorf("migration %04d is missing", expected)
+		}
+		for i < len(out) && out[i].Version == version {
+			i++
 		}
 	}
 	return out, nil
@@ -105,35 +113,73 @@ func migrate(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS) error {
 		return fmt.Errorf("create schema_migrations: %w", err)
 	}
 
-	applied := map[int]bool{}
-	rows, err := tx.Query(ctx, `SELECT version FROM schema_migrations`)
+	appliedByVersion := map[int]map[string]bool{}
+	rows, err := tx.Query(ctx, `SELECT version, name FROM schema_migrations`)
 	if err != nil {
 		return fmt.Errorf("read schema_migrations: %w", err)
 	}
 	for rows.Next() {
 		var v int
-		if err := rows.Scan(&v); err != nil {
+		var names string
+		if err := rows.Scan(&v, &names); err != nil {
 			rows.Close()
 			return fmt.Errorf("read schema_migrations: %w", err)
 		}
-		applied[v] = true
+		if appliedByVersion[v] == nil {
+			appliedByVersion[v] = make(map[string]bool)
+		}
+		for _, name := range strings.Split(names, ",") {
+			if name == "" {
+				continue
+			}
+			appliedByVersion[v][name] = true
+		}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("read schema_migrations: %w", err)
 	}
 
-	for _, m := range migrations {
-		if applied[m.Version] {
-			continue
+	for i := 0; i < len(migrations); {
+		j := i + 1
+		for j < len(migrations) && migrations[j].Version == migrations[i].Version {
+			j++
 		}
-		if _, err := tx.Exec(ctx, m.SQL); err != nil {
-			return fmt.Errorf("apply migration %04d_%s: %w", m.Version, m.Name, err)
+		version := migrations[i].Version
+		for _, m := range migrations[i:j] {
+			if appliedByVersion[version][m.Name] {
+				continue
+			}
+			if _, err := tx.Exec(ctx, m.SQL); err != nil {
+				return fmt.Errorf("apply migration %04d_%s: %w", m.Version, m.Name, err)
+			}
 		}
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO schema_migrations (version, name) VALUES ($1, $2)`, m.Version, m.Name); err != nil {
-			return fmt.Errorf("record migration %04d_%s: %w", m.Version, m.Name, err)
+
+		names := make(map[string]bool)
+		for name := range appliedByVersion[version] {
+			names[name] = true
 		}
+		for _, m := range migrations[i:j] {
+			names[m.Name] = true
+		}
+		orderedNames := make([]string, 0, len(names))
+		for name := range names {
+			orderedNames = append(orderedNames, name)
+		}
+		sort.Strings(orderedNames)
+		if _, exists := appliedByVersion[version]; exists {
+			if _, err := tx.Exec(ctx,
+				`UPDATE schema_migrations SET name = $2 WHERE version = $1`,
+				version, strings.Join(orderedNames, ",")); err != nil {
+				return fmt.Errorf("record migrations for version %04d: %w", version, err)
+			}
+		} else if _, err := tx.Exec(ctx,
+			`INSERT INTO schema_migrations (version, name) VALUES ($1, $2)`,
+			version, strings.Join(orderedNames, ",")); err != nil {
+			return fmt.Errorf("record migrations for version %04d: %w", version, err)
+		}
+		appliedByVersion[version] = names
+		i = j
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit migrations: %w", err)

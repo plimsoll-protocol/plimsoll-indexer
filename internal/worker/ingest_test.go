@@ -335,7 +335,7 @@ func (s *eventTrackingStore) Progress(context.Context, string) (store.Progress, 
 	return store.Progress{}, nil
 }
 
-func (s *eventTrackingStore) ApplyEvents(_ context.Context, name, _ string, _ uint32, raw []soroban.RawEvent, events []any) error {
+func (s *eventTrackingStore) ApplyEvents(_ context.Context, name, _ string, _ uint32, _ []soroban.RawEvent, events []any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.names[name] = true

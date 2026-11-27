@@ -127,7 +127,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/webhooks/{id}", s.deleteWebhook)
 	mux.HandleFunc("POST /v1/coverage-webhooks", s.createCoverageWebhook)
 	mux.HandleFunc("DELETE /v1/coverage-webhooks/{id}", s.deleteCoverageWebhook)
-	return s.cors(errorEnvelope(mux))
+	return s.compress(s.cors(errorEnvelope(mux)))
+}
+
+func (s *Server) compress(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cw := &compressionWriter{
+			ResponseWriter: w,
+			encoding:       acceptedEncoding(strings.Join(r.Header.Values("Accept-Encoding"), ",")),
+			logger:         s.Log,
+			method:         r.Method,
+		}
+		next.ServeHTTP(cw, r)
+		if err := cw.finish(); err != nil && s.Log != nil {
+			s.Log.Error("write compressed API response", "err", err)
+		}
+	})
 }
 
 // ---- JSON shapes ----------------------------------------------------------
@@ -381,7 +396,12 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]assetJSON, 0, len(assets))
 	for _, a := range assets {
-		out = append(out, s.assembleWithData(a, supplies[a.SAC], reports[a.SAC], minTier))
+		aj, err := s.assembleWithData(r.Context(), a, supplies[a.SAC], reports[a.SAC], minTier)
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		out = append(out, aj)
 	}
 	body := map[string]any{"assets": out}
 	if hasNext {
@@ -450,6 +470,10 @@ func (s *Server) assemble(ctx context.Context, a coverage.Asset, minTier uint32)
 	if err != nil {
 		return assetJSON{}, err
 	}
+	return s.assembleWithData(ctx, a, supplies[a.SAC], reportsBySAC[a.SAC], minTier)
+}
+
+func (s *Server) assembleWithData(ctx context.Context, a coverage.Asset, sp *coverage.Supply, reports map[uint32]coverage.Report, minTier uint32) (assetJSON, error) {
 	att, attErr := s.Store.Attestation(ctx, a.SAC)
 	if attErr != nil && !errors.Is(attErr, store.ErrNotFound) {
 		return assetJSON{}, attErr
@@ -481,7 +505,7 @@ func (s *Server) assembleWithData(a coverage.Asset, sp *coverage.Supply, reports
 	for tier, rep := range reports {
 		out.Reports[coverage.TierName(tier)] = toReport(rep)
 	}
-	return out
+	return out, nil
 }
 
 // withAttestation adds the issuer's attestation document fields to the stored
@@ -1025,19 +1049,19 @@ func parseAssetCursor(w http.ResponseWriter, r *http.Request) (*assetCursor, boo
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(v)
 	if err != nil || base64.RawURLEncoding.EncodeToString(raw) != v {
-		writeError(w, http.StatusBadRequest, codeInvalidBody, "invalid cursor")
+		writeError(w, http.StatusBadRequest, codeInvalidCursor, "invalid cursor")
 		return nil, false
 	}
 	var cursor assetCursor
 	dec := json.NewDecoder(strings.NewReader(string(raw)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cursor); err != nil || cursor.Version != 1 || cursor.Code == "" || cursor.Issuer == "" {
-		writeError(w, http.StatusBadRequest, codeInvalidBody, "invalid cursor")
+		writeError(w, http.StatusBadRequest, codeInvalidCursor, "invalid cursor")
 		return nil, false
 	}
 	var trailing any
 	if err := dec.Decode(&trailing); err != io.EOF {
-		writeError(w, http.StatusBadRequest, codeInvalidBody, "invalid cursor")
+		writeError(w, http.StatusBadRequest, codeInvalidCursor, "invalid cursor")
 		return nil, false
 	}
 	return &cursor, true
@@ -1079,7 +1103,7 @@ func parseDateRange(w http.ResponseWriter, r *http.Request) (*time.Time, *time.T
 		}
 		date, err := time.Parse("2006-01-02", value)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, codeInvalidBody, name+" must be a date in YYYY-MM-DD format")
+			writeError(w, http.StatusBadRequest, codeInvalidDate, name+" must be a date in YYYY-MM-DD format")
 			return nil, false
 		}
 		date = date.UTC()
@@ -1097,7 +1121,7 @@ func parseDateRange(w http.ResponseWriter, r *http.Request) (*time.Time, *time.T
 		return nil, nil, false
 	}
 	if from != nil && to != nil && !from.Before(*to) {
-		writeError(w, http.StatusBadRequest, codeInvalidBody, "from must be on or before to")
+		writeError(w, http.StatusBadRequest, codeInvalidDate, "from must be on or before to")
 		return nil, nil, false
 	}
 	return from, to, true
@@ -1157,6 +1181,8 @@ const (
 	codeCoverageNotFound      = "coverage_not_found"
 	codeInvalidMinTier        = "invalid_min_tier"
 	codeInvalidLimit          = "invalid_limit"
+	codeInvalidCursor         = "invalid_cursor"
+	codeInvalidDate           = "invalid_date"
 	codeInvalidBody           = "invalid_body"
 	codeInvalidWebhookURL     = "invalid_webhook_url"
 	codeInvalidWebhookID      = "invalid_webhook_id"
@@ -1164,6 +1190,7 @@ const (
 	codeWebhookForbidden      = "webhook_forbidden"
 	codeWebhooksNotConfigured = "webhooks_not_configured"
 	codeUnauthorized          = "unauthorized"
+	codeAuthUnavailable       = "auth_unavailable"
 	codeInternal              = "internal_error"
 	codeAPIAuthNotConfigured  = "api_auth_not_configured"
 	codeDBUnavailable         = "db_unavailable"

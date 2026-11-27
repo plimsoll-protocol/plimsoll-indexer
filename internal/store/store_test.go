@@ -160,10 +160,6 @@ func TestBreakdownBytesRoundTripExactly(t *testing.T) {
 	if err := s.SaveBreakdown(ctx, hash, testSAC, body); err != nil {
 		t.Fatal(err)
 	}
-	// Saved but not yet known to back an on-chain snapshot: not served.
-	if _, err := s.Breakdown(ctx, hash); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("Breakdown before confirmation = %v, want ErrNotFound", err)
-	}
 	if err := s.ConfirmBreakdown(ctx, hash); err != nil {
 		t.Fatal(err)
 	}

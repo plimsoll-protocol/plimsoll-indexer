@@ -118,7 +118,11 @@ func (f *fake) ReportExportPage(_ context.Context, _ string, from, to *time.Time
 	return f.exportPages[pageIndex], nil
 }
 func (f *fake) Reporters(context.Context) ([]coverage.Reporter, error) {
-	return []coverage.Reporter{{Address: "GAUD", Role: coverage.RoleAuditor, Name: "Acme"}}, nil
+	websiteURI, contactHash := "https://acme.example", "sha256:contact"
+	return []coverage.Reporter{{
+		Address: "GAUD", Role: coverage.RoleAuditor, Name: "Acme", DisplayName: "Acme Inc.",
+		WebsiteURI: &websiteURI, ContactHash: &contactHash,
+	}}, nil
 }
 func (f *fake) Breakdown(_ context.Context, h string) ([]byte, error) {
 	if b, ok := f.bodies[h]; ok {
@@ -126,6 +130,13 @@ func (f *fake) Breakdown(_ context.Context, h string) ([]byte, error) {
 	}
 	return nil, store.ErrNotFound
 }
+func (f *fake) Progress(_ context.Context, name string) (store.Progress, error) {
+	if p, ok := f.progress[name]; ok {
+		return p, nil
+	}
+	return store.Progress{}, nil
+}
+
 func (f *fake) CreateCoverageWebhook(_ context.Context, w coverage.Webhook) (coverage.Webhook, error) {
 	w.ID = int64(len(f.created) + 1)
 	w.CreatedAt = now
@@ -147,18 +158,6 @@ func (f *fake) Attestation(_ context.Context, s string) (store.Attestation, erro
 	}
 	return store.Attestation{}, store.ErrNotFound
 }
-func (f *fake) Progress(_ context.Context, name string) (store.Progress, error) {
-	if p, ok := f.progress[name]; ok {
-		return p, nil
-	}
-	return store.Progress{
-		Cursor:        "c",
-		ScannedLedger: 42,
-		EventLedger:   40,
-		EventAt:       now.Add(-90 * time.Second),
-	}, nil
-}
-
 func TestHealthAggregatesContractStreamProgress(t *testing.T) {
 	f := &fake{
 		progress: map[string]store.Progress{
@@ -248,6 +247,13 @@ func newFake() *fake {
 			}},
 		},
 		bodies: map[string][]byte{breakdownHash: []byte(`{"total":"1"}`)},
+		progress: map[string]store.Progress{
+			store.LegacyIngestCursorName: {
+				ScannedLedger: 42,
+				EventLedger:   40,
+				EventAt:       now.Add(-90 * time.Second),
+			},
+		},
 		attestation: map[string]store.Attestation{
 			sac: {Hash: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", ChangedAt: &now},
 		},
@@ -318,21 +324,16 @@ func TestGetAssetCoverage(t *testing.T) {
 	srv := server()
 	defer srv.Close()
 	body := get(t, srv, "/v1/assets/"+sac, 200)
-	toml, ok := body["toml"].(map[string]any)
-	if !ok {
-		t.Fatalf("toml = %v, want the attestation object", body["toml"])
-	}
-	if got := toml["attestation_hash"]; got != "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" {
-		t.Errorf("attestation_hash = %v", got)
-	}
-	if got := toml["attestation_changed_at"]; got != "2026-10-05T12:00:00Z" {
-		t.Errorf("attestation_changed_at = %v", got)
-	}
 	for _, field := range []string{"toml_checked_at", "toml_error"} {
 		value, ok := body[field]
 		if !ok || value != nil {
 			t.Errorf("%s = %v (present: %t), want null", field, value, ok)
 		}
+	}
+	toml := body["toml"].(map[string]any)
+	if toml["attestation_hash"] != "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" ||
+		toml["attestation_changed_at"] != now.Format(time.RFC3339) {
+		t.Errorf("toml attestation = %+v", toml)
 	}
 	report := body["reports"].(map[string]any)["issuer_signed"].(map[string]any)
 	if value, ok := report["doc_check"]; !ok || value != nil {
@@ -491,7 +492,9 @@ func TestListAndMisc(t *testing.T) {
 	}
 	get(t, srv, "/v1/assets/CNOPE", 400)
 	rep := get(t, srv, "/v1/reporters", 200)
-	if rep["reporters"].([]any)[0].(map[string]any)["role"] != "auditor" {
+	reporter := rep["reporters"].([]any)[0].(map[string]any)
+	if reporter["role"] != "auditor" || reporter["display_name"] != "Acme Inc." ||
+		reporter["website_uri"] != "https://acme.example" || reporter["contact_hash"] != "sha256:contact" {
 		t.Fatal("role name missing")
 	}
 	h := get(t, srv, "/healthz", 200)
@@ -854,6 +857,34 @@ func makeExportRows(n int) []store.ReportExportRow {
 	return rows
 }
 
+// adminRequest sends a webhook-administration request and returns the status
+// and decoded body (nil for 204).
+func adminRequest(t *testing.T, srv *httptest.Server, method, path, token, body string) (int, map[string]any) {
+	t.Helper()
+	var r io.Reader
+	if body != "" {
+		r = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, srv.URL+path, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent {
+		return resp.StatusCode, nil
+	}
+	var out map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return resp.StatusCode, out
+}
+
 func TestWebhookAdminEndpoints(t *testing.T) {
 	srv := coverageServer("test-admin")
 	defer srv.Close()
@@ -967,6 +998,12 @@ func (unreadable) LatestSupplies(context.Context, []string) (map[string]*coverag
 	return nil, errUnreadable
 }
 func (unreadable) SupplyHistory(context.Context, string, int) ([]coverage.Supply, error) {
+	return nil, errUnreadable
+}
+func (unreadable) LatestReportsBySAC(context.Context, []string) (map[string]map[uint32]coverage.Report, error) {
+	return nil, errUnreadable
+}
+func (unreadable) LatestSupplies(context.Context, []string) (map[string]*coverage.Supply, error) {
 	return nil, errUnreadable
 }
 func (unreadable) LatestReportsBySAC(context.Context, []string) (map[string]map[uint32]coverage.Report, error) {

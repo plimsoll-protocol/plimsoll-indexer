@@ -18,7 +18,7 @@ func APIKeyMiddleware(validator APIKeyValidator, log *slog.Logger, next http.Han
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if validator == nil {
-			writeError(w, http.StatusServiceUnavailable, codeAPIAuthNotConfigured, "API key authentication is not configured")
+			writeError(w, http.StatusServiceUnavailable, codeAuthUnavailable, "API key authentication is not configured")
 			return
 		}
 		valid, err := validator.ValidateAPIKey(r.Context(), r.Header.Get("X-Api-Key"))

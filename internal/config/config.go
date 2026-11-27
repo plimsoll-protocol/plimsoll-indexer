@@ -56,38 +56,18 @@ type Config struct {
 	// supply against before signing it on chain. One Horizon is one point of
 	// trust for the only figure this indexer asserts itself. Empty disables the
 	// comparison.
-	HorizonCheckURL    string
-	NetworkPassphrase  string
-	CoverageLedgerID   string
-	ReporterRegistryID string
-	StartLedger        uint32
-	IngestWorkers      int
-	// SecretsProvider selects where PosterSecret and DatabasePassword come
-	// from: env (the plain environment variables), ssm (AWS Systems Manager
-	// Parameter Store) or gcp (GCP Secret Manager).
-	SecretsProvider string
-	// PosterSecretName is the SSM parameter or GCP secret that holds the
-	// poster secret. Empty leaves PosterSecret as read from the environment.
-	PosterSecretName string
-	// DatabasePasswordName is the SSM parameter or GCP secret that holds the
-	// database password. Empty keeps the password DATABASE_URL carries.
-	DatabasePasswordName string
-	// DatabasePassword is fetched by ResolveSecrets and overrides the password
-	// in DATABASE_URL. Never log it.
-	DatabasePassword string
-
-	PosterSecret string
-	// WebhookAdminToken protects webhook administration. It is shared by
-	// issuer TOML change subscriptions and coverage alerts.
-	WebhookAdminToken string
-	// WebhookAPIKeys are extra bearer tokens accepted for webhook
-	// administration. Each must be unique and non-empty.
-	WebhookAPIKeys []string
-	// WebhookEncryptionKey encrypts the per-subscription secrets of issuer
-	// TOML change webhooks at rest; WebhookSigningSecret keys the HMAC-SHA256
-	// signature on coverage alert deliveries. Each enables its own feature and
-	// needs WebhookAdminToken.
+	HorizonCheckURL      string
+	NetworkPassphrase    string
+	CoverageLedgerID     string
+	ReporterRegistryID   string
+	StartLedger          uint32
+	IngestWorkers        int
+	PosterSecret         string
+	WebhookAdminToken    string
+	WebhookAPIKeys       []string
 	WebhookEncryptionKey string
+	SlackWebhookURL      string
+	DiscordWebhookURL    string
 	WebhookSigningSecret string
 	// SlackWebhookURL and DiscordWebhookURL receive coverage drop alerts.
 	SlackWebhookURL   string
