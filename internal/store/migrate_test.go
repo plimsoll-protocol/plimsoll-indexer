@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -32,6 +33,23 @@ func TestLoadMigrations(t *testing.T) {
 	}
 }
 
+// TestLoadMigrationsAllowsVersionReuse pins the rule that a version number may
+// name more than one migration, ordered by description: releases merged on the
+// same day each added a 0005.
+func TestLoadMigrationsAllowsVersionReuse(t *testing.T) {
+	sql := &fstest.MapFile{Data: []byte("SELECT 1")}
+	ms, err := loadMigrations(fstest.MapFS{"0001_b.sql": sql, "0001_a.sql": sql})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ms) != 2 || ms[0].Name != "a" || ms[1].Name != "b" {
+		t.Fatalf("migrations = %+v", ms)
+	}
+	if ms[0].key() != "0001_a" || ms[1].key() != "0001_b" {
+		t.Fatalf("keys = %q, %q", ms[0].key(), ms[1].key())
+	}
+}
+
 func TestLoadMigrationsRejectsMistakes(t *testing.T) {
 	sql := &fstest.MapFile{Data: []byte("SELECT 1")}
 	for name, tc := range map[string]struct {
@@ -40,7 +58,6 @@ func TestLoadMigrationsRejectsMistakes(t *testing.T) {
 	}{
 		"gap":          {fstest.MapFS{"0001_a.sql": sql, "0003_c.sql": sql}, "migration 0002 is missing"},
 		"no first":     {fstest.MapFS{"0002_b.sql": sql}, "migration 0001 is missing"},
-		"duplicate":    {fstest.MapFS{"0001_a.sql": sql, "0001_b.sql": sql}, "two migrations have version 0001"},
 		"no number":    {fstest.MapFS{"initial.sql": sql}, `"initial.sql" is not named`},
 		"short number": {fstest.MapFS{"1_initial.sql": sql}, `"1_initial.sql" is not named`},
 		"not sql":      {fstest.MapFS{"0001_a.txt": sql}, `"0001_a.txt" is not named`},
@@ -107,6 +124,21 @@ func schemaOf(t *testing.T, url string) []string {
 	return out
 }
 
+// embeddedVersions is every migration version compiled into the binary, in
+// order: what a database is at once Open has run.
+func embeddedVersions(t *testing.T) []int {
+	t.Helper()
+	ms, err := loadMigrations(migrationsFS())
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := make([]int, len(ms))
+	for i, m := range ms {
+		out[i] = m.Version
+	}
+	return out
+}
+
 func appliedVersions(t *testing.T, url string) []int {
 	t.Helper()
 	ctx := context.Background()
@@ -151,8 +183,8 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 	if len(want) == 0 {
 		t.Fatal("fresh database has no schema")
 	}
-	if got := appliedVersions(t, fresh); len(got) != 5 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 || got[4] != 5 {
-		t.Fatalf("fresh database recorded %v, want [1 2 3 4 5]", got)
+	if got, want := appliedVersions(t, fresh), embeddedVersions(t); !slices.Equal(got, want) {
+		t.Fatalf("fresh database recorded %v, want %v", got, want)
 	}
 
 	for name, schema := range map[string]string{
@@ -165,6 +197,11 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 			execSQL(t, url, `INSERT INTO assets (sac, code, issuer, listed_ledger, listed_at, event_id)
 				VALUES ('CSAC', 'PUSD', 'GISS', 7, now(), 'ev-1')`)
 			execSQL(t, url, `INSERT INTO breakdowns (hash, sac, body) VALUES ('h1', 'CSAC', '{"total":"5"}')`)
+			// The snapshot that h1 backs, so the breakdown is confirmed and served
+			// after the upgrade (the breakdown_confirmation migration).
+			execSQL(t, url, `INSERT INTO supply_snapshots
+				(event_id, sac, amount, at_ledger, breakdown_hash, poster, posted_ledger, posted_at, tx_hash)
+				VALUES ('ev-h1', 'CSAC', 5, 7, 'h1', 'GPOSTER', 8, now(), 'tx-h1')`)
 
 			s, err := Open(context.Background(), url)
 			if err != nil {
@@ -175,8 +212,8 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 			if d := schemaDiff(want, schemaOf(t, url)); len(d) > 0 {
 				t.Fatalf("schema differs from a fresh database:\n%s", strings.Join(d, "\n"))
 			}
-			if got := appliedVersions(t, url); len(got) != 5 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 || got[4] != 5 {
-				t.Fatalf("recorded %v, want [1 2 3 4 5]", got)
+			if got, want := appliedVersions(t, url), embeddedVersions(t); !slices.Equal(got, want) {
+				t.Fatalf("recorded %v, want %v", got, want)
 			}
 			a, err := s.GetAsset(context.Background(), "CSAC")
 			if err != nil || a.Code != "PUSD" {
@@ -197,8 +234,8 @@ func TestReopeningAppliesNothingTwice(t *testing.T) {
 		t.Fatal(err)
 	}
 	s2.Close()
-	if got := appliedVersions(t, url); len(got) != 5 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 || got[4] != 5 {
-		t.Fatalf("recorded %v, want [1 2 3 4 5]", got)
+	if got, want := appliedVersions(t, url), embeddedVersions(t); !slices.Equal(got, want) {
+		t.Fatalf("recorded %v, want %v", got, want)
 	}
 }
 
@@ -230,8 +267,8 @@ func TestConcurrentStartsDoNotRace(t *testing.T) {
 	for err := range errs {
 		t.Errorf("concurrent open: %v", err)
 	}
-	if got := appliedVersions(t, url); len(got) != 5 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 || got[4] != 5 {
-		t.Fatalf("recorded %v, want [1 2 3 4 5]", got)
+	if got, want := appliedVersions(t, url), embeddedVersions(t); !slices.Equal(got, want) {
+		t.Fatalf("recorded %v, want %v", got, want)
 	}
 }
 

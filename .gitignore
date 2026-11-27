@@ -1,6 +1,8 @@
 .env
 .env.*
 !.env.example
+# Local overrides loaded automatically by the indexer; never commit.
+.env.local
 .devdb/
 .devdb-run.exe
 /bin/

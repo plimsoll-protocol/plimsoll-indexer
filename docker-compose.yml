@@ -39,6 +39,7 @@ services:
       # Leave empty for read-only (API + ingest + toml sync only).
       SUPPLY_POSTER_SECRET: ""
       INGEST_INTERVAL: 10s
+      INGEST_WORKERS: 2
       POST_INTERVAL: 15m
       REPOST_AFTER: 6h
       TOML_INTERVAL: 6h

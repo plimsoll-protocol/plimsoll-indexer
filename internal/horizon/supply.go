@@ -4,20 +4,40 @@ package horizon
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // ErrAssetNotFound means Horizon has no record of the asset (no trustlines yet).
 var ErrAssetNotFound = errors.New("asset not found on horizon")
+
+// Version is reported in the User-Agent sent to Horizon, so an operator seeing
+// this indexer in their logs can tell which build it is. Release builds set it
+// with -ldflags "-X .../internal/horizon.Version=v1.2.3".
+var Version = "dev"
+
+// Retry policy for GETs. Horizon is idempotent and public instances rate-limit,
+// so a 429 or a brief 5xx is worth another try; the attempt count, the per-wait
+// cap and the total budget bound how long one request may take.
+const (
+	maxAttempts   = 4
+	baseBackoff   = 200 * time.Millisecond
+	maxBackoff    = 5 * time.Second
+	retryBudget   = 20 * time.Second
+	maxBodyBytes  = 8 << 20 // 8 MiB
+	userAgentName = "plimsoll-indexer"
+)
 
 // Breakdown is the per-bucket supply. Its canonical JSON encoding is hashed
 // and the hash is posted on-chain with the total, so anyone can recompute it.
@@ -55,6 +75,10 @@ func (b Breakdown) TotalInt() *big.Int {
 type Client struct {
 	BaseURL string
 	HTTP    *http.Client
+
+	// sleep waits between retries; nil means a real timer that also watches
+	// ctx. It is a field so tests do not spend the backoff in wall time.
+	sleep func(context.Context, time.Duration) error
 }
 
 func NewClient(baseURL string) *Client {
@@ -201,22 +225,132 @@ func ParseAmount(s string) (*big.Int, error) {
 	return n, nil
 }
 
+// get performs an idempotent GET, retrying rate limits and server errors within
+// a bounded number of attempts and a bounded total time, and honouring
+// Retry-After when Horizon sends one. Client errors other than 429 are not
+// retried: repeating a request Horizon has rejected as wrong will not fix it.
 func (c *Client) get(ctx context.Context, path string, out any) error {
+	deadline := time.Now().Add(retryBudget)
+	for attempt := 1; ; attempt++ {
+		retryAfter, retryable, err := c.getOnce(ctx, path, out)
+		if err == nil {
+			return nil
+		}
+		if !retryable {
+			return err
+		}
+		if attempt == maxAttempts {
+			return fmt.Errorf("%s: giving up after %d attempts: %w", path, attempt, err)
+		}
+		wait := backoffDelay(attempt, retryAfter)
+		if time.Now().Add(wait).After(deadline) {
+			return fmt.Errorf("%s: retry budget of %s exhausted: %w", path, retryBudget, err)
+		}
+		if err := c.wait(ctx, wait); err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+	}
+}
+
+// getOnce makes one attempt. It reports whether the failure is worth retrying
+// and, if Horizon said so, how long to wait first.
+func (c *Client) getOnce(ctx context.Context, path string, out any) (retryAfter time.Duration, retryable bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+path, nil)
 	if err != nil {
-		return err
+		return 0, false, err
 	}
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", userAgentName+"/"+Version)
 	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return 0, false, err
+	}
+	defer resp.Body.Close()
+
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		return 0, false, decodeLimited(resp.Body, out)
+	case resp.StatusCode == http.StatusNotFound:
+		return 0, false, ErrAssetNotFound
+	case resp.StatusCode == http.StatusTooManyRequests, resp.StatusCode >= 500:
+		return parseRetryAfter(resp.Header, time.Now()), true,
+			fmt.Errorf("unexpected status %d", resp.StatusCode)
+	default:
+		return 0, false, fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+}
+
+// decodeLimited decodes a response body of at most maxBodyBytes. Horizon pages
+// are small; a body larger than that means the URL is wrong or the peer is not
+// Horizon, and reading it whole would let a bad endpoint decide this process's
+// memory use.
+func decodeLimited(body io.Reader, out any) error {
+	b, err := io.ReadAll(io.LimitReader(body, maxBodyBytes+1))
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return ErrAssetNotFound
+	if len(b) > maxBodyBytes {
+		return fmt.Errorf("response body exceeds %d bytes", maxBodyBytes)
 	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status %d", resp.StatusCode)
+	return json.Unmarshal(b, out)
+}
+
+// parseRetryAfter reads Horizon's Retry-After, in seconds or as an HTTP date.
+// A missing, malformed or past value yields zero, which falls back to backoff.
+func parseRetryAfter(hdr http.Header, now time.Time) time.Duration {
+	v := strings.TrimSpace(hdr.Get("Retry-After"))
+	if v == "" {
+		return 0
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := t.Sub(now); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+// backoffDelay returns how long to wait before the next attempt. A Retry-After
+// is honoured as sent: the caller gives up when it does not fit the retry
+// budget, rather than retrying early and being rate-limited again. Otherwise it
+// is capped exponential backoff with equal jitter, so instances that were
+// rate-limited together do not all come back at the same instant.
+func backoffDelay(attempt int, retryAfter time.Duration) time.Duration {
+	if retryAfter > 0 {
+		return retryAfter
+	}
+	d := baseBackoff
+	for i := 1; i < attempt && d < maxBackoff; i++ {
+		d *= 2
+	}
+	d = min(d, maxBackoff)
+	half := d / 2
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(half)+1))
+	if err != nil {
+		// Without a random source, back off by the fixed half instead of
+		// failing the request.
+		return half
+	}
+	return half + time.Duration(n.Int64())
+}
+
+// wait sleeps for d, returning early with ctx's error if the context ends.
+func (c *Client) wait(ctx context.Context, d time.Duration) error {
+	if c.sleep != nil {
+		return c.sleep(ctx, d)
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }

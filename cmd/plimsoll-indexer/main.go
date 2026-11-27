@@ -33,11 +33,14 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "verify" {
 		os.Exit(runVerifyCommand(os.Args[2:]))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "replay" {
+		os.Exit(runReplayCommand(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
 		os.Exit(runHealthcheck())
 	}
-	if len(os.Args) > 1 && os.Args[1] == "replay" {
-		os.Exit(runReplayCommand(os.Args[2:]))
+	if len(os.Args) > 1 && os.Args[1] == "keygen" {
+		os.Exit(runKeygenCommand(os.Args[2:]))
 	}
 
 	cfg, err := config.Load()
@@ -62,14 +65,24 @@ func run(cfg config.Config, log *slog.Logger) error {
 	}
 	defer db.Close()
 
-	rpc := rpcclient.NewClient(cfg.RPCURL, netclient.New(30*time.Second, cfg.HTTPKeepAlive))
+	// Every RPC call goes through the rate-limit transport, so a node that
+	// answers 429 backs the caller off, honouring Retry-After, instead of
+	// failing the tick and retrying on the next one. Underneath it the
+	// keep-alive transport keeps connections open across ties and negotiates
+	// HTTP/2, which the RPC endpoints and Horizon both support.
+	rpcHTTP := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: soroban.NewRateLimitTransport(
+			netclient.Transport(cfg.HTTPKeepAlive), log.With("component", "rpc")),
+	}
+	rpc := rpcclient.NewClient(cfg.RPCURL, rpcHTTP)
 	defer rpc.Close()
 	hz := horizon.NewClient(cfg.HorizonURL)
 	hz.HTTP = netclient.New(20*time.Second, cfg.HTTPKeepAlive)
 
 	var webhookCodec *webhook.SecretCodec
 	var webhookDispatcher *webhook.Dispatcher
-	if cfg.WebhookAdminToken != "" {
+	if cfg.WebhookEncryptionKey != "" {
 		webhookCodec, err = webhook.NewSecretCodec(cfg.WebhookEncryptionKey)
 		if err != nil {
 			return err
@@ -83,6 +96,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 		ContractIDs: []string{cfg.CoverageLedgerID, cfg.ReporterRegistryID},
 		RegistryID:  cfg.ReporterRegistryID,
 		StartLedger: cfg.StartLedger,
+		Workers:     cfg.IngestWorkers,
 		Log:         log.With("job", "ingest"),
 	}
 	// Ingest once before the other jobs start, so they see the listed assets.
@@ -126,15 +140,26 @@ func run(cfg config.Config, log *slog.Logger) error {
 	go every(ctx, cfg.ReconcileInterval, log.With("job", "reconcile"), reconciler.Run)
 
 	tomlSync := &worker.TomlSync{
-		Horizon:  hz,
-		Fetcher:  stellartoml.NewFetcher(),
-		Store:    db,
-		Webhooks: webhookDispatcher,
-		MaxAge:   cfg.TomlInterval,
-		Log:      log.With("job", "toml"),
+		Horizon:     hz,
+		Fetcher:     stellartoml.NewFetcher(),
+		Store:       db,
+		Webhooks:    webhookDispatcher,
+		Attestation: stellartoml.NewDocumentFetcher(),
+		MaxAge:      cfg.TomlInterval,
+		Log:         log.With("job", "toml"),
 	}
 	// Checks every minute; each asset is refreshed once per TOML_INTERVAL.
 	go every(ctx, time.Minute, log.With("job", "toml"), tomlSync.Run)
+
+	if cfg.WebhookSigningSecret != "" {
+		notifier := &worker.WebhookNotifier{
+			Store:  db,
+			Secret: cfg.WebhookSigningSecret,
+			Log:    log.With("job", "webhooks"),
+			Now:    time.Now,
+		}
+		go every(ctx, cfg.WebhookInterval, log.With("job", "webhooks"), notifier.Run)
+	}
 
 	if cfg.KeepAwakeURL != "" {
 		keepAwake := worker.NewKeepAwake(cfg.KeepAwakeURL)
@@ -201,6 +226,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 			Store:             db,
 			WebhookStore:      db,
 			WebhookAdminToken: cfg.WebhookAdminToken,
+			WebhookAPIKeys:    cfg.WebhookAPIKeys,
 			WebhookCodec:      webhookCodec,
 			Network: api.NetworkInfo{
 				NetworkPassphrase:  cfg.NetworkPassphrase,
@@ -209,12 +235,18 @@ func run(cfg config.Config, log *slog.Logger) error {
 				CoverageLedgerID:   cfg.CoverageLedgerID,
 				ReporterRegistryID: cfg.ReporterRegistryID,
 			},
-			CORS:      cfg.CORSOrigins,
-			Log:       log.With("component", "api"),
-			Now:       time.Now,
-			Changelog: changes,
+			CoverageWebhooks:     db,
+			WebhookSigningSecret: cfg.WebhookSigningSecret,
+			CORS:                 cfg.CORSOrigins,
+			Log:                  log.With("component", "api"),
+			Now:                  time.Now,
+			Changelog:            changes,
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second, // Bounds the time clients can spend sending request bodies.
+		WriteTimeout:      30 * time.Second, // Closes connections when clients stall while receiving responses.
+		IdleTimeout:       60 * time.Second, // Reclaims keep-alive connections that are left idle.
+		MaxHeaderBytes:    1 << 20,          // Caps request headers at 1 MiB to limit per-connection memory use.
 	}
 	go func() {
 		<-ctx.Done()

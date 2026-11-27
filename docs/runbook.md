@@ -40,10 +40,16 @@ values are reported together at startup.
 | `START_LEDGER` | `0` | First ledger to ingest. `0` or a ledger in the future means "latest"; older than RPC retention is clamped. |
 | `SUPPLY_POSTER_SECRET` | empty | Empty runs read-only. Never log or share it. |
 | `WEBHOOK_ADMIN_TOKEN` | empty | Enables authenticated webhook management when set with `WEBHOOK_ENCRYPTION_KEY`. |
+| `WEBHOOK_API_KEYS` | empty | Optional comma-separated owner API keys; each can delete only its own webhooks. |
 | `WEBHOOK_ENCRYPTION_KEY` | empty | Base64-encoded 32-byte key (`openssl rand -base64 32`); keep stable to preserve webhook delivery. |
+
+| `WEBHOOK_ADMIN_TOKEN` | empty | Enables authenticated webhook management for both the issuer TOML subscriptions and the coverage alerts. |
+| `WEBHOOK_ENCRYPTION_KEY` | empty | Base64-encoded 32-byte key (`openssl rand -base64 32`) for TOML subscription secrets; keep stable to preserve webhook delivery. |
+| `WEBHOOK_SIGNING_SECRET` | empty | HMAC-SHA256 key for coverage alert deliveries; needs `WEBHOOK_ADMIN_TOKEN`. |
 | `PORT` | `8080` | |
 | `CORS_ORIGINS` | `*` | Comma separated. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. Logs are JSON on stdout. |
+| `GO_ENV` | empty | `production` disables the local `.env.local` overlay. Set it on every deployed instance. |
 | `KEEP_AWAKE_URL` | derived | `none` disables; otherwise `$RENDER_EXTERNAL_URL/healthz` on Render. |
 | `REPORTER_INTERVAL` | `5s` | How often registry reporter events are polled on their own cursor, so a registration reaches `/v1/reporters` within about one ledger. |
 | `HTTP_KEEPALIVE_TIMEOUT` | `90s` | How long an idle HTTP/2 connection to Horizon or Soroban RPC is kept open for reuse. |
@@ -122,6 +128,7 @@ Logs are JSON (`log/slog`). Key messages:
 | warn | `supply not cross-checked: horizons are at different ledgers` | Ledger skew after a retry. Posting continues. Frequent occurrences mean the two Horizons lag each other. |
 | warn | `ingest cursor is older than RPC retention...` | Ingestion was down longer than RPC's ~7 days. Events in the gap are gone from RPC; the reconciler repairs the latest state. |
 | warn | `start ledger is outside RPC retention` | `START_LEDGER` is too old and was clamped. |
+| warn | `rpc node is rate limiting; backing off` (`attempt`, `wait`) | The RPC node answered `429 Too Many Requests`. The request is retried after `Retry-After` when the node sends it, otherwise after a delay that doubles per attempt. Frequent entries mean the node's limit is too low for the ingest interval. |
 | warn | `recovered a supply snapshot / reserve report from contract state...` | The reconciler filled a gap. Rows are marked `"source": "chain"` with no `tx_hash`. |
 | info | `supply posting disabled (SUPPLY_POSTER_SECRET not set)` | Expected on read-only instances. |
 | info | `supply cross-check disabled (HORIZON_CHECK_URL not set)` | The poster signs on one Horizon's word. |
@@ -156,15 +163,31 @@ the last snapshot's ledger). Check `job failed` entries with `job=poster`.
 anything and without moving the ingest cursor:
 
 ```bash
-plimsoll-indexer replay --from 5034380 --to 5035000
-plimsoll-indexer replay --from 5034380 --to 5035000 --dry-run
+plimsoll-indexer replay -from 5034380 -to 5035000
+plimsoll-indexer replay -from 5034380 -to 5035000 -dry-run
 ```
 
 Rows are keyed by event id, so running the same range twice produces the same
 state; reporter changes only apply when they are not older than what is
-stored. `--dry-run` needs no database and logs what would be upserted. Progress
-is logged every 1 000 ledgers, and the command exits 0 on success or 1 on a bad
-range or an RPC failure.
+stored. `-dry-run` needs no database and logs what would be upserted. Progress
+is logged every 1 000 ledgers, and the command exits 2 on a bad range, 1 on an
+RPC or database failure, and 0 on success.
+
+**Breakdown returns 404 for an on-chain hash.** The poster saves each
+breakdown before it posts it and serves it only once the post is confirmed: by
+the successful transaction, by ingesting its `supply_posted` event, or by
+reading the ledger's current snapshot back (the poster does this every tick).
+A breakdown whose post never landed is deleted after 24 hours
+(`DefaultBreakdownGrace`); the poster logs `deleted breakdowns whose post never
+reached the chain`. A 404 for a hash that is on chain therefore means the
+confirmation has not run yet (check `job failed` entries with `job=poster` and
+`job=ingest`) or the breakdown was never stored by this database.
+
+**After a decoder change.** Events the old decoder did not track are already
+in `raw_events`. Deploy the new binary, then run
+`plimsoll-indexer replay` against the same `DATABASE_URL` once: it prints how
+many raw events it decoded. It is idempotent and can run while the indexer is
+up.
 
 **Move to another network.** Set `NETWORK` (and `STELLAR_RPC_URL` for mainnet),
 the two contract ids and `START_LEDGER` for that deployment. Use a fresh
@@ -173,7 +196,8 @@ database: one database holds one network's history.
 **Database restore or loss.** The schema recreates itself. Ingestion restarts
 from `START_LEDGER` and is clamped to RPC retention; older events cannot be
 recovered from RPC, but the reconciler restores the latest supply and report
-state from the contracts. Breakdowns for old snapshots can be lost: they are
+state from the contracts. A backup that holds `raw_events` can rebuild the
+typed tables with `plimsoll-indexer replay`. Breakdowns for old snapshots can be lost: they are
 stored only in this database.
 
 ## Local network testing

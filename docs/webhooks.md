@@ -11,18 +11,24 @@ Set both values in the indexer's environment:
 
 ```bash
 WEBHOOK_ADMIN_TOKEN=<long-random-admin-token>
+WEBHOOK_API_KEYS=<owner-key-1>,<owner-key-2>
 WEBHOOK_ENCRYPTION_KEY=$(openssl rand -base64 32)
 ```
 
-Keep both values private. The encryption key must remain stable: it is used to
-decrypt signing secrets at delivery time. Losing or rotating it makes existing
-webhook secrets unusable. The database stores a SHA-256 hash and an
-AES-256-GCM-encrypted copy of each secret; it never stores the plaintext.
+`WEBHOOK_API_KEYS` is an optional comma-separated list of owner API keys. The
+administrator token can also create and delete webhooks it owns, and is required
+to list all destinations. Each API key can delete only webhooks registered with
+that same key. Keep all tokens private. The encryption key must remain stable:
+it is used to decrypt signing secrets at delivery time. Losing or rotating it
+makes existing webhook secrets unusable. The database stores SHA-256 hashes of
+owner API keys and signing secrets, plus an AES-256-GCM-encrypted copy of each
+signing secret; it never stores either key in plaintext.
 
 ## Register a destination
 
-Webhook management requires the administrator bearer token, which identifies
-the API key that owns the destinations. Register a destination over HTTPS:
+Register a destination over HTTPS with the administrator token or one of the
+configured owner API keys. The key that registers a destination owns it,
+recorded only as a SHA-256 fingerprint of the token, never the token itself:
 
 ```bash
 curl -X POST https://indexer.example/v1/webhooks \
@@ -35,7 +41,9 @@ The `201` response includes the generated `secret` once. Save it securely;
 later list requests omit it. Each destination has its own secret, so repeat the
 call for every receiver you want to add: a key may register up to **10**
 destinations. An attempt beyond that answers `422` with
-`{"code":"webhook_limit_reached"}`.
+`{"code":"webhook_limit_reached"}`. A valid key that does not own a webhook
+receives `403` from `DELETE /v1/webhooks/{id}`; missing, unknown and
+already-deleted IDs receive `404`.
 
 The key is stored only as a SHA-256 fingerprint, never as the token itself.
 `GET /v1/webhooks` therefore lists the destinations registered with the
@@ -71,7 +79,8 @@ Every attempt increments `deliveries`; a failed attempt also increments
 sets `last_status` to `delivered` and omits `last_error`. Events fan out to
 every registered destination, so one receiver failing does not stop the others;
 the failure is returned to the TOML sync job, which logs it and continues on its
-next tick.
+next tick. The indexer only accepts HTTPS destinations and disables HTTP
+redirects.
 
 ## Verify a delivery
 
@@ -111,3 +120,10 @@ An initial successful fetch establishes a baseline and does not produce a
 change event. A later successful fetch with a different hash is stored as a
 new issuer snapshot, logged as `issuer stellar.toml changed`, and delivered to
 each registered destination.
+## Coverage alerts
+
+This guide covers issuer TOML change subscriptions at `/v1/webhooks`. Coverage
+threshold alerts are a separate feature with their own routes
+(`/v1/coverage-webhooks`), table (`coverage_webhooks`) and shared signing secret
+(`WEBHOOK_SIGNING_SECRET`); see the "Coverage alerts" section of the
+[README](../README.md) for the request body, payload and signature header.

@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
 )
 
@@ -161,6 +162,40 @@ func testPool(t *testing.T, url string) *pgxpool.Pool {
 	return p
 }
 
+func TestAssetPaginationKeyset(t *testing.T) {
+	s, url := openStore(t)
+	ctx := context.Background()
+	at := time.Date(2026, 11, 25, 2, 0, 0, 0, time.UTC)
+	for i, asset := range []struct {
+		sac, code, issuer string
+	}{
+		{"C1", "PUSD", "G1"},
+		{"C2", "PUSD", "G2"},
+		{"C3", "USDX", "G3"},
+		{"C4", "USDX", "G4"},
+		{"C5", "USDX", "G5"},
+	} {
+		execSQL(t, url, `
+			INSERT INTO assets (sac, code, issuer, listed_ledger, listed_at, event_id)
+			VALUES ($1, $2, $3, $4, $5, $6)`,
+			asset.sac, asset.code, asset.issuer, i+1, at, fmt.Sprintf("listed-%d", i))
+	}
+
+	first, err := s.ListAssetsPage(ctx, 3, "", "")
+	if err != nil || len(first) != 3 ||
+		first[0].Code != "PUSD" || first[1].Issuer != "G2" || first[2].Issuer != "G3" {
+		t.Fatalf("first page = %+v, err=%v", first, err)
+	}
+	middle, err := s.ListAssetsPage(ctx, 3, first[2].Code, first[2].Issuer)
+	if err != nil || len(middle) != 2 || middle[0].Issuer != "G4" || middle[1].Issuer != "G5" {
+		t.Fatalf("middle page = %+v, err=%v", middle, err)
+	}
+	last, err := s.ListAssetsPage(ctx, 3, middle[1].Code, middle[1].Issuer)
+	if err != nil || len(last) != 0 {
+		t.Fatalf("last page = %+v, err=%v", last, err)
+	}
+}
+
 func TestIssuerTomlSnapshotsDetectChanges(t *testing.T) {
 	s, _ := openStore(t)
 	ctx := context.Background()
@@ -195,100 +230,132 @@ func TestIssuerTomlSnapshotsDetectChanges(t *testing.T) {
 func TestWebhookPersistence(t *testing.T) {
 	s, _ := openStore(t)
 	ctx := context.Background()
-	const key = "key-one"
 	ciphertext := []byte{1, 2, 3, 4}
-	created, err := s.CreateWebhook(ctx, key, "https://receiver.example/hook", "sha256-hash", ciphertext)
+	ownerKeyHash := "owner-key-hash"
+	created, err := s.CreateWebhook(ctx, "https://receiver.example/hook", "sha256-hash", ciphertext, ownerKeyHash)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if created.ID < 1 || created.APIKey != key || created.SecretHash != "sha256-hash" ||
+	if created.ID < 1 || created.SecretHash != "sha256-hash" || created.OwnerKeyHash != ownerKeyHash ||
 		!bytes.Equal(created.SecretCiphertext, ciphertext) {
 		t.Fatalf("created webhook = %+v", created)
 	}
 
-	list, err := s.ListWebhooksForKey(ctx, key)
-	if err != nil || len(list) != 1 || list[0].ID != created.ID ||
+	if err := s.DeleteWebhook(ctx, created.ID, "different-owner", false); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("delete webhook as non-owner: err=%v, want ErrForbidden", err)
+	}
+	if err := s.DeleteWebhook(ctx, created.ID, ownerKeyHash, false); err != nil {
+		t.Fatalf("delete webhook as owner: %v", err)
+	}
+	if err := s.DeleteWebhook(ctx, created.ID, ownerKeyHash, false); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("delete missing webhook: err=%v, want ErrNotFound", err)
+	}
+
+	list, err := s.ListWebhooks(ctx)
+	if err != nil || len(list) != 0 {
+		t.Fatalf("listed webhooks after delete = %+v, %v", list, err)
+	}
+	if _, err := s.CreateWebhook(ctx, "https://receiver.example/hook", "sha256-hash", ciphertext, ownerKeyHash); err != nil {
+		t.Fatal(err)
+	}
+	list, err = s.ListWebhooks(ctx)
+	if err != nil || len(list) != 1 ||
 		list[0].URL != created.URL || list[0].SecretHash != created.SecretHash ||
 		!bytes.Equal(list[0].SecretCiphertext, ciphertext) {
 		t.Fatalf("listed webhooks = %+v, %v", list, err)
 	}
-	// Another key sees only its own endpoints.
-	if other, err := s.ListWebhooksForKey(ctx, "key-two"); err != nil || len(other) != 0 {
-		t.Fatalf("another key listed %+v, %v", other, err)
-	}
-	// The dispatcher still sees every endpoint.
-	if all, err := s.ListWebhooks(ctx); err != nil || len(all) != 1 {
-		t.Fatalf("all webhooks = %+v, %v", all, err)
-	}
 
-	deleted, err := s.DeleteWebhook(ctx, "key-two", created.ID)
-	if err != nil || deleted {
-		t.Fatalf("another key deleted the endpoint: deleted=%v err=%v", deleted, err)
-	}
-	deleted, err = s.DeleteWebhook(ctx, key, created.ID)
-	if err != nil || !deleted {
-		t.Fatalf("delete webhook: deleted=%v err=%v", deleted, err)
-	}
-	deleted, err = s.DeleteWebhook(ctx, key, created.ID)
-	if err != nil || deleted {
-		t.Fatalf("delete missing webhook: deleted=%v err=%v", deleted, err)
-	}
-}
-
-func TestWebhookLimitAndDeliveryTracking(t *testing.T) {
-	s, _ := openStore(t)
-	ctx := context.Background()
-	const key = "key-limit"
-	ciphertext := []byte{1, 2, 3, 4}
-
-	var first Webhook
-	for i := range MaxWebhooksPerKey {
-		created, err := s.CreateWebhook(ctx, key, fmt.Sprintf("https://receiver.example/%d", i), "hash", ciphertext)
-		if err != nil {
-			t.Fatalf("create endpoint %d: %v", i, err)
-		}
-		if i == 0 {
-			first = created
-		}
-	}
-	_, err := s.CreateWebhook(ctx, key, "https://receiver.example/over-limit", "hash", ciphertext)
-	if !errors.Is(err, ErrWebhookLimit) {
-		t.Fatalf("over-limit create error = %v, want ErrWebhookLimit", err)
-	}
-	// The limit is per key, so another key can still register.
-	if _, err := s.CreateWebhook(ctx, "key-other", "https://receiver.example/other", "hash", ciphertext); err != nil {
-		t.Fatalf("another key could not register: %v", err)
-	}
-
-	at := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
-	if err := s.RecordWebhookDelivery(ctx, first.ID, at, ""); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.RecordWebhookDelivery(ctx, first.ID, at.Add(time.Minute), "webhook returned status 500"); err != nil {
-		t.Fatal(err)
-	}
-
-	list, err := s.ListWebhooksForKey(ctx, key)
+	var legacyID int64
+	err = s.pool.QueryRow(ctx, `
+		INSERT INTO webhooks (url, secret_hash, secret_ciphertext)
+		VALUES ('https://legacy.example/hook', 'legacy-hash', $1)
+		RETURNING id`, ciphertext).Scan(&legacyID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got *Webhook
-	for i := range list {
-		if list[i].ID == first.ID {
-			got = &list[i]
+	if err := s.DeleteWebhook(ctx, legacyID, "owner-key-hash", false); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("delete legacy webhook as owner key: err=%v, want ErrForbidden", err)
+	}
+	if err := s.DeleteWebhook(ctx, legacyID, "admin-key-hash", true); err != nil {
+		t.Fatalf("delete legacy webhook as admin: %v", err)
+	}
+}
+
+// TestWebhookPerKeyLimitAndDeliveryCounters covers the multi-endpoint rules:
+// one key holds at most MaxWebhooksPerKey endpoints, each key sees only its
+// own, and every delivery attempt is counted against the endpoint it went to.
+func TestWebhookPerKeyLimitAndDeliveryCounters(t *testing.T) {
+	s, _ := openStore(t)
+	ctx := context.Background()
+	ciphertext := []byte{1, 2, 3, 4}
+
+	var created Webhook
+	for i := range MaxWebhooksPerKey {
+		w, err := s.CreateWebhook(ctx, fmt.Sprintf("https://receiver.example/%d", i), "hash", ciphertext, "key-one")
+		if err != nil {
+			t.Fatalf("create endpoint %d: %v", i, err)
+		}
+		created = w
+	}
+	if _, err := s.CreateWebhook(ctx, "https://receiver.example/over", "hash", ciphertext, "key-one"); !errors.Is(err, ErrWebhookLimit) {
+		t.Fatalf("create past the limit: err=%v, want ErrWebhookLimit", err)
+	}
+	// The limit is per key: another key starts with its own quota.
+	if _, err := s.CreateWebhook(ctx, "https://receiver.example/other", "hash", ciphertext, "key-two"); err != nil {
+		t.Fatalf("create for a second key: %v", err)
+	}
+
+	mine, err := s.ListWebhooksForKey(ctx, "key-one")
+	if err != nil || len(mine) != MaxWebhooksPerKey {
+		t.Fatalf("key-one lists %d endpoints (%v), want %d", len(mine), err, MaxWebhooksPerKey)
+	}
+	theirs, err := s.ListWebhooksForKey(ctx, "key-two")
+	if err != nil || len(theirs) != 1 || theirs[0].OwnerKeyHash != "key-two" {
+		t.Fatalf("key-two lists %+v (%v), want only its own endpoint", theirs, err)
+	}
+	// The dispatcher still sees every endpoint.
+	if all, err := s.ListWebhooks(ctx); err != nil || len(all) != MaxWebhooksPerKey+1 {
+		t.Fatalf("all endpoints = %d (%v), want %d", len(all), err, MaxWebhooksPerKey+1)
+	}
+
+	at := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	if err := s.RecordWebhookDelivery(ctx, created.ID, at, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordWebhookDelivery(ctx, created.ID, at.Add(time.Minute), "webhook returned status 500"); err != nil {
+		t.Fatal(err)
+	}
+	mine, err = s.ListWebhooksForKey(ctx, "key-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Webhook
+	for _, w := range mine {
+		if w.ID == created.ID {
+			got = w
 		}
 	}
-	if got == nil {
-		t.Fatalf("endpoint %d missing from %+v", first.ID, list)
+	failedAt := at.Add(time.Minute)
+	if got.Deliveries != 2 || got.Failures != 1 || got.LastDeliveryStatus != "failed" ||
+		got.LastDeliveryError != "webhook returned status 500" ||
+		got.LastDeliveryAt == nil || !got.LastDeliveryAt.Equal(failedAt) {
+		t.Fatalf("delivery state = %+v, want two attempts and one failure", got)
 	}
-	if got.Deliveries != 2 || got.Failures != 1 {
-		t.Errorf("deliveries=%d failures=%d, want 2 and 1", got.Deliveries, got.Failures)
+	// A later success updates the status and clears the error, not the counts.
+	if err := s.RecordWebhookDelivery(ctx, created.ID, at.Add(2*time.Minute), ""); err != nil {
+		t.Fatal(err)
 	}
-	if got.LastDeliveryStatus != "failed" || got.LastDeliveryError != "webhook returned status 500" {
-		t.Errorf("last delivery = %q %q", got.LastDeliveryStatus, got.LastDeliveryError)
+	mine, err = s.ListWebhooksForKey(ctx, "key-one")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got.LastDeliveryAt == nil || !got.LastDeliveryAt.Equal(at.Add(time.Minute)) {
-		t.Errorf("last delivery at = %v, want %v", got.LastDeliveryAt, at.Add(time.Minute))
+	for _, w := range mine {
+		if w.ID == created.ID {
+			got = w
+		}
+	}
+	if got.Deliveries != 3 || got.Failures != 1 || got.LastDeliveryStatus != "delivered" || got.LastDeliveryError != "" {
+		t.Fatalf("delivery state after success = %+v", got)
 	}
 }
 
@@ -316,7 +383,7 @@ func TestApplyEventsIsIdempotentAcrossReconnect(t *testing.T) {
 		DocURI:   "https://example.com/report",
 	}
 
-	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-1", 101, []any{supply, reserve}); err != nil {
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-1", 101, nil, []any{supply, reserve}); err != nil {
 		t.Fatalf("apply first page: %v", err)
 	}
 	// A reconnect can return the tail of the first page again alongside new data.
@@ -327,7 +394,7 @@ func TestApplyEventsIsIdempotentAcrossReconnect(t *testing.T) {
 	nextReserve.ID = "reserve-event-2"
 	nextReserve.Ledger = 102
 	nextReserve.AsOf = at.Add(time.Minute)
-	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-2", 102,
+	if err := s.ApplyEvents(ctx, "plimsoll-events", "cursor-2", 102, nil,
 		[]any{supply, reserve, nextSupply, nextReserve}); err != nil {
 		t.Fatalf("apply replayed page: %v", err)
 	}
@@ -397,5 +464,69 @@ func TestEventIDMigrationRepairsLegacyTables(t *testing.T) {
 	}
 	if constraints != 2 {
 		t.Fatalf("created %d event ID constraints, want 2", constraints)
+	}
+}
+
+func TestLatestSuppliesAndReportsBySAC(t *testing.T) {
+	s, _ := openStore(t)
+	ctx := context.Background()
+	at := time.Date(2026, 11, 25, 1, 0, 0, 0, time.UTC)
+
+	for _, supply := range []coverage.Supply{
+		{Amount: big.NewInt(100), Ledger: 10, PostedAt: at, BreakdownHash: "old", Poster: "G1"},
+		{Amount: big.NewInt(200), Ledger: 20, PostedAt: at.Add(time.Hour), BreakdownHash: "new", Poster: "G1"},
+	} {
+		if _, err := s.SaveChainSupply(ctx, "CSAC1", supply); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.SaveChainSupply(ctx, "CSAC2", coverage.Supply{
+		Amount: big.NewInt(300), Ledger: 30, PostedAt: at, BreakdownHash: "two", Poster: "G2",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	reports := []coverage.Report{
+		{Tier: coverage.TierIssuerSigned, Amount: big.NewInt(110), AsOf: at, PostedAt: at, Reporter: "G1", DocURI: "old"},
+		{Tier: coverage.TierIssuerSigned, Amount: big.NewInt(210), AsOf: at.Add(time.Hour), PostedAt: at.Add(time.Hour), Reporter: "G1", DocURI: "new"},
+		{Tier: coverage.TierAuditorSigned, Amount: big.NewInt(220), AsOf: at, PostedAt: at, Reporter: "G2", DocURI: "audit"},
+	}
+	for _, report := range reports {
+		if _, err := s.SaveChainReport(ctx, "CSAC1", report); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.SaveChainReport(ctx, "CSAC2", coverage.Report{
+		Tier: coverage.TierTranscribed, Amount: big.NewInt(290), AsOf: at, PostedAt: at, Reporter: "G3", DocURI: "two",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	supplies, err := s.LatestSupplies(ctx, []string{"CSAC1", "CSAC2", "CSAC3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if supplies["CSAC1"] == nil || supplies["CSAC1"].Ledger != 20 || supplies["CSAC1"].Amount.String() != "200" {
+		t.Fatalf("CSAC1 supply = %+v", supplies["CSAC1"])
+	}
+	if supplies["CSAC2"] == nil || supplies["CSAC2"].Ledger != 30 {
+		t.Fatalf("CSAC2 supply = %+v", supplies["CSAC2"])
+	}
+	if supplies["CSAC3"] != nil {
+		t.Fatalf("missing CSAC3 supply should be nil: %+v", supplies["CSAC3"])
+	}
+
+	bySAC, err := s.LatestReportsBySAC(ctx, []string{"CSAC1", "CSAC2", "CSAC3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bySAC["CSAC1"]) != 2 {
+		t.Fatalf("CSAC1 reports = %+v", bySAC["CSAC1"])
+	}
+	if got := bySAC["CSAC1"][coverage.TierIssuerSigned].Amount.String(); got != "210" {
+		t.Fatalf("latest issuer_signed amount = %q, want 210", got)
+	}
+	if len(bySAC["CSAC2"]) != 1 {
+		t.Fatalf("CSAC2 reports = %+v", bySAC["CSAC2"])
 	}
 }

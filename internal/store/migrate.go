@@ -19,6 +19,10 @@ import (
 // migration a database has not recorded yet, in version order, and records
 // each one in schema_migrations. A merged migration is never edited: a later
 // schema change is a new file.
+//
+// A version is not unique: releases that were merged on the same day each
+// added a file numbered 0005 (and 0003), so the recorded key is the version
+// and the description together, ordered by version and then by description.
 
 //go:embed migrations/*.sql
 var embeddedMigrations embed.FS
@@ -33,6 +37,11 @@ type migration struct {
 	Version int
 	Name    string
 	SQL     string
+}
+
+// key is how a migration is recorded: its version alone does not identify it.
+func (m migration) key() string {
+	return fmt.Sprintf("%04d_%s", m.Version, m.Name)
 }
 
 // loadMigrations reads the migration files at the root of fsys and returns
@@ -62,13 +71,18 @@ func loadMigrations(fsys fs.FS) ([]migration, error) {
 		}
 		out = append(out, migration{Version: version, Name: m[2], SQL: string(body)})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Version < out[j].Version })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Version != out[j].Version {
+			return out[i].Version < out[j].Version
+		}
+		return out[i].Name < out[j].Name
+	})
+	// Versions run from 0001 with no gap, but several migrations may share a
+	// version, so the check is that every version is present, not that the
+	// nth file has version n.
 	for i, m := range out {
-		if m.Version != i+1 {
-			if i > 0 && m.Version == out[i-1].Version {
-				return nil, fmt.Errorf("two migrations have version %04d", m.Version)
-			}
-			return nil, fmt.Errorf("migration %04d is missing", i+1)
+		if want := i + 1; m.Version > want {
+			return nil, fmt.Errorf("migration %04d is missing", want)
 		}
 	}
 	return out, nil
@@ -105,18 +119,30 @@ func migrate(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS) error {
 		return fmt.Errorf("create schema_migrations: %w", err)
 	}
 
-	applied := map[int]bool{}
-	rows, err := tx.Query(ctx, `SELECT version FROM schema_migrations`)
+	// Databases migrated before versions stopped being unique have a primary
+	// key on version alone; widen it in place so each file is recorded once.
+	// Rows written earlier already carry both columns, so the key still
+	// matches what they recorded.
+	if _, err := tx.Exec(ctx, `ALTER TABLE schema_migrations DROP CONSTRAINT IF EXISTS schema_migrations_pkey`); err != nil {
+		return fmt.Errorf("widen schema_migrations: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `ALTER TABLE schema_migrations ADD CONSTRAINT schema_migrations_pkey PRIMARY KEY (version, name)`); err != nil {
+		return fmt.Errorf("widen schema_migrations: %w", err)
+	}
+
+	applied := map[string]bool{}
+	rows, err := tx.Query(ctx, `SELECT version, name FROM schema_migrations`)
 	if err != nil {
 		return fmt.Errorf("read schema_migrations: %w", err)
 	}
 	for rows.Next() {
 		var v int
-		if err := rows.Scan(&v); err != nil {
+		var name string
+		if err := rows.Scan(&v, &name); err != nil {
 			rows.Close()
 			return fmt.Errorf("read schema_migrations: %w", err)
 		}
-		applied[v] = true
+		applied[migration{Version: v, Name: name}.key()] = true
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -124,7 +150,7 @@ func migrate(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS) error {
 	}
 
 	for _, m := range migrations {
-		if applied[m.Version] {
+		if applied[m.key()] {
 			continue
 		}
 		if _, err := tx.Exec(ctx, m.SQL); err != nil {
