@@ -1240,6 +1240,41 @@ func (s *Store) Disputes(ctx context.Context, sac, status string, limit, offset 
 		out = append(out, d)
 	}
 	return out, rows.Err()
+// ---- aggregate stats -------------------------------------------------------
+
+// Stats is the summary served at /v1/stats.
+type Stats struct {
+	TotalAssets     int64
+	CoveredAssets   int64
+	TotalReporters  int64
+	ActiveReporters int64
+	ReportsToday    int64
+	// LastEventAt is when the last contract event was written; nil before the
+	// first one lands.
+	LastEventAt *time.Time
+}
+
+// Stats reads every aggregate in one round trip. An asset counts as covered
+// when coverage.Compute would return a result for it, i.e. it has a supply
+// snapshot and at least one reserve report.
+func (s *Store) Stats(ctx context.Context, dayStart time.Time) (Stats, error) {
+	var out Stats
+	err := s.pool.QueryRow(ctx, `
+		SELECT
+		    (SELECT count(*) FROM assets),
+		    (SELECT count(*) FROM assets a
+		     WHERE EXISTS (SELECT 1 FROM supply_snapshots sp WHERE sp.sac = a.sac)
+		       AND EXISTS (SELECT 1 FROM reserve_reports rr WHERE rr.sac = a.sac)),
+		    (SELECT count(*) FROM reporters),
+		    (SELECT count(*) FROM reporters WHERE active),
+		    (SELECT count(*) FROM reserve_reports WHERE posted_at >= $1),
+		    (SELECT max(event_at) FROM ingest_cursor)`, dayStart,
+	).Scan(&out.TotalAssets, &out.CoveredAssets, &out.TotalReporters,
+		&out.ActiveReporters, &out.ReportsToday, &out.LastEventAt)
+	if err != nil {
+		return Stats{}, fmt.Errorf("read stats: %w", err)
+	}
+	return out, nil
 }
 
 // ---- breakdowns and toml --------------------------------------------------

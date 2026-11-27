@@ -636,6 +636,26 @@ components:
           description: Missing or invalid administrator token
         '404':
           description: Webhook not found
+  /v1/stats:
+    get:
+      summary: Aggregate indexer statistics
+      description: >-
+        Counts across the indexed set. The response is cached in memory for up
+        to 60 seconds, so values may lag the database by that much.
+      operationId: getStats
+      responses:
+        '200':
+          description: Aggregate statistics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Stats'
+        '500':
+          description: Statistics could not be read
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/breakdowns/{hash}:
     get:
       summary: Get raw supply breakdown by hash
@@ -1127,9 +1147,11 @@ components:
         - opened_ledger
         - opened_at
     Webhook:
+    Stats:
       type: object
+      description: Aggregate counts over the indexed data.
       properties:
-        id:
+        totalAssets:
           type: integer
         url:
           type: string
@@ -1212,6 +1234,45 @@ components:
           type: string
           format: date-time
       required: [id, payload, last_error, attempts, failed_at]
+          format: int64
+          description: Assets listed on the coverage ledger.
+          example: 12
+        coveredAssets:
+          type: integer
+          format: int64
+          description: >-
+            Assets with a supply snapshot and at least one reserve report, so
+            coverage can be computed for them.
+          example: 9
+        totalReporters:
+          type: integer
+          format: int64
+          description: Reporters ever registered, revoked ones included.
+          example: 5
+        activeReporters:
+          type: integer
+          format: int64
+          description: Reporters currently holding a role.
+          example: 3
+        reportsToday:
+          type: integer
+          format: int64
+          description: Reserve reports posted since 00:00 UTC today.
+          example: 7
+        ingestLagSeconds:
+          type: integer
+          format: int64
+          description: >-
+            Seconds since the last contract event was written; 0 when no event
+            has been ingested yet or the last event is dated in the future.
+          example: 42
+      required:
+        - totalAssets
+        - coveredAssets
+        - totalReporters
+        - activeReporters
+        - reportsToday
+        - ingestLagSeconds
     ErrorResponse:
       type: object
       description: |
