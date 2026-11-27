@@ -81,6 +81,11 @@ type WebhookDLQ struct {
 	FailedAt  time.Time
 }
 
+type CoverageData struct {
+	Supply  *coverage.Supply
+	Reports map[uint32]coverage.Report
+}
+
 // Open connects to the database and brings its schema up to date by applying
 // any pending migrations (see migrate.go).
 func Open(ctx context.Context, url string) (*Store, error) {
@@ -917,6 +922,106 @@ func (s *Store) LatestReporterReports(ctx context.Context) ([]ReporterLatestRepo
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate latest reporter reports: %w", err)
+// BatchCoverage returns the latest supply and reserve reports for each SAC
+// using one query.
+func (s *Store) BatchCoverage(ctx context.Context, sacs []string) (map[string]CoverageData, error) {
+	out := make(map[string]CoverageData, len(sacs))
+	for _, sac := range sacs {
+		if _, ok := out[sac]; !ok {
+			out[sac] = CoverageData{Reports: make(map[uint32]coverage.Report)}
+		}
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		WITH requested AS (
+			SELECT sac, ord
+			FROM unnest($1::text[]) WITH ORDINALITY AS input(sac, ord)
+		),
+		latest_supply AS (
+			SELECT DISTINCT ON (sac) sac, amount::text AS amount, at_ledger, posted_at,
+			       breakdown_hash, poster, tx_hash, source
+			FROM supply_snapshots
+			WHERE sac = ANY($1::text[])
+			ORDER BY sac, at_ledger DESC
+		),
+		latest_reports AS (
+			SELECT DISTINCT ON (sac, tier) sac, tier, amount::text AS amount, as_of,
+			       posted_at, reporter, doc_hash, doc_uri, tx_hash, source,
+			       COALESCE(doc_check, '') AS doc_check
+			FROM reserve_reports
+			WHERE sac = ANY($1::text[])
+			ORDER BY sac, tier, as_of DESC
+		)
+		SELECT requested.sac,
+		       COALESCE(latest_supply.amount, ''),
+		       COALESCE(latest_supply.at_ledger, 0),
+		       COALESCE(latest_supply.posted_at, 'epoch'::timestamptz),
+		       COALESCE(latest_supply.breakdown_hash, ''),
+		       COALESCE(latest_supply.poster, ''),
+		       COALESCE(latest_supply.tx_hash, ''),
+		       COALESCE(latest_supply.source, ''),
+		       COALESCE(latest_reports.tier, 0),
+		       COALESCE(latest_reports.amount, ''),
+		       COALESCE(latest_reports.as_of, 'epoch'::timestamptz),
+		       COALESCE(latest_reports.posted_at, 'epoch'::timestamptz),
+		       COALESCE(latest_reports.reporter, ''),
+		       COALESCE(latest_reports.doc_hash, ''),
+		       COALESCE(latest_reports.doc_uri, ''),
+		       COALESCE(latest_reports.tx_hash, ''),
+		       COALESCE(latest_reports.source, ''),
+		       COALESCE(latest_reports.doc_check, '')
+		FROM requested
+		LEFT JOIN latest_supply USING (sac)
+		LEFT JOIN latest_reports USING (sac)
+		ORDER BY requested.ord, latest_reports.tier`, sacs)
+	if err != nil {
+		return nil, fmt.Errorf("query batch coverage: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sac, supplyAmount, breakdownHash, poster, supplyTxHash, supplySource string
+		var supplyLedger int64
+		var supplyPostedAt time.Time
+		var tier int16
+		var reportAmount, reporter, docHash, docURI, reportTxHash, reportSource, docCheck string
+		var reportAsOf, reportPostedAt time.Time
+		if err := rows.Scan(
+			&sac, &supplyAmount, &supplyLedger, &supplyPostedAt, &breakdownHash, &poster, &supplyTxHash, &supplySource,
+			&tier, &reportAmount, &reportAsOf, &reportPostedAt, &reporter, &docHash, &docURI, &reportTxHash, &reportSource, &docCheck,
+		); err != nil {
+			return nil, fmt.Errorf("scan batch coverage: %w", err)
+		}
+
+		data := out[sac]
+		if supplyAmount != "" {
+			data.Supply = &coverage.Supply{
+				Amount:        mustBig(supplyAmount),
+				Ledger:        uint32(supplyLedger),
+				PostedAt:      supplyPostedAt,
+				BreakdownHash: breakdownHash,
+				Poster:        poster,
+				TxHash:        supplyTxHash,
+				Source:        supplySource,
+			}
+		}
+		if tier != 0 {
+			data.Reports[uint32(tier)] = coverage.Report{
+				Tier:     uint32(tier),
+				Amount:   mustBig(reportAmount),
+				AsOf:     reportAsOf,
+				PostedAt: reportPostedAt,
+				Reporter: reporter,
+				DocHash:  docHash,
+				DocURI:   docURI,
+				TxHash:   reportTxHash,
+				Source:   reportSource,
+				DocCheck: docCheck,
+			}
+		}
+		out[sac] = data
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate batch coverage: %w", err)
 	}
 	return out, nil
 }

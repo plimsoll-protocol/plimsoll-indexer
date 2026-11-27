@@ -139,6 +139,40 @@ func portOf(url string) string {
 	return fmt.Sprint(cfg.Port)
 }
 
+func TestBatchCoverage(t *testing.T) {
+	s, url := openStore(t)
+	ctx := context.Background()
+	execSQL(t, url, `
+		INSERT INTO supply_snapshots
+			(event_id, sac, amount, at_ledger, breakdown_hash, poster, posted_ledger, posted_at, tx_hash)
+		VALUES
+			('supply-old', 'sac-a', 900, 90, 'old', 'poster', 90, '2026-10-01T00:00:00Z', 'tx-old'),
+			('supply-new', 'sac-a', 1000, 100, 'new', 'poster', 100, '2026-10-02T00:00:00Z', 'tx-new')`)
+	execSQL(t, url, `
+		INSERT INTO reserve_reports
+			(event_id, sac, tier, amount, as_of, reporter, doc_hash, doc_uri, posted_ledger, posted_at, tx_hash)
+		VALUES
+			('report-old', 'sac-a', 2, 950, '2026-10-01T00:00:00Z', 'reporter', 'hash', 'uri', 90, '2026-10-01T00:00:00Z', 'tx-old'),
+			('report-new', 'sac-a', 2, 1100, '2026-10-02T00:00:00Z', 'reporter', 'hash', 'uri', 100, '2026-10-02T00:00:00Z', 'tx-new'),
+			('report-tier3', 'sac-a', 3, 1050, '2026-10-01T12:00:00Z', 'auditor', 'hash', 'uri', 95, '2026-10-01T12:00:00Z', 'tx-tier3')`)
+
+	got, err := s.BatchCoverage(ctx, []string{"sac-a", "sac-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := got["sac-a"]
+	if a.Supply == nil || a.Supply.Amount.String() != "1000" || a.Supply.Ledger != 100 {
+		t.Fatalf("latest supply = %+v", a.Supply)
+	}
+	if len(a.Reports) != 2 || a.Reports[2].Amount.String() != "1100" || a.Reports[3].Amount.String() != "1050" {
+		t.Fatalf("latest reports = %+v", a.Reports)
+	}
+	b := got["sac-b"]
+	if b.Supply != nil || len(b.Reports) != 0 {
+		t.Fatalf("missing asset data = %+v", b)
+	}
+}
+
 // execSQL runs statements on the database at url outside any Store.
 func execSQL(t *testing.T, url, sql string, args ...any) {
 	t.Helper()
