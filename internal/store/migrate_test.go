@@ -225,6 +225,8 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 		t.Fatalf("fresh database recorded %v, want [1 2 3 4]", got)
 	if got := appliedVersions(t, fresh); len(got) != 6 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 || got[4] != 5 || got[5] != 6 {
 		t.Fatalf("fresh database recorded %v, want [1 2 3 4 5 6]", got)
+	if got := appliedVersions(t, fresh); len(got) != 5 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 || got[4] != 5 {
+		t.Fatalf("fresh database recorded %v, want [1 2 3 4 5]", got)
 	}
 
 	for name, schema := range map[string]string{
@@ -264,6 +266,8 @@ func TestFreshAndExistingDatabasesEndAtTheSameSchema(t *testing.T) {
 				t.Fatalf("recorded %v, want [1 2 3 4]", got)
 			if got := appliedVersions(t, url); len(got) != 6 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 || got[4] != 5 || got[5] != 6 {
 				t.Fatalf("recorded %v, want [1 2 3 4 5 6]", got)
+			if got := appliedVersions(t, url); len(got) != 5 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 || got[4] != 5 {
+				t.Fatalf("recorded %v, want [1 2 3 4 5]", got)
 			}
 			a, err := s.GetAsset(context.Background(), "CSAC")
 			if err != nil || a.Code != "PUSD" {
@@ -299,6 +303,8 @@ func TestReopeningAppliesNothingTwice(t *testing.T) {
 		t.Fatalf("recorded %v, want [1 2 3 4]", got)
 	if got := appliedVersions(t, url); len(got) != 6 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 || got[4] != 5 || got[5] != 6 {
 		t.Fatalf("recorded %v, want [1 2 3 4 5 6]", got)
+	if got := appliedVersions(t, url); len(got) != 5 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 || got[4] != 5 {
+		t.Fatalf("recorded %v, want [1 2 3 4 5]", got)
 	}
 }
 
@@ -341,6 +347,8 @@ func TestConcurrentStartsDoNotRace(t *testing.T) {
 		t.Fatalf("recorded %v, want [1 2 3 4]", got)
 	if got := appliedVersions(t, url); len(got) != 6 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 || got[4] != 5 || got[5] != 6 {
 		t.Fatalf("recorded %v, want [1 2 3 4 5 6]", got)
+	if got := appliedVersions(t, url); len(got) != 5 || got[0] != 1 || got[1] != 2 || got[2] != 3 || got[3] != 4 || got[4] != 5 {
+		t.Fatalf("recorded %v, want [1 2 3 4 5]", got)
 	}
 }
 

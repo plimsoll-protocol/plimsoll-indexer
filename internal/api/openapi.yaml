@@ -675,6 +675,73 @@ components:
           $ref: '#/components/responses/Unauthorized'
         '503':
           $ref: '#/components/responses/WebhooksNotConfigured'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /v1/webhooks/{id}/dlq:
+    get:
+      summary: List failed webhook deliveries (dead letters)
+      description: |
+        Returns failed delivery attempts for one webhook, newest first, with
+        the latency measured from sending the request to receiving the
+        complete response.
+      operationId: listWebhookDLQ
+      security:
+        - WebhookAdminAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of failed attempts to return (1-1000)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        '200':
+          description: Failed webhook deliveries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deliveries:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/WebhookDelivery'
+                required: [deliveries]
+        '400':
+          description: Invalid webhook id or limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing or invalid administrator token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Webhook not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Webhook management is not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/webhooks/{id}:
     delete:
       summary: Delete a registered webhook
@@ -1254,6 +1321,7 @@ components:
           required: [secret]
     CoverageWebhook:
     WebhookDLQ:
+    WebhookDelivery:
       type: object
       properties:
         id:
@@ -1329,6 +1397,27 @@ components:
         - activeReporters
         - reportsToday
         - ingestLagSeconds
+        webhook_id:
+          type: integer
+        event:
+          type: string
+          example: issuer_toml_changed
+        status_code:
+          type: integer
+          description: HTTP status returned by the destination, or 0 when no response arrived.
+        error:
+          type: string
+        delivery_latency_ms:
+          type: integer
+          description: |
+            Milliseconds from sending the request to receiving the complete
+            response, so slow upstream endpoints are visible next to failures.
+          minimum: 0
+          example: 912
+        attempted_at:
+          type: string
+          format: date-time
+      required: [id, webhook_id, event, status_code, error, delivery_latency_ms, attempted_at]
     ErrorResponse:
       type: object
       description: |
