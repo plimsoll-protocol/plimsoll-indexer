@@ -22,14 +22,16 @@ One process (`cmd/plimsoll-indexer`) runs these jobs and an HTTP server on
 Ingest, the reporter watcher and reconcile run once before the server starts
 listening. A job that
 returns an error is logged as `job failed` with `err` and retried on its next
-tick; it does not stop the process. The process exits non-zero only if the
-database cannot be opened, the poster secret is invalid, or the HTTP server
+tick; it does not stop the process. The process exits non-zero if the
+environment fails validation, the database cannot be opened, or the HTTP server
 fails.
 
 ## Configuration
 
-Required: `DATABASE_URL`, `COVERAGE_LEDGER_ID`, `REPORTER_REGISTRY_ID`. Missing
-values are reported together at startup.
+Required: `DATABASE_URL`, `COVERAGE_LEDGER_ID`, `REPORTER_REGISTRY_ID`. Before
+touching the database, RPC or listener, the indexer validates every variable
+documented below and prints a table of variable, expected type, current value
+(redacted for secrets) and error, then exits 1 if anything is wrong.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
