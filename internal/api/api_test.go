@@ -25,17 +25,21 @@ const sac = "CCHPT4TEJDPZQDSUVW3NP6A35ROGV4WEFZKT45SKWYCFZSUB7R5HIM7S"
 // breakdownHash is what a SHA-256 breakdown hash looks like: 64 hex characters.
 var breakdownHash = strings.Repeat("a", 64)
 
-// unlistedSAC is a well-formed contract strkey that fake holds no asset for.
-func unlistedSAC(t *testing.T) string {
+// contractAddress builds a well-formed contract strkey from a tag byte, so a
+// test can hold several distinct addresses.
+func contractAddress(t *testing.T, tag byte) string {
 	t.Helper()
 	raw := make([]byte, 32)
-	raw[0] = 0x01
+	raw[0] = tag
 	s, err := strkey.Encode(strkey.VersionByteContract, raw)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return s
 }
+
+// unlistedSAC is a well-formed contract strkey that fake holds no asset for.
+func unlistedSAC(t *testing.T) string { return contractAddress(t, 0x01) }
 
 type fake struct {
 	assets           []coverage.Asset
@@ -146,6 +150,19 @@ func (f *fake) Reporters(context.Context) ([]coverage.Reporter, error) {
 		Address: "GAUD", Role: coverage.RoleAuditor, Name: "Acme", DisplayName: "Acme Inc.",
 		WebsiteURI: &websiteURI, ContactHash: &contactHash,
 	}}, nil
+}
+func (f *fake) Disputes(_ context.Context, s, status string, _, offset int) ([]coverage.Dispute, error) {
+	var filtered []coverage.Dispute
+	for _, d := range f.disputes[s] {
+		if status != "" && d.Status != status {
+			continue
+		}
+		filtered = append(filtered, d)
+	}
+	if offset >= len(filtered) {
+		return nil, nil
+	}
+	return filtered[offset:], nil
 }
 func (f *fake) Breakdown(_ context.Context, h string) ([]byte, error) {
 	if b, ok := f.bodies[h]; ok {
@@ -531,6 +548,7 @@ func TestMalformedPathIDs(t *testing.T) {
 		"/v1/assets/CNOPE",
 		"/v1/assets/not-a-sac/supply",
 		"/v1/assets/not-a-sac/reports",
+		"/v1/assets/not-a-sac/disputes",
 	} {
 		body := get(t, srv, path, 400)
 		if body["code"] != "invalid_sac" || body["message"] == nil {
@@ -553,6 +571,7 @@ func TestUnlistedPathIDs(t *testing.T) {
 		"/v1/assets/" + unknown,
 		"/v1/assets/" + unknown + "/supply",
 		"/v1/assets/" + unknown + "/reports",
+		"/v1/assets/" + unknown + "/disputes",
 	} {
 		body := get(t, srv, path, 404)
 		if body["code"] != "asset_not_listed" || body["message"] != "asset not listed" {

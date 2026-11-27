@@ -445,6 +445,33 @@ func TestKeepAwakeURLIntegration(t *testing.T) {
 	}
 }
 
+func TestDecimalCheckEnabled(t *testing.T) {
+	setBase(t)
+	got, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.DecimalCheckEnabled {
+		t.Error("DecimalCheckEnabled = false by default, want true")
+	}
+
+	setBase(t)
+	t.Setenv("DECIMAL_CHECK_ENABLED", "false")
+	got, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DecimalCheckEnabled {
+		t.Error("DecimalCheckEnabled = true with DECIMAL_CHECK_ENABLED=false")
+	}
+
+	setBase(t)
+	t.Setenv("DECIMAL_CHECK_ENABLED", "sometimes")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "DECIMAL_CHECK_ENABLED") {
+		t.Fatalf("want an invalid boolean error, got %v", err)
+	}
+}
+
 // TestPostingEnabled verifies the PostingEnabled predicate.
 func TestPostingEnabled(t *testing.T) {
 	setBase(t)

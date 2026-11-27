@@ -106,6 +106,24 @@ type Reporter struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
+// Dispute is a challenge to one reserve report, identified by the asset and
+// the report's as_of timestamp. Reporter is the account that signed the
+// disputed report, Disputer the watcher that challenged it.
+type Dispute struct {
+	SAC             string     `json:"-"`
+	Reporter        string     `json:"reporter"`
+	Disputer        string     `json:"disputer"`
+	Status          string     `json:"status"`
+	Resolution      string     `json:"resolution,omitempty"`
+	ReportAsOf      time.Time  `json:"report_as_of"`
+	HoldUntilLedger uint32     `json:"hold_until_ledger,omitempty"`
+	OpenedLedger    uint32     `json:"opened_ledger"`
+	OpenedAt        time.Time  `json:"opened_at"`
+	ResolvedLedger  *uint32    `json:"resolved_ledger,omitempty"`
+	ResolvedAt      *time.Time `json:"resolved_at,omitempty"`
+	TxHash          string     `json:"tx_hash,omitempty"`
+}
+
 // Result mirrors the contract's Coverage struct.
 type Result struct {
 	Bps            uint32

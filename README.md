@@ -239,6 +239,10 @@ falls back to its environment variable when its `*_SECRET_NAME` is empty.
 `NETWORK` selects a preset (`testnet`, the default, `mainnet` or `standalone`)
 that supplies defaults for `STELLAR_RPC_URL`, `HORIZON_URL` and
 `STELLAR_NETWORK_PASSPHRASE`. Setting any of those three overrides the preset.
+`DECIMAL_CHECK_ENABLED` (default `true`) warns when a new supply snapshot
+differs from the previous on-chain one by more than six orders of magnitude,
+which usually means an asset's decimals were applied wrongly. The snapshot is
+still posted; set it to `false` to silence the warning.
 `mainnet` has no default RPC (SDF runs no public Soroban RPC for it), so
 `STELLAR_RPC_URL` is required there. `standalone` points at a local
 [stellar/quickstart](https://github.com/stellar/quickstart) on `localhost:8000`.
